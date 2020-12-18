@@ -570,3 +570,39 @@
            '*boundaries-read': ['uint64'],
            '*boundaries-write': ['uint64'],
            '*boundaries-flush': ['uint64'] } }
+
+##
+# @MediaErrorBehavior:
+#
+# Enumerated type for classifying type of read error behavior.
+#
+##
+{ 'enum': 'MediaErrorBehavior', 'data': ['hard', 'fixedonwrite', 'flakey'] }
+
+##
+# @media-error-create:
+#
+# Example:
+# -> {"execute": "media-error-create",
+#     "arguments": {"device_id": "12345678, "lba" : 10000, "behavior" : "hard"}}
+# <- { "return": {} }
+#
+# Create a synthetic media error for the specified logical block address when
+# it is read by the guest OS.
+#
+##
+{ 'command':'media-error-create',
+  'data': {'deviceid': 'str', 'lba': 'uint64', 'behavior': 'MediaErrorBehavior'}}
+
+##
+# @media-error-delete:
+#
+# Delete a synthetic media error for the specified logical block address.
+#
+# # Example:
+# -> {"execute": "media-error-delete",
+#     "arguments": {"device_id": "01020304", "lba" : 10000}
+# <- { "return": {} }
+##
+{ 'command':'media-error-delete',
+  'data': {'deviceid': 'str', 'lba': 'uint64'}}
