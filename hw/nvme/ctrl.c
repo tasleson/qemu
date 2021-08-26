@@ -148,6 +148,7 @@
  *     zoned.cross_read=<enable RAZB, default: false>
  *         Setting this property to true enables Read Across Zone Boundaries.
  */
+#include "block/error_inject.h"
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
@@ -3111,6 +3112,15 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
 
     if (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
         return nvme_dif_rw(n, req);
+    }
+
+    if (rw->opcode == NVME_CMD_READ) {
+        uint64_t error_sector = 0;
+        char device_id[32];
+        sprintf(device_id, "%lu", ns->id_ns.eui64);
+        if (error_in_read(device_id, slba, nlb, &error_sector)) {
+            return NVME_UNRECOVERED_READ | NVME_DNR;
+        }
     }
 
     status = nvme_map_data(n, nlb, req);
