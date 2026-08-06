@@ -16,6 +16,7 @@ block_ss.add(files(
   'crypto.c',
   'dirty-bitmap.c',
   'filter-compress.c',
+  'inject-error.c',
   'graph-lock.c',
   'io.c',
   'mirror.c',
