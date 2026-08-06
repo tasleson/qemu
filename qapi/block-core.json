@@ -3334,6 +3334,8 @@
 #
 # @snapshot-access: Since 7.0
 #
+# @inject-error: Since 11.2
+#
 # Since: 2.9
 ##
 { 'enum': 'BlockdevDriver',
@@ -3342,7 +3344,7 @@
             'file', 'snapshot-access', 'ftp', 'ftps',
             {'name': 'host_cdrom', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
             {'name': 'host_device', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
-            'http', 'https',
+            'http', 'https', 'inject-error',
             { 'name': 'io_uring', 'if': 'CONFIG_BLKIO' },
             'iscsi',
             'luks', 'nbd', 'nfs', 'null-aio', 'null-co', 'nvme',
@@ -4017,6 +4019,69 @@
             '*set-state': ['BlkdebugSetStateOptions'],
             '*take-child-perms': ['BlockPermission'],
             '*unshare-child-perms': ['BlockPermission'] } }
+
+##
+# @InjectErrorBehavior:
+#
+# Describes how an injected media error behaves.
+#
+# @persistent: error always fires
+#
+# @fix-on-write: error is cleared when the affected sector is
+#     successfully written
+#
+# @transient: error fires once then is automatically removed
+#
+# Since: 11.2
+##
+{ 'enum': 'InjectErrorBehavior',
+  'data': [ 'persistent', 'fix-on-write', 'transient' ] }
+
+##
+# @InjectErrorSectorOptions:
+#
+# Describes a bad sector region for inject-error.
+#
+# @sector: first bad sector number (512-byte sectors)
+#
+# @count: number of consecutive bad sectors (default: 1)
+#
+# @errno: error to return (default: EIO)
+#
+# @behavior: how the error behaves (default: persistent)
+#
+# @reads: whether to fail read operations (default: true)
+#
+# @writes: whether to fail write operations (default: false)
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectErrorSectorOptions',
+  'data': { 'sector': 'int',
+            '*count': 'int',
+            '*errno': 'int',
+            '*behavior': 'InjectErrorBehavior',
+            '*reads': 'bool',
+            '*writes': 'bool' } }
+
+##
+# @BlockdevOptionsInjectError:
+#
+# Driver specific block device options for inject-error.
+#
+# Simulates media errors (bad sectors) by returning errors for I/O
+# operations that touch configured sector ranges.  Useful for
+# testing guest OS error handling paths.
+#
+# @image: underlying block device
+#
+# @errors: initial set of bad sector descriptions
+#
+# Since: 11.2
+##
+{ 'struct': 'BlockdevOptionsInjectError',
+  'data': { 'image': 'BlockdevRef',
+            '*errors': ['InjectErrorSectorOptions'] } }
 
 ##
 # @BlockdevOptionsBlklogwrites:
@@ -4851,6 +4916,7 @@
                        'if': 'HAVE_HOST_BLOCK_DEVICE' },
       'http':       'BlockdevOptionsCurlHttp',
       'https':      'BlockdevOptionsCurlHttps',
+      'inject-error':'BlockdevOptionsInjectError',
       'io_uring':   { 'type': 'BlockdevOptionsIoUring',
                       'if': 'CONFIG_BLKIO' },
       'iscsi':      'BlockdevOptionsIscsi',
@@ -6104,6 +6170,81 @@
              '*force': 'bool' },
   'features': [ 'unstable' ],
   'allow-preconfig': true }
+
+##
+# @x-inject-error-add:
+#
+# Add a bad sector region to an inject-error filter node.
+#
+# @node-name: the name of the inject-error node to modify
+#
+# @sector: first bad sector number (512-byte sectors)
+#
+# @count: number of consecutive bad sectors (default: 1)
+#
+# @errno: error to return (default: EIO)
+#
+# @behavior: how the error behaves (default: persistent)
+#
+# @reads: whether to fail read operations (default: true)
+#
+# @writes: whether to fail write operations (default: false)
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-add",
+#          "arguments": { "node-name": "err0",
+#                         "sector": 1024,
+#                         "count": 8 } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-inject-error-add',
+  'data': { 'node-name': 'str',
+            'sector': 'int',
+            '*count': 'int',
+            '*errno': 'int',
+            '*behavior': 'InjectErrorBehavior',
+            '*reads': 'bool',
+            '*writes': 'bool' },
+  'features': [ 'unstable' ] }
+
+##
+# @x-inject-error-remove:
+#
+# Remove bad sector regions from an inject-error filter node.
+# Removes all entries that overlap the specified sector range.
+#
+# @node-name: the name of the inject-error node to modify
+#
+# @sector: first sector of the range to clear (512-byte sectors)
+#
+# @count: number of consecutive sectors to clear (default: 1)
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-remove",
+#          "arguments": { "node-name": "err0",
+#                         "sector": 1024,
+#                         "count": 8 } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-inject-error-remove',
+  'data': { 'node-name': 'str',
+            'sector': 'int',
+            '*count': 'int' },
+  'features': [ 'unstable' ] }
 
 ##
 # @QuorumOpType:
