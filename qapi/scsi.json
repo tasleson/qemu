@@ -1,0 +1,103 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+#
+# This work is licensed under the terms of the GNU GPL, version 2 or later.
+# See the COPYING file in the top-level directory.
+
+##
+# ****************************
+# SCSI device infrastructure
+# ****************************
+##
+
+##
+# @ScsiInjectResponseType:
+#
+# The type of SCSI command response to override.
+#
+# @inquiry-standard: Standard INQUIRY response (non-VPD).
+#
+# @inquiry-vpd: INQUIRY Vital Product Data page response.
+#
+# @mode-sense-page: MODE SENSE response for a specific page.
+#
+# Since: 11.2
+##
+{ 'enum': 'ScsiInjectResponseType',
+  'data': [ 'inquiry-standard', 'inquiry-vpd', 'mode-sense-page' ] }
+
+##
+# @x-scsi-disk-inject-response-set:
+#
+# Set a SCSI command response override on a scsi-hd or scsi-cd device.
+# The override data completely replaces the normal response for the
+# specified command with no validation or length checks.  This is
+# intended for fuzzing guest software by returning arbitrary data.
+#
+# @id: the device ID of the scsi-hd or scsi-cd device
+#
+# @type: which response to override
+#
+# @page: page code (0-255).  Required for inquiry-vpd and
+#     mode-sense-page types.  Must not be present for
+#     inquiry-standard.
+#
+# @data: base64-encoded response data.  This data replaces the
+#     entire response buffer verbatim.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-scsi-disk-inject-response-set",
+#          "arguments": { "id": "disk0",
+#                         "type": "inquiry-vpd",
+#                         "page": 128,
+#                         "data": "AIA/VEVTVFNFU..." } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-scsi-disk-inject-response-set',
+  'data': { 'id': 'str',
+            'type': 'ScsiInjectResponseType',
+            '*page': 'uint8',
+            'data': 'str' },
+  'features': [ 'unstable' ] }
+
+##
+# @x-scsi-disk-inject-response-clear:
+#
+# Clear SCSI command response overrides from a scsi-hd or scsi-cd
+# device.
+#
+# @id: the device ID of the scsi-hd or scsi-cd device
+#
+# @type: which override to clear.  If not specified, clears all
+#     overrides on the device.
+#
+# @page: page code.  Required when type is inquiry-vpd or
+#     mode-sense-page.  Must not be present for inquiry-standard
+#     or when type is absent.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-scsi-disk-inject-response-clear",
+#          "arguments": { "id": "disk0",
+#                         "type": "inquiry-vpd",
+#                         "page": 128 } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-scsi-disk-inject-response-clear',
+  'data': { 'id': 'str',
+            '*type': 'ScsiInjectResponseType',
+            '*page': 'uint8' },
+  'features': [ 'unstable' ] }

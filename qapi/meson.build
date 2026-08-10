@@ -64,6 +64,7 @@ if have_system
     'cryptodev',
     'qdev',
     'pci',
+    'scsi',
     'rocker',
     'misc-arm',
     'misc-i386',
