@@ -44,6 +44,8 @@
 #include "qemu/cutils.h"
 #include "trace.h"
 #include "qom/object.h"
+#include "qemu/base64.h"
+#include "qapi/qapi-commands-scsi.h"
 
 #ifdef __linux
 #include <scsi/sg.h>
@@ -64,6 +66,11 @@
 #define MAX_SERIAL_LEN_FOR_DEVID    20
 
 OBJECT_DECLARE_TYPE(SCSIDiskState, SCSIDiskClass, SCSI_DISK_BASE)
+
+typedef struct SCSIInjectData {
+    uint8_t *data;
+    uint32_t len;
+} SCSIInjectData;
 
 struct SCSIDiskClass {
     SCSIDeviceClass parent_class;
@@ -122,6 +129,13 @@ struct SCSIDiskState {
      * 0xffff        - reserved
      */
     uint16_t rotation_rate;
+
+    /* Response data injection for fuzzing (not migrated) */
+    uint8_t *inject_inquiry_data;
+    uint32_t inject_inquiry_len;
+    GHashTable *inject_vpd_pages;
+    GHashTable *inject_mode_pages;
+
     bool migrate_emulated_scsi_request;
     NotifierWithReturn migration_notifier;
 };
@@ -663,6 +677,16 @@ static int scsi_disk_emulate_vpd_page(SCSIRequest *req, uint8_t *outbuf)
     uint8_t page_code = req->cmd.buf[2];
     int start, buflen = 0;
 
+    if (s->inject_vpd_pages) {
+        SCSIInjectData *inj = g_hash_table_lookup(s->inject_vpd_pages,
+                                                  GUINT_TO_POINTER(page_code));
+        if (inj) {
+            buflen = MIN(inj->len, req->cmd.xfer);
+            memcpy(outbuf, inj->data, buflen);
+            return buflen;
+        }
+    }
+
     outbuf[buflen++] = s->qdev.type & 0x1f;
     outbuf[buflen++] = page_code;
     outbuf[buflen++] = 0x00;
@@ -820,6 +844,12 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     if (req->cmd.buf[1] & 0x1) {
         /* Vital product data */
         return scsi_disk_emulate_vpd_page(req, outbuf);
+    }
+
+    if (s->inject_inquiry_data) {
+        buflen = MIN(s->inject_inquiry_len, req->cmd.xfer);
+        memcpy(outbuf, s->inject_inquiry_data, buflen);
+        return buflen;
     }
 
     /* Standard INQUIRY data */
@@ -1337,8 +1367,19 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
     uint8_t *p;
     uint8_t dev_specific_param;
 
-    dbd = (r->req.cmd.buf[1] & 0x8) != 0;
     page = r->req.cmd.buf[2] & 0x3f;
+
+    if (s->inject_mode_pages) {
+        SCSIInjectData *inj = g_hash_table_lookup(s->inject_mode_pages,
+                                                  GUINT_TO_POINTER(page));
+        if (inj) {
+            buflen = MIN(inj->len, r->req.cmd.xfer);
+            memcpy(outbuf, inj->data, buflen);
+            return buflen;
+        }
+    }
+
+    dbd = (r->req.cmd.buf[1] & 0x8) != 0;
     page_control = (r->req.cmd.buf[2] & 0xc0) >> 6;
 
     trace_scsi_disk_emulate_mode_sense((r->req.cmd.buf[0] == MODE_SENSE) ? 6 :
@@ -2595,8 +2636,175 @@ static void scsi_realize(SCSIDevice *dev, Error **errp)
                          dev->conf.lsecs);
 }
 
+static void scsi_inject_data_free(gpointer data)
+{
+    SCSIInjectData *inj = data;
+    g_free(inj->data);
+    g_free(inj);
+}
+
+static void scsi_disk_clear_all_injections(SCSIDiskState *s)
+{
+    g_free(s->inject_inquiry_data);
+    s->inject_inquiry_data = NULL;
+    s->inject_inquiry_len = 0;
+
+    g_clear_pointer(&s->inject_vpd_pages, g_hash_table_destroy);
+    g_clear_pointer(&s->inject_mode_pages, g_hash_table_destroy);
+}
+
+static SCSIDiskState *find_scsi_disk_device(const char *id, Error **errp)
+{
+    DeviceState *dev;
+
+    dev = qdev_find_recursive(sysbus_get_default(), id);
+    if (!dev) {
+        error_setg(errp, "Device '%s' not found", id);
+        return NULL;
+    }
+
+    if (!object_dynamic_cast(OBJECT(dev), "scsi-hd") &&
+        !object_dynamic_cast(OBJECT(dev), "scsi-cd")) {
+        error_setg(errp,
+                   "Device '%s' is not a scsi-hd or scsi-cd device", id);
+        return NULL;
+    }
+
+    return SCSI_DISK_BASE(dev);
+}
+
+static void scsi_disk_inject_page(GHashTable **table, uint8_t page,
+                                  uint8_t *data, uint32_t len)
+{
+    SCSIInjectData *inj;
+
+    if (!*table) {
+        *table = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                       NULL, scsi_inject_data_free);
+    }
+
+    inj = g_new(SCSIInjectData, 1);
+    inj->data = data;
+    inj->len = len;
+    g_hash_table_insert(*table, GUINT_TO_POINTER(page), inj);
+}
+
+void qmp_x_scsi_disk_inject_response_set(const char *id,
+                                         ScsiInjectResponseType type,
+                                         bool has_page, uint8_t page,
+                                         const char *data,
+                                         Error **errp)
+{
+    SCSIDiskState *s;
+    uint8_t *decoded;
+    size_t decoded_len;
+
+    s = find_scsi_disk_device(id, errp);
+    if (!s) {
+        return;
+    }
+
+    if (type == SCSI_INJECT_RESPONSE_TYPE_INQUIRY_STANDARD) {
+        if (has_page) {
+            error_setg(errp, "page must not be specified for inquiry-standard");
+            return;
+        }
+    } else {
+        if (!has_page) {
+            error_setg(errp, "page is required for %s",
+                       ScsiInjectResponseType_str(type));
+            return;
+        }
+    }
+
+    decoded = qbase64_decode(data, -1, &decoded_len, errp);
+    if (!decoded) {
+        return;
+    }
+
+    if (decoded_len == 0 || decoded_len > 65536) {
+        g_free(decoded);
+        error_setg(errp, "data length must be between 1 and 65536 bytes");
+        return;
+    }
+
+    switch (type) {
+    case SCSI_INJECT_RESPONSE_TYPE_INQUIRY_STANDARD:
+        g_free(s->inject_inquiry_data);
+        s->inject_inquiry_data = decoded;
+        s->inject_inquiry_len = decoded_len;
+        break;
+    case SCSI_INJECT_RESPONSE_TYPE_INQUIRY_VPD:
+        scsi_disk_inject_page(&s->inject_vpd_pages, page, decoded, decoded_len);
+        break;
+    case SCSI_INJECT_RESPONSE_TYPE_MODE_SENSE_PAGE:
+        scsi_disk_inject_page(&s->inject_mode_pages, page, decoded,
+                              decoded_len);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+void qmp_x_scsi_disk_inject_response_clear(const char *id,
+                                            bool has_type,
+                                            ScsiInjectResponseType type,
+                                            bool has_page, uint8_t page,
+                                            Error **errp)
+{
+    SCSIDiskState *s;
+
+    s = find_scsi_disk_device(id, errp);
+    if (!s) {
+        return;
+    }
+
+    if (!has_type) {
+        if (has_page) {
+            error_setg(errp, "page must not be specified without type");
+            return;
+        }
+        scsi_disk_clear_all_injections(s);
+        return;
+    }
+
+    switch (type) {
+    case SCSI_INJECT_RESPONSE_TYPE_INQUIRY_STANDARD:
+        if (has_page) {
+            error_setg(errp, "page must not be specified for inquiry-standard");
+            return;
+        }
+        g_free(s->inject_inquiry_data);
+        s->inject_inquiry_data = NULL;
+        s->inject_inquiry_len = 0;
+        break;
+    case SCSI_INJECT_RESPONSE_TYPE_INQUIRY_VPD:
+        if (!has_page) {
+            error_setg(errp, "page is required for inquiry-vpd");
+            return;
+        }
+        if (s->inject_vpd_pages) {
+            g_hash_table_remove(s->inject_vpd_pages, GUINT_TO_POINTER(page));
+        }
+        break;
+    case SCSI_INJECT_RESPONSE_TYPE_MODE_SENSE_PAGE:
+        if (!has_page) {
+            error_setg(errp, "page is required for mode-sense-page");
+            return;
+        }
+        if (s->inject_mode_pages) {
+            g_hash_table_remove(s->inject_mode_pages, GUINT_TO_POINTER(page));
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void scsi_unrealize(SCSIDevice *dev)
 {
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
+    scsi_disk_clear_all_injections(s);
     del_boot_device_lchs(&dev->qdev, NULL);
 }
 
@@ -3359,6 +3567,7 @@ static void scsi_cd_class_initfn(ObjectClass *klass, const void *data)
     SCSIDeviceClass *sc = SCSI_DEVICE_CLASS(klass);
 
     sc->realize      = scsi_cd_realize;
+    sc->unrealize    = scsi_unrealize;
     sc->alloc_req    = scsi_new_request;
     sc->unit_attention_reported = scsi_disk_unit_attention_reported;
     dc->desc = "virtual SCSI CD-ROM";
