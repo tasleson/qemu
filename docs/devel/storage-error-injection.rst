@@ -200,6 +200,10 @@ Notes
   page length) is part of the injected data.  The ``scsi-inject.py``
   helper constructs these headers automatically.
 
+- The maximum injected response size is 65536 bytes.  For VPD page 0x80
+  (serial number), this means a maximum serial string of 65532 bytes
+  (65536 minus the 4-byte VPD header).
+
 - Overrides apply only to ``scsi-hd`` and ``scsi-cd`` devices (emulated
   SCSI).  They have no effect on ``scsi-block`` (passthrough) devices,
   which route INQUIRY and MODE SENSE directly to the host via SG_IO.
@@ -209,6 +213,19 @@ Notes
 
 - Overrides persist across guest reboots (they are not cleared on device
   reset).  Use the clear command to remove them.
+
+- The Linux kernel caches INQUIRY responses.  After injecting a new
+  override, rescan the device in the guest to pick up the change::
+
+      echo 1 > /sys/block/sda/device/rescan
+
+  The rescan updates both direct queries (``sg_inq``) and the kernel's
+  sysfs VPD cache (``/sys/block/sda/device/vpd_pg80``), which is what
+  tools like ``lsmcli local-disk-list`` read.
+
+  Note: ``sg_inq`` queries the device directly via SG_IO and will
+  reflect overrides immediately without a rescan.  A rescan is only
+  needed to update the kernel's cached copy in sysfs.
 
 
 Command-Line Tools

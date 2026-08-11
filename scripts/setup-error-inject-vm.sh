@@ -136,8 +136,8 @@ run_vm() {
         -qmp "unix:${QMP_SOCK},server=on,wait=off" \
         -monitor stdio \
         \
-        -device virtio-net-pci,netdev=net0 \
-        -netdev passt,id=net0 \
+        -net nic,model=virtio-net-pci \
+        -net passt,tcp-ports=2222:22 \
         \
         -blockdev driver=file,filename="${BOOT_DISK}",node-name=boot-file \
         -blockdev driver=qcow2,file=boot-file,node-name=boot \
