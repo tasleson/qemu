@@ -6247,6 +6247,62 @@
   'features': [ 'unstable' ] }
 
 ##
+# @InjectErrorEntryInfo:
+#
+# Information about a single error injection entry.
+#
+# @sector: first bad sector number (512-byte sectors)
+#
+# @count: number of consecutive bad sectors
+#
+# @errno: error number returned for matching I/O
+#
+# @behavior: how the error behaves
+#
+# @reads: whether read operations are failed
+#
+# @writes: whether write operations are failed
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectErrorEntryInfo',
+  'data': { 'sector': 'int',
+            'count': 'int',
+            'errno': 'int',
+            'behavior': 'InjectErrorBehavior',
+            'reads': 'bool',
+            'writes': 'bool' } }
+
+##
+# @x-inject-error-list:
+#
+# List all active error injection entries for an inject-error filter
+# node.
+#
+# @node-name: the name of the inject-error node to query
+#
+# Returns: a list of active error injection entries
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-list",
+#          "arguments": { "node-name": "err0" } }
+#     <- { "return": [ { "sector": 1024, "count": 8, "errno": 5,
+#                        "behavior": "persistent",
+#                        "reads": true, "writes": false } ] }
+##
+{ 'command': 'x-inject-error-list',
+  'data': { 'node-name': 'str' },
+  'returns': ['InjectErrorEntryInfo'],
+  'features': [ 'unstable' ] }
+
+##
 # @QuorumOpType:
 #
 # An enumeration of the quorum operation types

@@ -427,3 +427,41 @@ void qmp_x_inject_error_remove(const char *node_name, int64_t sector,
         }
     }
 }
+
+InjectErrorEntryInfoList *qmp_x_inject_error_list(const char *node_name,
+                                                  Error **errp)
+{
+    BlockDriverState *bs;
+    BDRVInjectErrorState *s;
+    InjectErrorEntryInfoList *head = NULL, **tail = &head;
+    InjectErrorEntry *entry;
+
+    bs = bdrv_find_node(node_name);
+    if (!bs) {
+        error_setg(errp, "Node '%s' not found", node_name);
+        return NULL;
+    }
+
+    if (bs->drv != &bdrv_inject_error) {
+        error_setg(errp, "Node '%s' is not an inject-error node", node_name);
+        return NULL;
+    }
+
+    s = bs->opaque;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    QLIST_FOREACH(entry, &s->entries, next) {
+        InjectErrorEntryInfo *info = g_new0(InjectErrorEntryInfo, 1);
+
+        info->sector = entry->offset / BDRV_SECTOR_SIZE;
+        info->count = entry->length / BDRV_SECTOR_SIZE;
+        info->q_errno = entry->error;
+        info->behavior = entry->behavior;
+        info->reads = entry->reads;
+        info->writes = entry->writes;
+
+        QAPI_LIST_APPEND(tail, info);
+    }
+
+    return head;
+}
