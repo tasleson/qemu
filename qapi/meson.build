@@ -66,6 +66,7 @@ if have_system
     'pci',
     'scsi',
     'nvme',
+    'ide',
     'rocker',
     'misc-arm',
     'misc-i386',

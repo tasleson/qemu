@@ -1,0 +1,103 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+#
+# This work is licensed under the terms of the GNU GPL, version 2 or later.
+# See the COPYING file in the top-level directory.
+
+##
+# ****************************
+# IDE device infrastructure
+# ****************************
+##
+
+##
+# @IdeInjectResponseType:
+#
+# The type of ATA command response to override.
+#
+# @identify-device: IDENTIFY DEVICE (ECh) response — the 512-byte
+#     data structure returned via PIO.
+#
+# @smart-read-data: SMART READ DATA (B0h/D0h) response — the
+#     512-byte attribute data structure.
+#
+# @smart-read-thresh: SMART READ THRESHOLDS (B0h/D1h) response —
+#     the 512-byte threshold data structure.
+#
+# Since: 11.2
+##
+{ 'enum': 'IdeInjectResponseType',
+  'data': [ 'identify-device', 'smart-read-data', 'smart-read-thresh' ] }
+
+##
+# @x-ide-inject-response-set:
+#
+# Set an ATA command response override on an IDE hard disk device.
+# The override data completely replaces the normal response for the
+# specified command with no validation or length checks.
+# Alternatively, ATA error register values can be injected to
+# simulate command failures.  This is intended for fuzzing guest
+# software by returning arbitrary data or error conditions.
+#
+# @id: the device ID of the ide-hd device.
+#
+# @type: which response to override
+#
+# @data: base64-encoded response data (up to 512 bytes).  This
+#     data replaces the entire PIO transfer buffer verbatim.
+#     At least one of @data or @error must be specified.
+#
+# @error: ATA error register value (must be non-zero).  When
+#     set, the command completes with ERR_STAT in the status
+#     register and this value in the error register; no data
+#     is transferred even if @data is also given.  At least
+#     one of @data or @error must be specified.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-ide-inject-response-set",
+#          "arguments": { "id": "ide-disk0",
+#                         "type": "identify-device",
+#                         "data": "AQIDBA..." } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-ide-inject-response-set',
+  'data': { 'id': 'str',
+            'type': 'IdeInjectResponseType',
+            '*data': 'str',
+            '*error': 'uint8' },
+  'features': [ 'unstable' ] }
+
+##
+# @x-ide-inject-response-clear:
+#
+# Clear ATA command response overrides from an IDE hard disk device.
+#
+# @id: the device ID of the ide-hd device.
+#
+# @type: which override to clear.  If not specified, clears all
+#     overrides on the device.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-ide-inject-response-clear",
+#          "arguments": { "id": "ide-disk0",
+#                         "type": "identify-device" } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-ide-inject-response-clear',
+  'data': { 'id': 'str',
+            '*type': 'IdeInjectResponseType' },
+  'features': [ 'unstable' ] }
