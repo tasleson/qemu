@@ -46,6 +46,7 @@
 #include "qom/object.h"
 #include "qemu/base64.h"
 #include "qapi/qapi-commands-scsi.h"
+#include "hw/usb/msd.h"
 
 #ifdef __linux
 #include <scsi/sg.h>
@@ -2663,14 +2664,27 @@ static SCSIDiskState *find_scsi_disk_device(const char *id, Error **errp)
         return NULL;
     }
 
-    if (!object_dynamic_cast(OBJECT(dev), "scsi-hd") &&
-        !object_dynamic_cast(OBJECT(dev), "scsi-cd")) {
-        error_setg(errp,
-                   "Device '%s' is not a scsi-hd or scsi-cd device", id);
+    if (object_dynamic_cast(OBJECT(dev), "scsi-hd") ||
+        object_dynamic_cast(OBJECT(dev), "scsi-cd")) {
+        return SCSI_DISK_BASE(dev);
+    }
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_USB_STORAGE)) {
+        MSDState *msd = USB_STORAGE_DEV(USB_DEVICE(dev));
+        if (msd->scsi_dev &&
+            (object_dynamic_cast(OBJECT(msd->scsi_dev), "scsi-hd") ||
+             object_dynamic_cast(OBJECT(msd->scsi_dev), "scsi-cd"))) {
+            return SCSI_DISK_BASE(msd->scsi_dev);
+        }
+        error_setg(errp, "USB storage device '%s' has no SCSI disk attached",
+                   id);
         return NULL;
     }
 
-    return SCSI_DISK_BASE(dev);
+    error_setg(errp,
+               "Device '%s' is not a scsi-hd, scsi-cd, or usb-storage device",
+               id);
+    return NULL;
 }
 
 static void scsi_disk_inject_page(GHashTable **table, uint8_t page,
