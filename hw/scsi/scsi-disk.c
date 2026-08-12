@@ -47,6 +47,7 @@
 #include "qemu/base64.h"
 #include "qapi/qapi-commands-scsi.h"
 #include "hw/usb/msd.h"
+#include "hw/ufs/ufs.h"
 
 #ifdef __linux
 #include <scsi/sg.h>
@@ -2681,8 +2682,21 @@ static SCSIDiskState *find_scsi_disk_device(const char *id, Error **errp)
         return NULL;
     }
 
+    if (object_dynamic_cast(OBJECT(dev), TYPE_UFS_LU)) {
+        UfsLu *lu = UFSLU(dev);
+        if (lu->scsi_dev &&
+            (object_dynamic_cast(OBJECT(lu->scsi_dev), "scsi-hd") ||
+             object_dynamic_cast(OBJECT(lu->scsi_dev), "scsi-cd"))) {
+            return SCSI_DISK_BASE(lu->scsi_dev);
+        }
+        error_setg(errp, "UFS logical unit '%s' has no SCSI disk attached",
+                   id);
+        return NULL;
+    }
+
     error_setg(errp,
-               "Device '%s' is not a scsi-hd, scsi-cd, or usb-storage device",
+               "Device '%s' is not a scsi-hd, scsi-cd, usb-storage,"
+               " or ufs-lu device",
                id);
     return NULL;
 }

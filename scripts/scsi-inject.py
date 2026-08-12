@@ -4,7 +4,7 @@
 #
 # SCSI response injection tool for QEMU
 #
-# Sets SCSI command response overrides on scsi-hd/scsi-cd devices via QMP,
+# Sets SCSI command response overrides on SCSI disk devices via QMP,
 # useful for fuzzing guest storage management software.
 #
 # Usage: $builddir/run scripts/scsi-inject.py [options] <command> [args]

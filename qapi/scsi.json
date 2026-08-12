@@ -29,12 +29,14 @@
 ##
 # @x-scsi-disk-inject-response-set:
 #
-# Set a SCSI command response override on a scsi-hd or scsi-cd device.
+# Set a SCSI command response override on a SCSI disk device.
 # The override data completely replaces the normal response for the
 # specified command with no validation or length checks.  This is
 # intended for fuzzing guest software by returning arbitrary data.
 #
-# @id: the device ID of the scsi-hd or scsi-cd device
+# @id: the device ID of the scsi-hd, scsi-cd, usb-storage, or
+#     ufs-lu device.  Container devices (usb-storage, ufs-lu)
+#     are resolved to their internal SCSI disk automatically.
 #
 # @type: which response to override
 #
@@ -70,10 +72,11 @@
 ##
 # @x-scsi-disk-inject-response-clear:
 #
-# Clear SCSI command response overrides from a scsi-hd or scsi-cd
-# device.
+# Clear SCSI command response overrides from a SCSI disk device.
 #
-# @id: the device ID of the scsi-hd or scsi-cd device
+# @id: the device ID of the scsi-hd, scsi-cd, usb-storage, or
+#     ufs-lu device.  Container devices (usb-storage, ufs-lu)
+#     are resolved to their internal SCSI disk automatically.
 #
 # @type: which override to clear.  If not specified, clears all
 #     overrides on the device.
