@@ -51,6 +51,9 @@
 #include "qemu/guest-random.h"
 #include "qemu/module.h"
 #include "sdmmc-internal.h"
+#include "qapi/qapi-commands-sd.h"
+#include "qemu/base64.h"
+#include "system/system.h"
 #include "trace.h"
 #include "crypto/hmac.h"
 
@@ -140,6 +143,11 @@ typedef struct QEMU_PACKED {
 QEMU_BUILD_BUG_MSG(sizeof(RPMBDataFrame) != 512,
                    "invalid RPMBDataFrame size");
 
+typedef struct SdInjectData {
+    uint8_t *data;
+    uint32_t len;
+} SdInjectData;
+
 struct SDState {
     DeviceState parent_obj;
 
@@ -206,6 +214,12 @@ struct SDState {
     uint8_t dat_lines;
     bool cmd_line;
     char *preset_auth_key;
+
+    /* Response injection (not migrated) */
+    SdInjectData *inject_cid;
+    SdInjectData *inject_csd;
+    bool has_inject_card_status;
+    uint32_t inject_card_status;
 };
 
 static void sd_realize(DeviceState *dev, Error **errp);
@@ -790,17 +804,23 @@ static size_t sd_response_size(SDState *sd, sd_rsp_type_t rtype)
 
 static void sd_response_r1_make(SDState *sd, uint8_t *response)
 {
+    uint32_t card_status = sd->card_status;
+
+    if (sd->has_inject_card_status) {
+        card_status |= sd->inject_card_status;
+    }
+
     if (sd_is_spi(sd)) {
         response[0] = sd->state == sd_idle_state;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, ERASE_RESET) << 1;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, ILLEGAL_COMMAND) << 2;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, COM_CRC_ERROR) << 3;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, ERASE_SEQ_ERROR) << 4;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, ADDRESS_ERROR) << 5;
-        response[0] |= FIELD_EX32(sd->card_status, CSR, BLOCK_LEN_ERROR) << 6;
+        response[0] |= FIELD_EX32(card_status, CSR, ERASE_RESET) << 1;
+        response[0] |= FIELD_EX32(card_status, CSR, ILLEGAL_COMMAND) << 2;
+        response[0] |= FIELD_EX32(card_status, CSR, COM_CRC_ERROR) << 3;
+        response[0] |= FIELD_EX32(card_status, CSR, ERASE_SEQ_ERROR) << 4;
+        response[0] |= FIELD_EX32(card_status, CSR, ADDRESS_ERROR) << 5;
+        response[0] |= FIELD_EX32(card_status, CSR, BLOCK_LEN_ERROR) << 6;
         response[0] |= 0 << 7;
     } else {
-        stl_be_p(response, sd->card_status);
+        stl_be_p(response, card_status);
     }
 
     /* Clear the "clear on read" status bits */
@@ -809,18 +829,24 @@ static void sd_response_r1_make(SDState *sd, uint8_t *response)
 
 static void spi_response_r2_make(SDState *sd, uint8_t *resp)
 {
+    uint32_t card_status = sd->card_status;
+
+    if (sd->has_inject_card_status) {
+        card_status |= sd->inject_card_status;
+    }
+
     /* Prepend R1 */
     sd_response_r1_make(sd, resp);
 
-    resp[1]  = FIELD_EX32(sd->card_status, CSR, CARD_IS_LOCKED) << 0;
-    resp[1] |= (FIELD_EX32(sd->card_status, CSR, LOCK_UNLOCK_FAILED)
-                || FIELD_EX32(sd->card_status, CSR, WP_ERASE_SKIP)) << 1;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, ERROR) << 2;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, CC_ERROR) << 3;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, CARD_ECC_FAILED) << 4;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, WP_VIOLATION) << 5;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, ERASE_PARAM) << 6;
-    resp[1] |= FIELD_EX32(sd->card_status, CSR, OUT_OF_RANGE) << 7;
+    resp[1]  = FIELD_EX32(card_status, CSR, CARD_IS_LOCKED) << 0;
+    resp[1] |= (FIELD_EX32(card_status, CSR, LOCK_UNLOCK_FAILED)
+                || FIELD_EX32(card_status, CSR, WP_ERASE_SKIP)) << 1;
+    resp[1] |= FIELD_EX32(card_status, CSR, ERROR) << 2;
+    resp[1] |= FIELD_EX32(card_status, CSR, CC_ERROR) << 3;
+    resp[1] |= FIELD_EX32(card_status, CSR, CARD_ECC_FAILED) << 4;
+    resp[1] |= FIELD_EX32(card_status, CSR, WP_VIOLATION) << 5;
+    resp[1] |= FIELD_EX32(card_status, CSR, ERASE_PARAM) << 6;
+    resp[1] |= FIELD_EX32(card_status, CSR, OUT_OF_RANGE) << 7;
 }
 
 static void sd_response_r3_make(SDState *sd, uint8_t *response)
@@ -835,11 +861,16 @@ static void sd_response_r3_make(SDState *sd, uint8_t *response)
 
 static void sd_response_r6_make(SDState *sd, uint8_t *response)
 {
+    uint32_t card_status = sd->card_status;
     uint16_t status;
 
-    status = ((sd->card_status >> 8) & 0xc000) |
-             ((sd->card_status >> 6) & 0x2000) |
-              (sd->card_status & 0x1fff);
+    if (sd->has_inject_card_status) {
+        card_status |= sd->inject_card_status;
+    }
+
+    status = ((card_status >> 8) & 0xc000) |
+             ((card_status >> 6) & 0x2000) |
+              (card_status & 0x1fff);
     sd->card_status &= ~(CARD_STATUS_C & 0xc81fff);
     stw_be_p(response + 0, sd->rca);
     stw_be_p(response + 2, status);
@@ -1861,6 +1892,10 @@ static sd_rsp_type_t spi_cmd_SEND_CxD(SDState *sd, SDRequest req,
 /* CMD9 */
 static sd_rsp_type_t spi_cmd_SEND_CSD(SDState *sd, SDRequest req)
 {
+    if (sd->inject_csd && sd->inject_csd->data) {
+        return spi_cmd_SEND_CxD(sd, req, sd->inject_csd->data,
+                                sd->inject_csd->len);
+    }
     return spi_cmd_SEND_CxD(sd, req, sd->csd, sizeof(sd->csd));
 }
 
@@ -1876,6 +1911,10 @@ static sd_rsp_type_t sd_cmd_SEND_CSD(SDState *sd, SDRequest req)
 /* CMD10 */
 static sd_rsp_type_t spi_cmd_SEND_CID(SDState *sd, SDRequest req)
 {
+    if (sd->inject_cid && sd->inject_cid->data) {
+        return spi_cmd_SEND_CxD(sd, req, sd->inject_cid->data,
+                                sd->inject_cid->len);
+    }
     return spi_cmd_SEND_CxD(sd, req, sd->cid, sizeof(sd->cid));
 }
 
@@ -2564,11 +2603,23 @@ send_response:
         break;
 
     case sd_r2_i:
-        memcpy(response, sd->cid, sizeof(sd->cid));
+        if (sd->inject_cid && sd->inject_cid->data) {
+            memset(response, 0, sizeof(sd->cid));
+            memcpy(response, sd->inject_cid->data,
+                   MIN(sd->inject_cid->len, sizeof(sd->cid)));
+        } else {
+            memcpy(response, sd->cid, sizeof(sd->cid));
+        }
         break;
 
     case sd_r2_s:
-        memcpy(response, sd->csd, sizeof(sd->csd));
+        if (sd->inject_csd && sd->inject_csd->data) {
+            memset(response, 0, sizeof(sd->csd));
+            memcpy(response, sd->inject_csd->data,
+                   MIN(sd->inject_csd->len, sizeof(sd->csd)));
+        } else {
+            memcpy(response, sd->csd, sizeof(sd->csd));
+        }
         break;
 
     case sd_r3:
@@ -3058,6 +3109,133 @@ static const SDProto sd_proto_emmc = {
     },
 };
 
+static void sd_inject_data_free(SdInjectData *inj)
+{
+    if (inj) {
+        g_free(inj->data);
+        g_free(inj);
+    }
+}
+
+static void sd_clear_all_injections(SDState *sd)
+{
+    sd_inject_data_free(sd->inject_cid);
+    sd->inject_cid = NULL;
+    sd_inject_data_free(sd->inject_csd);
+    sd->inject_csd = NULL;
+    sd->has_inject_card_status = false;
+    sd->inject_card_status = 0;
+}
+
+static SDState *find_sd_device(const char *id, Error **errp)
+{
+    DeviceState *dev;
+
+    dev = qdev_find_recursive(sysbus_get_default(), id);
+    if (!dev) {
+        error_setg(errp, "Device '%s' not found", id);
+        return NULL;
+    }
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_SDMMC_COMMON)) {
+        return SDMMC_COMMON(dev);
+    }
+
+    error_setg(errp, "Device '%s' is not an SD/MMC card", id);
+    return NULL;
+}
+
+#define SD_INJECT_DATA_MAX_SIZE 16
+
+void qmp_x_sd_inject_response_set(const char *id,
+                                   SdInjectResponseType type,
+                                   const char *data,
+                                   bool has_card_status, uint32_t card_status,
+                                   Error **errp)
+{
+    SDState *sd;
+    SdInjectData *inj;
+    uint8_t *decoded = NULL;
+    size_t decoded_len = 0;
+
+    sd = find_sd_device(id, errp);
+    if (!sd) {
+        return;
+    }
+
+    if (!data && !has_card_status) {
+        error_setg(errp,
+                   "at least one of 'data' or 'card-status' must be specified");
+        return;
+    }
+
+    if (data) {
+        decoded = qbase64_decode(data, -1, &decoded_len, errp);
+        if (!decoded) {
+            return;
+        }
+        if (decoded_len == 0 || decoded_len > SD_INJECT_DATA_MAX_SIZE) {
+            g_free(decoded);
+            error_setg(errp, "data length must be between 1 and %d bytes",
+                       SD_INJECT_DATA_MAX_SIZE);
+            return;
+        }
+
+        inj = g_new0(SdInjectData, 1);
+        inj->data = decoded;
+        inj->len = decoded_len;
+
+        switch (type) {
+        case SD_INJECT_RESPONSE_TYPE_CID:
+            sd_inject_data_free(sd->inject_cid);
+            sd->inject_cid = inj;
+            break;
+        case SD_INJECT_RESPONSE_TYPE_CSD:
+            sd_inject_data_free(sd->inject_csd);
+            sd->inject_csd = inj;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+
+    if (has_card_status) {
+        sd->has_inject_card_status = true;
+        sd->inject_card_status = card_status;
+    }
+}
+
+void qmp_x_sd_inject_response_clear(const char *id,
+                                     bool has_type,
+                                     SdInjectResponseType type,
+                                     Error **errp)
+{
+    SDState *sd;
+
+    sd = find_sd_device(id, errp);
+    if (!sd) {
+        return;
+    }
+
+    if (!has_type) {
+        sd_clear_all_injections(sd);
+        return;
+    }
+
+    switch (type) {
+    case SD_INJECT_RESPONSE_TYPE_CID:
+        sd_inject_data_free(sd->inject_cid);
+        sd->inject_cid = NULL;
+        break;
+    case SD_INJECT_RESPONSE_TYPE_CSD:
+        sd_inject_data_free(sd->inject_csd);
+        sd->inject_csd = NULL;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void sd_instance_init(Object *obj)
 {
     SDState *sd = SDMMC_COMMON(obj);
@@ -3072,6 +3250,7 @@ static void sd_instance_finalize(Object *obj)
 {
     SDState *sd = SDMMC_COMMON(obj);
 
+    sd_clear_all_injections(sd);
     timer_free(sd->ocr_power_timer);
 }
 
