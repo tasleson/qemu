@@ -216,6 +216,8 @@
 
 #include "nvme.h"
 #include "dif.h"
+#include "qemu/base64.h"
+#include "qapi/qapi-commands-nvme.h"
 #include "trace.h"
 
 #define NVME_MAX_IOQPAIRS 0xffff
@@ -5773,6 +5775,18 @@ static uint16_t nvme_identify_ctrl(NvmeCtrl *n, NvmeRequest *req)
 {
     trace_pci_nvme_identify_ctrl();
 
+    if (n->inject_id_ctrl) {
+        uint16_t status = NVME_SUCCESS;
+        if (n->inject_id_ctrl->data) {
+            status = nvme_c2h(n, n->inject_id_ctrl->data,
+                              n->inject_id_ctrl->len, req);
+        }
+        if (n->inject_id_ctrl->has_status) {
+            return n->inject_id_ctrl->status;
+        }
+        return status;
+    }
+
     return nvme_c2h(n, (uint8_t *)&n->id_ctrl, sizeof(n->id_ctrl), req);
 }
 
@@ -5813,6 +5827,21 @@ static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeRequest *req, bool active)
 
     if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
         return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    if (n->inject_id_ns) {
+        NvmeInjectData *inj = g_hash_table_lookup(n->inject_id_ns,
+                                                   GUINT_TO_POINTER(nsid));
+        if (inj) {
+            uint16_t status = NVME_SUCCESS;
+            if (inj->data) {
+                status = nvme_c2h(n, inj->data, inj->len, req);
+            }
+            if (inj->has_status) {
+                return inj->status;
+            }
+            return status;
+        }
     }
 
     ns = nvme_ns(n, nsid);
@@ -9687,6 +9716,168 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
     }
 }
 
+static void nvme_inject_data_free(gpointer data)
+{
+    NvmeInjectData *inj = data;
+    g_free(inj->data);
+    g_free(inj);
+}
+
+static void nvme_clear_all_injections(NvmeCtrl *n)
+{
+    if (n->inject_id_ctrl) {
+        g_free(n->inject_id_ctrl->data);
+        g_free(n->inject_id_ctrl);
+        n->inject_id_ctrl = NULL;
+    }
+    g_clear_pointer(&n->inject_id_ns, g_hash_table_destroy);
+}
+
+static NvmeCtrl *find_nvme_device(const char *id, Error **errp)
+{
+    DeviceState *dev;
+
+    dev = qdev_find_recursive(sysbus_get_default(), id);
+    if (!dev) {
+        error_setg(errp, "Device '%s' not found", id);
+        return NULL;
+    }
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_NVME)) {
+        return NVME(dev);
+    }
+
+    error_setg(errp, "Device '%s' is not an NVMe controller", id);
+    return NULL;
+}
+
+void qmp_x_nvme_inject_response_set(const char *id,
+                                     NvmeInjectResponseType type,
+                                     bool has_nsid, uint32_t nsid,
+                                     const char *data,
+                                     bool has_status, uint16_t status,
+                                     Error **errp)
+{
+    NvmeCtrl *n;
+    NvmeInjectData *inj;
+    uint8_t *decoded = NULL;
+    size_t decoded_len = 0;
+
+    n = find_nvme_device(id, errp);
+    if (!n) {
+        return;
+    }
+
+    if (!data && !has_status) {
+        error_setg(errp, "at least one of 'data' or 'status' must be specified");
+        return;
+    }
+
+    if (type == NVME_INJECT_RESPONSE_TYPE_IDENTIFY_CTRL) {
+        if (has_nsid) {
+            error_setg(errp, "nsid must not be specified for identify-ctrl");
+            return;
+        }
+    } else {
+        if (!has_nsid) {
+            error_setg(errp, "nsid is required for identify-ns");
+            return;
+        }
+        if (nsid == 0) {
+            error_setg(errp, "nsid must be non-zero");
+            return;
+        }
+    }
+
+    if (data) {
+        decoded = qbase64_decode(data, -1, &decoded_len, errp);
+        if (!decoded) {
+            return;
+        }
+        if (decoded_len == 0 || decoded_len > NVME_IDENTIFY_DATA_SIZE) {
+            g_free(decoded);
+            error_setg(errp, "data length must be between 1 and %d bytes",
+                       NVME_IDENTIFY_DATA_SIZE);
+            return;
+        }
+    }
+
+    inj = g_new0(NvmeInjectData, 1);
+    inj->data = decoded;
+    inj->len = decoded_len;
+    inj->has_status = has_status;
+    inj->status = status;
+
+    switch (type) {
+    case NVME_INJECT_RESPONSE_TYPE_IDENTIFY_CTRL:
+        if (n->inject_id_ctrl) {
+            g_free(n->inject_id_ctrl->data);
+            g_free(n->inject_id_ctrl);
+        }
+        n->inject_id_ctrl = inj;
+        break;
+    case NVME_INJECT_RESPONSE_TYPE_IDENTIFY_NS:
+        if (!n->inject_id_ns) {
+            n->inject_id_ns = g_hash_table_new_full(g_direct_hash,
+                                                     g_direct_equal,
+                                                     NULL,
+                                                     nvme_inject_data_free);
+        }
+        g_hash_table_insert(n->inject_id_ns, GUINT_TO_POINTER(nsid), inj);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+void qmp_x_nvme_inject_response_clear(const char *id,
+                                       bool has_type,
+                                       NvmeInjectResponseType type,
+                                       bool has_nsid, uint32_t nsid,
+                                       Error **errp)
+{
+    NvmeCtrl *n;
+
+    n = find_nvme_device(id, errp);
+    if (!n) {
+        return;
+    }
+
+    if (!has_type) {
+        if (has_nsid) {
+            error_setg(errp, "nsid must not be specified without type");
+            return;
+        }
+        nvme_clear_all_injections(n);
+        return;
+    }
+
+    switch (type) {
+    case NVME_INJECT_RESPONSE_TYPE_IDENTIFY_CTRL:
+        if (has_nsid) {
+            error_setg(errp, "nsid must not be specified for identify-ctrl");
+            return;
+        }
+        if (n->inject_id_ctrl) {
+            g_free(n->inject_id_ctrl->data);
+            g_free(n->inject_id_ctrl);
+            n->inject_id_ctrl = NULL;
+        }
+        break;
+    case NVME_INJECT_RESPONSE_TYPE_IDENTIFY_NS:
+        if (!has_nsid) {
+            error_setg(errp, "nsid is required for identify-ns");
+            return;
+        }
+        if (n->inject_id_ns) {
+            g_hash_table_remove(n->inject_id_ns, GUINT_TO_POINTER(nsid));
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void nvme_exit(PCIDevice *pci_dev)
 {
     NvmeCtrl *n = NVME(pci_dev);
@@ -9703,6 +9894,8 @@ static void nvme_exit(PCIDevice *pci_dev)
     }
 
     nvme_subsys_unregister_ctrl(n->subsys, n);
+
+    nvme_clear_all_injections(n);
 
     g_free(n->cq);
     g_free(n->sq);

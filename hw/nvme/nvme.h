@@ -588,6 +588,13 @@ typedef struct NvmeParams {
     bool     atomic_dn;
 } NvmeParams;
 
+typedef struct NvmeInjectData {
+    uint8_t *data;
+    uint32_t len;
+    bool has_status;
+    uint16_t status;
+} NvmeInjectData;
+
 typedef struct NvmeCtrl {
     PCIDevice    parent_obj;
     MemoryRegion bar0;
@@ -681,6 +688,10 @@ typedef struct NvmeCtrl {
 
     /* Socket mapping to SPDM over NVMe Security In/Out commands */
     int spdm_socket;
+
+    /* Response injection for fuzzing (not migrated) */
+    NvmeInjectData *inject_id_ctrl;
+    GHashTable *inject_id_ns; /* NSID -> NvmeInjectData */
 
     /* Migration-related stuff */
     Error *migration_blocker;
