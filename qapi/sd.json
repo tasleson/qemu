@@ -1,0 +1,98 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+#
+# This work is licensed under the terms of the GNU GPL, version 2 or later.
+# See the COPYING file in the top-level directory.
+
+##
+# ****************************
+# SD/MMC device infrastructure
+# ****************************
+##
+
+##
+# @SdInjectResponseType:
+#
+# The type of SD/MMC card response data to override.
+#
+# @cid: Card Identification (CID) register — the 16-byte
+#     identification data returned in R2 responses.
+#
+# @csd: Card Specific Data (CSD) register — the 16-byte
+#     card-specific data returned in R2 responses.
+#
+# Since: 11.2
+##
+{ 'enum': 'SdInjectResponseType',
+  'data': [ 'cid', 'csd' ] }
+
+##
+# @x-sd-inject-response-set:
+#
+# Set an SD/MMC card response override on an SD or eMMC card device.
+# The override data completely replaces the normal response for the
+# specified register with no validation or length checks.
+# Alternatively, card status error bits can be injected to simulate
+# error conditions in R1 responses.  This is intended for fuzzing
+# guest software by returning arbitrary data or error conditions.
+#
+# @id: the device ID of the SD/MMC card device.
+#
+# @type: which response data to override
+#
+# @data: base64-encoded response data (up to 16 bytes for CID/CSD).
+#     This data replaces the entire register content verbatim.
+#     At least one of @data or @card-status must be specified.
+#
+# @card-status: card status register bits to OR into the card_status
+#     field when any R1 response is generated.  At least one of @data
+#     or @card-status must be specified.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-sd-inject-response-set",
+#          "arguments": { "id": "sd0",
+#                         "type": "cid",
+#                         "data": "AQIDBA..." } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-sd-inject-response-set',
+  'data': { 'id': 'str',
+            'type': 'SdInjectResponseType',
+            '*data': 'str',
+            '*card-status': 'uint32' },
+  'features': [ 'unstable' ] }
+
+##
+# @x-sd-inject-response-clear:
+#
+# Clear SD/MMC card response overrides from an SD or eMMC card device.
+#
+# @id: the device ID of the SD/MMC card device.
+#
+# @type: which override to clear.  If not specified, clears all
+#     overrides on the device including card-status injection.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-sd-inject-response-clear",
+#          "arguments": { "id": "sd0",
+#                         "type": "cid" } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-sd-inject-response-clear',
+  'data': { 'id': 'str',
+            '*type': 'SdInjectResponseType' },
+  'features': [ 'unstable' ] }
