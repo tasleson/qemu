@@ -213,6 +213,9 @@ run_vm() {
     echo "    MegaRAID    : megasas-disk1"
     echo "    PVSCSI      : pvscsi-disk1"
     echo ""
+    echo "  NVMe response injection (use with x-nvme-inject-response-set):"
+    echo "    NVMe        : nvme-disk1"
+    echo ""
 
     local args=()
 

@@ -1,0 +1,107 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+#
+# This work is licensed under the terms of the GNU GPL, version 2 or later.
+# See the COPYING file in the top-level directory.
+
+##
+# ****************************
+# NVMe device infrastructure
+# ****************************
+##
+
+##
+# @NvmeInjectResponseType:
+#
+# The type of NVMe identify response to override.
+#
+# @identify-ctrl: Identify Controller (CNS 01h) response.
+#
+# @identify-ns: Identify Namespace (CNS 00h) response.
+#
+# Since: 11.2
+##
+{ 'enum': 'NvmeInjectResponseType',
+  'data': [ 'identify-ctrl', 'identify-ns' ] }
+
+##
+# @x-nvme-inject-response-set:
+#
+# Set an NVMe identify response override on an NVMe controller.
+# The override data completely replaces the normal response for the
+# specified identify command with no validation or length checks.
+# Alternatively, a status code can be injected to simulate command
+# failures.  This is intended for fuzzing guest software by returning
+# arbitrary data or error conditions.
+#
+# @id: the device ID of the NVMe controller.
+#
+# @type: which identify response to override
+#
+# @nsid: namespace ID (1-based).  Required for identify-ns type.
+#     Must not be present for identify-ctrl.
+#
+# @data: base64-encoded response data.  This data replaces the
+#     entire response buffer verbatim.  At least one of @data or
+#     @status must be specified.  If both are given, the status
+#     code is returned along with the data.
+#
+# @status: NVMe status code to return in the completion queue
+#     entry.  At least one of @data or @status must be specified.
+#     If only @status is given (without @data), the command fails
+#     with this status and no data is transferred.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-nvme-inject-response-set",
+#          "arguments": { "id": "nvme0",
+#                         "type": "identify-ctrl",
+#                         "data": "AQIDBA..." } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-nvme-inject-response-set',
+  'data': { 'id': 'str',
+            'type': 'NvmeInjectResponseType',
+            '*nsid': 'uint32',
+            '*data': 'str',
+            '*status': 'uint16' },
+  'features': [ 'unstable' ] }
+
+##
+# @x-nvme-inject-response-clear:
+#
+# Clear NVMe identify response overrides from an NVMe controller.
+#
+# @id: the device ID of the NVMe controller.
+#
+# @type: which override to clear.  If not specified, clears all
+#     overrides on the controller.
+#
+# @nsid: namespace ID.  Required when type is identify-ns.
+#     Must not be present for identify-ctrl or when type is absent.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-nvme-inject-response-clear",
+#          "arguments": { "id": "nvme0",
+#                         "type": "identify-ns",
+#                         "nsid": 1 } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-nvme-inject-response-clear',
+  'data': { 'id': 'str',
+            '*type': 'NvmeInjectResponseType',
+            '*nsid': 'uint32' },
+  'features': [ 'unstable' ] }
