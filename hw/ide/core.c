@@ -38,6 +38,8 @@
 #include "hw/block/block.h"
 #include "system/block-backend.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-ide.h"
+#include "qemu/base64.h"
 #include "qemu/cutils.h"
 #include "system/replay.h"
 #include "system/runstate.h"
@@ -1448,6 +1450,27 @@ static bool cmd_data_set_management(IDEState *s, uint8_t cmd)
 static bool cmd_identify(IDEState *s, uint8_t cmd)
 {
     if (s->blk && s->drive_kind != IDE_CD) {
+        if (s->inject_identify) {
+            if (s->inject_identify->data) {
+                memcpy(s->io_buffer, s->inject_identify->data,
+                       s->inject_identify->len);
+                if (s->inject_identify->len < 512) {
+                    memset(s->io_buffer + s->inject_identify->len, 0,
+                           512 - s->inject_identify->len);
+                }
+            }
+            if (s->inject_identify->has_error) {
+                s->status = READY_STAT | ERR_STAT;
+                s->error = s->inject_identify->error;
+                ide_transfer_stop(s);
+                ide_bus_set_irq(s->bus);
+                return true;
+            }
+            s->status = READY_STAT | SEEK_STAT;
+            ide_transfer_start(s, s->io_buffer, 512, ide_transfer_stop);
+            ide_bus_set_irq(s->bus);
+            return false;
+        }
         if (s->drive_kind != IDE_CFATA) {
             ide_identify(s);
         } else {
@@ -1946,6 +1969,28 @@ static bool cmd_smart(IDEState *s, uint8_t cmd)
         return true;
 
     case SMART_READ_THRESH:
+        if (s->inject_smart_thresh) {
+            if (s->inject_smart_thresh->data) {
+                memcpy(s->io_buffer, s->inject_smart_thresh->data,
+                       s->inject_smart_thresh->len);
+                if (s->inject_smart_thresh->len < 512) {
+                    memset(s->io_buffer + s->inject_smart_thresh->len, 0,
+                           512 - s->inject_smart_thresh->len);
+                }
+            }
+            if (s->inject_smart_thresh->has_error) {
+                s->status = READY_STAT | ERR_STAT;
+                s->error = s->inject_smart_thresh->error;
+                ide_transfer_stop(s);
+                ide_bus_set_irq(s->bus);
+                return true;
+            }
+            s->status = READY_STAT | SEEK_STAT;
+            ide_transfer_start(s, s->io_buffer, 0x200, ide_transfer_stop);
+            ide_bus_set_irq(s->bus);
+            return false;
+        }
+
         memset(s->io_buffer, 0, 0x200);
         s->io_buffer[0] = 0x01; /* smart struct version */
 
@@ -1966,6 +2011,28 @@ static bool cmd_smart(IDEState *s, uint8_t cmd)
         return false;
 
     case SMART_READ_DATA:
+        if (s->inject_smart_data) {
+            if (s->inject_smart_data->data) {
+                memcpy(s->io_buffer, s->inject_smart_data->data,
+                       s->inject_smart_data->len);
+                if (s->inject_smart_data->len < 512) {
+                    memset(s->io_buffer + s->inject_smart_data->len, 0,
+                           512 - s->inject_smart_data->len);
+                }
+            }
+            if (s->inject_smart_data->has_error) {
+                s->status = READY_STAT | ERR_STAT;
+                s->error = s->inject_smart_data->error;
+                ide_transfer_stop(s);
+                ide_bus_set_irq(s->bus);
+                return true;
+            }
+            s->status = READY_STAT | SEEK_STAT;
+            ide_transfer_start(s, s->io_buffer, 0x200, ide_transfer_stop);
+            ide_bus_set_irq(s->bus);
+            return false;
+        }
+
         memset(s->io_buffer, 0, 0x200);
         s->io_buffer[0] = 0x01; /* smart struct version */
 
@@ -2815,8 +2882,147 @@ void ide_bus_set_irq(IDEBus *bus)
     }
 }
 
+static void ide_inject_data_free(IdeInjectData *inj)
+{
+    if (inj) {
+        g_free(inj->data);
+        g_free(inj);
+    }
+}
+
+static void ide_clear_all_injections(IDEState *s)
+{
+    ide_inject_data_free(s->inject_identify);
+    s->inject_identify = NULL;
+    ide_inject_data_free(s->inject_smart_data);
+    s->inject_smart_data = NULL;
+    ide_inject_data_free(s->inject_smart_thresh);
+    s->inject_smart_thresh = NULL;
+}
+
+static IDEState *find_ide_device(const char *id, Error **errp)
+{
+    DeviceState *dev;
+    IDEDevice *idedev;
+    IDEBus *bus;
+
+    dev = qdev_find_recursive(sysbus_get_default(), id);
+    if (!dev) {
+        error_setg(errp, "Device '%s' not found", id);
+        return NULL;
+    }
+
+    if (!object_dynamic_cast(OBJECT(dev), "ide-hd")) {
+        error_setg(errp, "Device '%s' is not an ide-hd device", id);
+        return NULL;
+    }
+
+    idedev = IDE_DEVICE(dev);
+    bus = DO_UPCAST(IDEBus, qbus, dev->parent_bus);
+    return &bus->ifs[idedev->unit];
+}
+
+void qmp_x_ide_inject_response_set(const char *id,
+                                    IdeInjectResponseType type,
+                                    const char *data,
+                                    bool has_error, uint8_t error,
+                                    Error **errp)
+{
+    IDEState *s;
+    IdeInjectData *inj;
+    uint8_t *decoded = NULL;
+    size_t decoded_len = 0;
+
+    s = find_ide_device(id, errp);
+    if (!s) {
+        return;
+    }
+
+    if (!data && !has_error) {
+        error_setg(errp,
+                   "at least one of 'data' or 'error' must be specified");
+        return;
+    }
+
+    if (has_error && error == 0) {
+        error_setg(errp, "error register value must be non-zero");
+        return;
+    }
+
+    if (data) {
+        decoded = qbase64_decode(data, -1, &decoded_len, errp);
+        if (!decoded) {
+            return;
+        }
+        if (decoded_len == 0 || decoded_len > 512) {
+            g_free(decoded);
+            error_setg(errp, "data length must be between 1 and 512 bytes");
+            return;
+        }
+    }
+
+    inj = g_new0(IdeInjectData, 1);
+    inj->data = decoded;
+    inj->len = decoded_len;
+    inj->has_error = has_error;
+    inj->error = error;
+
+    switch (type) {
+    case IDE_INJECT_RESPONSE_TYPE_IDENTIFY_DEVICE:
+        ide_inject_data_free(s->inject_identify);
+        s->inject_identify = inj;
+        break;
+    case IDE_INJECT_RESPONSE_TYPE_SMART_READ_DATA:
+        ide_inject_data_free(s->inject_smart_data);
+        s->inject_smart_data = inj;
+        break;
+    case IDE_INJECT_RESPONSE_TYPE_SMART_READ_THRESH:
+        ide_inject_data_free(s->inject_smart_thresh);
+        s->inject_smart_thresh = inj;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+void qmp_x_ide_inject_response_clear(const char *id,
+                                      bool has_type,
+                                      IdeInjectResponseType type,
+                                      Error **errp)
+{
+    IDEState *s;
+
+    s = find_ide_device(id, errp);
+    if (!s) {
+        return;
+    }
+
+    if (!has_type) {
+        ide_clear_all_injections(s);
+        return;
+    }
+
+    switch (type) {
+    case IDE_INJECT_RESPONSE_TYPE_IDENTIFY_DEVICE:
+        ide_inject_data_free(s->inject_identify);
+        s->inject_identify = NULL;
+        break;
+    case IDE_INJECT_RESPONSE_TYPE_SMART_READ_DATA:
+        ide_inject_data_free(s->inject_smart_data);
+        s->inject_smart_data = NULL;
+        break;
+    case IDE_INJECT_RESPONSE_TYPE_SMART_READ_THRESH:
+        ide_inject_data_free(s->inject_smart_thresh);
+        s->inject_smart_thresh = NULL;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 void ide_exit(IDEState *s)
 {
+    ide_clear_all_injections(s);
     timer_free(s->sector_write_timer);
     qemu_vfree(s->smart_selftest_data);
     qemu_vfree(s->io_buffer);
