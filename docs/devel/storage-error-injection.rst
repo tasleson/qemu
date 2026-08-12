@@ -280,7 +280,9 @@ QMP commands
 
 Arguments:
 
-- ``id`` (string, required): device ID of the scsi-hd or scsi-cd device
+- ``id`` (string, required): device ID of the scsi-hd, scsi-cd, or
+  usb-storage device (USB mass storage devices are resolved to their
+  internal SCSI disk automatically)
 - ``type`` (string, required): ``inquiry-standard``, ``inquiry-vpd``, or
   ``mode-sense-page``
 - ``page`` (int, 0--255): page code; required for ``inquiry-vpd`` and
@@ -330,8 +332,11 @@ Notes
   (serial number), this means a maximum serial string of 65532 bytes
   (65536 minus the 4-byte VPD header).
 
-- Overrides apply only to ``scsi-hd`` and ``scsi-cd`` devices (emulated
-  SCSI).  They have no effect on ``scsi-block`` (passthrough) devices,
+- Overrides apply to ``scsi-hd`` and ``scsi-cd`` devices (emulated
+  SCSI), including the internal SCSI disk inside ``usb-storage`` devices.
+  When targeting a ``usb-storage`` device, pass its device ID and the
+  injection commands will automatically resolve to the internal SCSI disk.
+  Overrides have no effect on ``scsi-block`` (passthrough) devices,
   which route INQUIRY and MODE SENSE directly to the host via SG_IO.
 
 - Overrides are not migrated.  After live migration, the fuzzer harness
