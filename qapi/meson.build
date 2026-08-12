@@ -65,6 +65,7 @@ if have_system
     'qdev',
     'pci',
     'scsi',
+    'nvme',
     'rocker',
     'misc-arm',
     'misc-i386',
