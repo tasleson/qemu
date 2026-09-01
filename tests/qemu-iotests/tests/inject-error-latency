@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+# group: rw quick
+#
+# Test latency injection in the inject-error block filter
+#
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+import contextlib
+import os
+import time
+from threading import Thread
+from typing import Any, Dict, List, Optional
+
+import iotests
+from iotests import qemu_img_create, qemu_io, QMPTestCase, QemuStorageDaemon
+
+
+disk = os.path.join(iotests.test_dir, 'disk.img')
+nbd_sock = os.path.join(iotests.sock_dir, 'inject-error-nbd.sock')
+nbd_url = f'nbd+unix:///err0?socket={nbd_sock}'
+
+# Rules use a hold time far longer than a local read takes, so that
+# "was it delayed?" can be decided with a generous margin.
+HOLD_MS = 3000
+MARGIN_S = 1.0
+
+
+@contextlib.contextmanager
+def quiet_stderr():
+    """
+    Silence the daemon's stderr for as long as it lives.  An export
+    request that fails makes the NBD server log a client disconnect, and
+    the error tests below provoke exactly that.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+class IoThread(Thread):
+    """Run qemu-io commands against the export in the background."""
+
+    def __init__(self, *args: str) -> None:
+        super().__init__()
+        self.args = args
+        self.returncode: Optional[int] = None
+        self.output = ''
+
+    def run(self) -> None:
+        res = qemu_io('-f', 'raw', *self.args, nbd_url, check=False)
+        self.returncode = res.returncode
+        self.output = res.stdout
+
+
+class TestInjectErrorLatency(QMPTestCase):
+    def setUp(self) -> None:
+        # Fully allocated: the NBD server answers reads of a hole from
+        # block status alone, and those never reach the filter.
+        qemu_img_create('-f', 'raw', '-o', 'preallocation=full', disk, '16M')
+
+        with quiet_stderr():
+            self.qsd = QemuStorageDaemon(
+                '--blockdev', f'file,node-name=file0,filename={disk}',
+                '--blockdev', 'inject-error,node-name=err0,image=file0',
+                '--nbd-server', f'addr.type=unix,addr.path={nbd_sock}',
+                '--export', 'nbd,id=exp0,node-name=err0,writable=true',
+                qmp=True
+            )
+
+    def tearDown(self) -> None:
+        # Nothing may be left held, or the daemon would not shut down
+        self.qsd.cmd('x-inject-error-delay-remove', {'node-name': 'err0'})
+        self.qsd.cmd('x-inject-error-delay-release', {'node-name': 'err0'})
+        self.qsd.stop()
+        os.remove(disk)
+
+    # Helpers
+
+    def add_rule(self, **rule: Any) -> None:
+        self.qsd.cmd('x-inject-error-delay-add',
+                     {'node-name': 'err0', 'rule': rule})
+
+    def rules(self) -> List[Dict[str, Any]]:
+        return self.qsd.cmd('x-inject-error-delay-list',
+                            {'node-name': 'err0'})
+
+    def inflight(self) -> List[Dict[str, Any]]:
+        return self.qsd.cmd('x-inject-error-delay-inflight',
+                            {'node-name': 'err0'})
+
+    def wait_for_held(self, count: int = 1) -> List[Dict[str, Any]]:
+        """
+        Wait for @count requests to be held.  Reaching this at all proves
+        that holding a request leaves the daemon's event loop running:
+        the QMP command below is served while the request is outstanding.
+        """
+        for _ in range(500):
+            held = self.inflight()
+            if len(held) >= count:
+                return held
+            time.sleep(0.01)
+        self.fail(f'{count} request(s) never showed up as held')
+        return []
+
+    def timed_io(self, *args: str) -> 'tuple[float, int, str]':
+        start = time.monotonic()
+        res = qemu_io('-f', 'raw', *args, nbd_url, check=False)
+        return (time.monotonic() - start, res.returncode, res.stdout)
+
+    # Tests
+
+    def test_fixed_latency(self) -> None:
+        self.add_rule(id='fixed', ops=['read'], **{'delay-ms': HOLD_MS})
+
+        elapsed, ret, _ = self.timed_io('-c', 'read 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertGreater(elapsed, MARGIN_S)
+
+        # The rule only covers reads, so a write is not held
+        elapsed, ret, _ = self.timed_io('-c', 'write 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertLess(elapsed, MARGIN_S)
+
+        self.qsd.cmd('x-inject-error-delay-remove',
+                     {'node-name': 'err0', 'id': 'fixed'})
+        elapsed, ret, _ = self.timed_io('-c', 'read 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertLess(elapsed, MARGIN_S)
+
+    def test_delayed_failure(self) -> None:
+        """A request that fails only after the guest has timed it out."""
+        self.add_rule(id='late-fail', ops=['read'],
+                      **{'delay-ms': HOLD_MS, 'errno': 5})
+
+        elapsed, ret, out = self.timed_io('-c', 'read 0 4k')
+        self.assertNotEqual(ret, 0)
+        self.assertGreater(elapsed, MARGIN_S)
+        self.assertIn('Input/output error', out)
+
+    def test_flush_latency(self) -> None:
+        """Flushes can be held on their own, which matters during boot."""
+        self.add_rule(id='flush', ops=['flush'], stall=True)
+
+        # qemu-io flushes when it closes the image, so this run performs
+        # a read and a flush; only the flush must end up held.
+        io = IoThread('-c', 'read 0 4k')
+        io.start()
+
+        held = self.wait_for_held()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]['op'], 'flush')
+        self.assertNotIn('sector', held[0])
+        self.assertTrue(io.is_alive())
+
+        self.qsd.cmd('x-inject-error-delay-release', {'node-name': 'err0'})
+        io.join()
+        self.assertEqual(io.returncode, 0)
+
+    def test_stall_and_release(self) -> None:
+        self.add_rule(id='stall', ops=['read'], stall=True)
+
+        reader = IoThread('-c', 'read 0 4k')
+        reader.start()
+
+        held = self.wait_for_held()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]['rule-id'], 'stall')
+        self.assertEqual(held[0]['op'], 'read')
+        self.assertTrue(held[0]['stalled'])
+
+        # A write is not covered by the rule and overtakes the stalled read
+        elapsed, ret, _ = self.timed_io('-c', 'write 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertLess(elapsed, MARGIN_S)
+        self.assertTrue(reader.is_alive())
+
+        res = self.qsd.cmd('x-inject-error-delay-release',
+                           {'node-name': 'err0',
+                            'request-id': held[0]['id'],
+                            'disposition': 'complete'})
+        self.assertEqual(res['count'], 1)
+
+        reader.join()
+        self.assertEqual(reader.returncode, 0)
+        self.assertEqual(self.inflight(), [])
+
+    def test_stall_and_fail(self) -> None:
+        self.add_rule(id='stall', ops=['read'], stall=True)
+
+        reader = IoThread('-c', 'read 0 4k')
+        reader.start()
+        self.wait_for_held()
+
+        res = self.qsd.cmd('x-inject-error-delay-release',
+                           {'node-name': 'err0', 'disposition': 'error',
+                            'errno': 5})
+        self.assertEqual(res['count'], 1)
+
+        reader.join()
+        self.assertNotEqual(reader.returncode, 0)
+        self.assertIn('Input/output error', reader.output)
+
+    def test_max_hits(self) -> None:
+        self.add_rule(id='once', ops=['read'],
+                      **{'delay-ms': HOLD_MS, 'max-hits': 1})
+
+        elapsed, ret, _ = self.timed_io('-c', 'read 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertGreater(elapsed, MARGIN_S)
+
+        # The rule is gone once its budget is used up
+        self.assertEqual(self.rules(), [])
+        elapsed, ret, _ = self.timed_io('-c', 'read 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertLess(elapsed, MARGIN_S)
+
+    def test_sector_range(self) -> None:
+        self.add_rule(id='range', ops=['read'], sector=1024, count=8,
+                      **{'delay-ms': HOLD_MS})
+
+        elapsed, ret, _ = self.timed_io('-c', 'read 0 4k')
+        self.assertEqual(ret, 0)
+        self.assertLess(elapsed, MARGIN_S)
+
+        elapsed, ret, _ = self.timed_io('-c', 'read 512k 4k')
+        self.assertEqual(ret, 0)
+        self.assertGreater(elapsed, MARGIN_S)
+
+    def test_rule_management(self) -> None:
+        self.add_rule(id='a', ops=['read'], **{'delay-ms': 10})
+        self.add_rule(id='b', **{'delay-ms': 20, 'probability': 0.5})
+
+        rules = self.rules()
+        self.assertEqual([r['id'] for r in rules], ['a', 'b'])
+        self.assertEqual(rules[0]['ops'], ['read'])
+        self.assertEqual(rules[0]['delay-ms'], 10)
+        self.assertEqual(rules[1]['probability'], 0.5)
+        # An unrestricted rule covers every kind of I/O and the whole device
+        self.assertEqual(len(rules[1]['ops']), 5)
+        self.assertNotIn('count', rules[1])
+
+        self.assertRaises(Exception, self.add_rule, id='a')
+        self.assertRaises(Exception, self.add_rule, id='c',
+                          **{'probability': 2.0})
+        self.assertRaises(Exception, self.add_rule, id='c',
+                          **{'delay-ms': 100, 'delay-max-ms': 50})
+
+        res = self.qsd.cmd('x-inject-error-delay-remove',
+                           {'node-name': 'err0', 'id': 'a'})
+        self.assertEqual(res['count'], 1)
+        self.assertEqual([r['id'] for r in self.rules()], ['b'])
+
+        res = self.qsd.cmd('x-inject-error-delay-remove',
+                           {'node-name': 'err0'})
+        self.assertEqual(res['count'], 1)
+        self.assertEqual(self.rules(), [])
+
+
+if __name__ == '__main__':
+    # Latency injection is format agnostic; it sits below the format layer
+    iotests.main(supported_fmts=['raw'],
+                 supported_protocols=['file'])
