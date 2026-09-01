@@ -509,7 +509,8 @@ disks behind inject-error filters::
 
 The VM is configured with:
 
-- A 40G boot disk on virtio-blk (install Fedora here)
+- A 40G boot disk on virtio-blk behind an inject-error filter (install
+  Fedora here)
 - Three 10G SCSI disks on a virtio-scsi bus, each behind an
   inject-error filter
 - A QMP Unix socket for runtime control
@@ -517,17 +518,44 @@ The VM is configured with:
 
 Device and node names:
 
-====== ========= =========== ==================
+====== ========= =========== ===========================================
 Disk   Device ID Block Node  Description
-====== ========= =========== ==================
+====== ========= =========== ===========================================
+boot   disk0     err0        virtio-blk system disk, inject-error filter
 1      disk1     err1        SCSI disk with inject-error filter
 2      disk2     err2        SCSI disk with inject-error filter
 3      disk3     err3        SCSI disk with inject-error filter
-====== ========= =========== ==================
+====== ========= =========== ===========================================
 
 Use ``disk1``/``disk2``/``disk3`` with ``x-scsi-disk-inject-response-set``
-and ``scsi-inject.py``.  Use ``err1``/``err2``/``err3`` with
-``x-inject-error-add``.
+and ``scsi-inject.py``; SCSI response injection does not apply to the boot
+disk, which is virtio-blk.  Use ``err0`` through ``err3`` with
+``x-inject-error-add`` and the latency commands.
+
+Injecting on the system disk
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``err0`` is the disk the guest is running from, which makes it the most
+realistic target and the most awkward one.  Three things to plan for.
+
+The guest usually cannot report what happened, because the log it would
+write lives on the disk that is failing.  Arrange an observable that does
+not touch storage -- a serial console, or the QEMU-side trace events --
+before injecting anything there.
+
+Failures on the system disk tend to end the experiment rather than
+produce a result: an error on the paging path is a guest crash, and on
+some guests the crash dump is written by a separate driver instance that
+will hit the same injected failure.
+
+The image can be left inconsistent, and a stall on ``err0`` holds up VM
+shutdown until it is released.  Work from a copy, or from an overlay
+created with ``qemu-img create -f qcow2 -b boot.qcow2 -F qcow2``, so each
+run starts from a known state.
+
+The data disks are the better instrument for everything that does not
+specifically require the boot path: the guest stays alive and able to
+report, and a run costs seconds rather than a reinstall.
 
 
 Walkthrough: End-to-End Example

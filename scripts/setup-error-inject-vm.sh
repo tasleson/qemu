@@ -5,7 +5,7 @@
 # Set up and run a QEMU VM for SCSI error injection testing.
 #
 # Creates:
-#   - A boot disk for Fedora installation
+#   - A boot disk for Fedora installation, behind an inject-error filter
 #   - 3 additional sparse SCSI disks with inject-error filters
 #   - QMP socket for runtime error/response injection
 #
@@ -51,6 +51,10 @@ Environment variables:
   CPUS        VM CPU count (default: ${CPUS})
 
 QMP socket: ${QMP_SOCK}
+
+Block nodes for injection:
+  err0        boot disk (virtio-blk) -- the running system's disk
+  err1..err3  data disks (virtio-scsi)
 
 After booting, inject errors/responses via QMP:
   # Add a bad sector on scsi-disk1
@@ -118,10 +122,14 @@ run_vm() {
 
     echo "Starting VM..."
     echo "  QMP socket: ${QMP_SOCK}"
-    echo "  Boot disk:  ${BOOT_DISK}"
+    echo "  Boot disk:  ${BOOT_DISK} (virtio-blk, inject-error filter)"
     echo "  SCSI disks: scsi-disk[1-3] with inject-error filters"
-    echo "  Nodes:      err1, err2, err3 (for x-inject-error-add)"
+    echo "  Nodes:      err0 (boot), err1, err2, err3"
     echo "  Devices:    disk1, disk2, disk3 (for x-scsi-disk-inject-response-set)"
+    echo ""
+    echo "  Note: err0 is the running system's disk.  Injecting there can"
+    echo "        bugcheck or corrupt the guest, and a stall on it will hold"
+    echo "        up VM shutdown until released.  Back the image up first."
     echo ""
 
     exec "${QEMU}" \
@@ -139,9 +147,10 @@ run_vm() {
         -net nic,model=virtio-net-pci \
         -net passt,tcp-ports=2222:22 \
         \
-        -blockdev driver=file,filename="${BOOT_DISK}",node-name=boot-file \
-        -blockdev driver=qcow2,file=boot-file,node-name=boot \
-        -device virtio-blk-pci,drive=boot,bootindex=0 \
+        -blockdev driver=file,filename="${BOOT_DISK}",node-name=file0 \
+        -blockdev driver=qcow2,file=file0,node-name=raw0 \
+        -blockdev driver=inject-error,image=raw0,node-name=err0 \
+        -device virtio-blk-pci,drive=err0,bootindex=0,id=disk0 \
         \
         -device virtio-scsi-pci,id=scsi0 \
         \
@@ -203,7 +212,7 @@ cmd_status() {
     fi
 
     for disk_info in \
-        "${BOOT_DISK}:boot disk" \
+        "${BOOT_DISK}:boot disk (disk0/err0)" \
         "${SCSI_DISK1}:SCSI disk 1 (disk1/err1)" \
         "${SCSI_DISK2}:SCSI disk 2 (disk2/err2)" \
         "${SCSI_DISK3}:SCSI disk 3 (disk3/err3)"; do
