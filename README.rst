@@ -8,9 +8,11 @@ storage hardware errors and unusual device responses.
 
 It adds two runtime-controllable injection mechanisms:
 
-- **Block-layer I/O error injection** -- a filter driver (``inject-error``)
-  that sits in front of any disk image and returns errors (EIO, ENOSPC, etc.)
-  for configurable sector ranges, simulating bad sectors and media failures.
+- **Block-layer I/O error and latency injection** -- a filter driver
+  (``inject-error``) that sits in front of any disk image.  It returns errors
+  (EIO, ENOSPC, etc.) for configurable sector ranges, simulating bad sectors
+  and media failures, and it can hold requests -- for a fixed time, a random
+  time, or indefinitely -- to simulate slow, stalled and timing-out storage.
 
 - **SCSI response injection** -- overrides for INQUIRY and MODE SENSE
   responses on emulated SCSI devices, allowing you to present arbitrary
@@ -32,6 +34,13 @@ What you can do with this
 
 - Override MODE SENSE pages to test how guest drivers handle unexpected
   caching, geometry, or device characteristic responses.
+
+- Hold I/O requests to reproduce the timing failures that guest storage
+  drivers are worst at: fixed and tail latency, complete stalls, completions
+  that arrive after the guest has already timed the request out, flush-only
+  latency, queue saturation, out-of-order completion, and completions racing
+  a device reset.  Requests are held asynchronously, so the guest keeps
+  running and takes its own recovery paths.
 
 - Spin up a ready-made test VM with multiple SCSI disks behind
   inject-error filters using the included setup script.

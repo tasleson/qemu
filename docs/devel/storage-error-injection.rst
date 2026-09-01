@@ -5,7 +5,7 @@ QEMU provides two complementary mechanisms for testing how guest software
 handles storage errors and unusual hardware responses:
 
 - **inject-error** block filter driver -- injects I/O errors (bad sectors)
-  at the block layer
+  and latency (slow, stalled and timing-out requests) at the block layer
 - **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
   at the SCSI emulation layer
 
@@ -108,6 +108,132 @@ Error behaviors
 
 ``transient``
     The error fires once, then the entry is automatically removed.
+
+Latency Injection
+-----------------
+
+Bad sectors cover the case where the disk answers quickly with an error.
+Guest drivers are usually much weaker at the other case: a disk that
+answers slowly, late, or not at all.  ``inject-error`` covers that with
+*latency rules*, which hold a matching request for a while before passing
+it on to the image or failing it.
+
+A held request only yields its own coroutine.  The QEMU event loop and the
+vCPU threads keep running, so the guest continues to execute, keeps
+queueing I/O, and can time the request out or reset the device while it is
+outstanding.  This is the difference between simulating a slow disk and
+simulating a frozen VMM, and it is what makes the Windows VirtIO storage
+driver take its recovery paths rather than simply stop.
+
+Rules are matched in the order they were added and the first match wins.
+A matching rule is applied before the bad sector entries, so a rule that
+carries an ``errno`` short-circuits the request without the image ever
+seeing it.
+
+Rule options
+^^^^^^^^^^^^
+
+- ``id`` (string, required): name of the rule, used to remove it and
+  reported on held requests
+- ``ops`` (array, default all): any of ``read``, ``write``, ``flush``,
+  ``discard``, ``write-zeroes``
+- ``sector`` / ``count``: sector range the rule covers.  Without ``count``
+  the rule covers the whole device; with it, flushes never match because a
+  flush has no sector range.
+- ``probability`` (0.0--1.0, default 1.0): fraction of matching requests to
+  hold.  This is what tail latency is made of.
+- ``delay-ms`` (default 0) and ``delay-max-ms``: how long to hold the
+  request.  If ``delay-max-ms`` is larger, the hold time is drawn
+  uniformly from the range, which makes held requests complete out of
+  order with respect to later, undelayed ones.
+- ``stall`` (default false): hold the request indefinitely instead.
+- ``errno`` (default 0): fail the request with this error once the hold
+  expires.  Zero means the request is passed on to the image and completes
+  normally.
+- ``max-hits``: drop the rule after it has held this many requests.
+
+The upper bound on ``delay-ms`` is 24 hours; use ``stall`` for anything
+longer.  Randomised hold times come from a per-node PRNG that can be
+seeded at startup with the ``seed`` option, so a run can be reproduced.
+
+Rules can be configured on the command line the same way bad sectors
+are::
+
+    -blockdev driver=inject-error,image=fmt0,node-name=err0,seed=1,\
+             delays.0.id=bootflush,delays.0.ops.0=flush,\
+             delays.0.delay-ms=30000
+
+QMP commands
+^^^^^^^^^^^^
+
+**x-inject-error-delay-add** -- add a rule::
+
+    { "execute": "x-inject-error-delay-add",
+      "arguments": { "node-name": "err0",
+                     "rule": { "id": "tail",
+                               "probability": 0.001,
+                               "delay-ms": 10000,
+                               "delay-max-ms": 60000 } } }
+
+**x-inject-error-delay-remove** -- remove the rule named ``id``, or every
+rule if ``id`` is omitted.  Requests already held are unaffected.
+
+**x-inject-error-delay-list** -- list the rules along with how many
+requests each has held so far.
+
+**x-inject-error-delay-inflight** -- list the requests currently being
+held: request id, rule, operation, sector range, whether the request is
+stalled or has a deadline, and the error it will fail with.
+
+**x-inject-error-delay-release** -- release held requests.  Without
+``request-id`` every held request is released.  ``disposition`` overrides
+what the rule asked for: ``complete`` passes the request on to the image,
+``error`` fails it with ``errno`` (default EIO)::
+
+    { "execute": "x-inject-error-delay-release",
+      "arguments": { "node-name": "err0", "disposition": "error" } }
+
+Drain and device reset
+^^^^^^^^^^^^^^^^^^^^^^
+
+Draining a block node has to make progress, and a guest-initiated device
+reset drains.  A stall therefore ends when the guest resets the device,
+with each request keeping the disposition its rule asked for.  This is
+both a practical necessity -- otherwise a reset would wedge QEMU rather
+than the guest -- and a reasonable model of recovery: the point of the
+test is what the driver does on the way there.
+
+Nothing else releases a stall on its own, so a request left held will
+hold up shutdown of whatever is using the node, in the same way a
+suspended ``blkdebug`` request does.  Release the held requests, or drop
+the rule and let the guest reset the device, before tearing a setup
+down.
+
+Failure modes worth testing
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``scripts/inject-error.py scenario`` sets up a rule for each of these; the
+rule column shows what it configures.
+
+=========================== ================================================
+Scenario                    Rule
+=========================== ================================================
+Fixed latency               ``delay-ms``
+Tail latency                small ``probability`` with a wide delay range
+Complete stall              ``stall``, ended with a release or a reset
+Timeout then success        ``delay-ms`` past the guest's own timeout
+Timeout then failure        the same, plus ``errno``
+Backend disconnect          ``stall`` everything, then release the
+                            outstanding requests with ``--error`` while new
+                            ones keep stalling; remove the rule to reconnect
+Flush latency               ``ops=flush``, which is what bites during boot
+                            and filesystem recovery
+Queue saturation            ``stall`` with ``max-hits``, so the queue fills
+                            up behind the held requests
+Out-of-order completion     ``delay-max-ms`` above ``delay-ms``
+Reset race                  a hold that straddles the guest's timeout, so
+                            the completion lands during recovery
+=========================== ================================================
 
 
 SCSI Response Injection
@@ -333,6 +459,40 @@ Commands:
 
         build/run scripts/inject-error.py -s /tmp/qmp.sock clear err0
 
+``scenario <node> <scenario> <id> [options]``
+    Add a latency rule for one of the named failure modes.  ``--help``
+    lists them; every field of the rule can still be overridden::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            scenario err0 tail-latency slow
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            scenario err0 fixed-latency lag --delay-ms 200
+
+``delay-add <node> <id> [options]``
+    Add a latency rule from scratch::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            delay-add err0 bootflush --ops flush --delay-ms 30000
+
+``delay-list <node>`` / ``delay-remove <node> [id]``
+    List the latency rules, or remove one of them (all of them if no id is
+    given)::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock delay-list err0
+        build/run scripts/inject-error.py -s /tmp/qmp.sock delay-remove err0
+
+``inflight <node>``
+    List the requests currently being held::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock inflight err0
+
+``release <node> [--request-id N] [--complete|--error]``
+    Release held requests, optionally overriding how they complete::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            release err0 --error --errno EIO
+
 
 setup-error-inject-vm.sh
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -458,6 +618,27 @@ The read succeeds again::
     $ dd if=/dev/sda of=/dev/null bs=512 count=1
     1+0 records in
     1+0 records out
+
+8a. Hold a request and watch the guest recover
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+From the host, stall every request to the disk::
+
+    build/run scripts/inject-error.py -s $QMP scenario err1 stall gone
+
+In the guest, a read now hangs instead of failing::
+
+    $ dd if=/dev/sda of=/dev/null bs=512 count=1
+
+Back on the host, the held request is visible, and can be failed or
+completed at will::
+
+    build/run scripts/inject-error.py -s $QMP inflight err1
+    build/run scripts/inject-error.py -s $QMP release err1 --error
+    build/run scripts/inject-error.py -s $QMP delay-remove err1
+
+Leaving it held long enough instead lets the guest's own timeout and
+device reset run, which is the interesting part for driver testing.
 
 9. Override the standard INQUIRY response
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
