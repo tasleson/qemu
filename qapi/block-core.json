@@ -4065,6 +4065,92 @@
             '*writes': 'bool' } }
 
 ##
+# @InjectDelayOp:
+#
+# Kinds of I/O a latency injection rule can match.
+#
+# @read: read requests
+#
+# @write: write requests
+#
+# @flush: cache flush requests
+#
+# @discard: discard/unmap requests
+#
+# @write-zeroes: write-zeroes requests
+#
+# Since: 11.2
+##
+{ 'enum': 'InjectDelayOp',
+  'data': [ 'read', 'write', 'flush', 'discard', 'write-zeroes' ] }
+
+##
+# @InjectDelayRuleOptions:
+#
+# Describes a latency injection rule for inject-error.
+#
+# A matching request is held by the filter without blocking the QEMU
+# event loop or the vCPU thread: only the request coroutine yields, so
+# the guest continues to run and can submit further I/O while the
+# request is outstanding.  This models a slow or wedged disk rather
+# than a frozen VMM.
+#
+# @id: unique name of the rule, used to remove it later and reported
+#     on held requests
+#
+# @ops: kinds of I/O the rule applies to (default: all)
+#
+# @sector: first sector of the region the rule applies to (512-byte
+#     sectors, default: 0)
+#
+# @count: number of sectors the rule applies to.  If absent the rule
+#     applies to the whole device; if present, @flush requests never
+#     match because a flush has no sector range.
+#
+# @probability: fraction of matching requests to delay, between 0.0
+#     and 1.0 (default: 1.0).  Use a small value to model tail
+#     latency, e.g. 0.001 for one request in a thousand.
+#
+# @delay-ms: how long to hold the request, in milliseconds
+#     (default: 0)
+#
+# @delay-max-ms: if given and larger than @delay-ms, the hold time is
+#     picked uniformly at random from [@delay-ms, @delay-max-ms].
+#     Randomised hold times make delayed requests complete out of
+#     order with respect to later, undelayed ones.
+#
+# @stall: hold the request indefinitely instead of for a fixed time
+#     (default: false).  A stalled request completes only when
+#     released with x-inject-error-delay-release or when the node is
+#     drained, which happens on device reset.  Note that a stall left
+#     armed also holds up shutdown of whatever is using the node, so
+#     release the requests before tearing the setup down.
+#
+# @errno: error to fail the request with once the hold expires
+#     (default: 0, meaning the request is passed on to the image and
+#     completes normally).  Combine with a long @delay-ms to model a
+#     request that fails only after the guest has already started
+#     recovery.
+#
+# @max-hits: number of requests the rule applies to before it is
+#     removed automatically.  If absent the rule stays until removed
+#     explicitly.
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectDelayRuleOptions',
+  'data': { 'id': 'str',
+            '*ops': ['InjectDelayOp'],
+            '*sector': 'int',
+            '*count': 'int',
+            '*probability': 'number',
+            '*delay-ms': 'int',
+            '*delay-max-ms': 'int',
+            '*stall': 'bool',
+            '*errno': 'int',
+            '*max-hits': 'int' } }
+
+##
 # @BlockdevOptionsInjectError:
 #
 # Driver specific block device options for inject-error.
@@ -4077,11 +4163,19 @@
 #
 # @errors: initial set of bad sector descriptions
 #
+# @delays: initial set of latency injection rules
+#
+# @seed: seed for the random number generator used by the
+#     @probability and @delay-max-ms options of latency rules.  Fix it
+#     to make a test run reproducible.
+#
 # Since: 11.2
 ##
 { 'struct': 'BlockdevOptionsInjectError',
   'data': { 'image': 'BlockdevRef',
-            '*errors': ['InjectErrorSectorOptions'] } }
+            '*errors': ['InjectErrorSectorOptions'],
+            '*delays': ['InjectDelayRuleOptions'],
+            '*seed': 'int' } }
 
 ##
 # @BlockdevOptionsBlklogwrites:
@@ -6300,6 +6394,278 @@
 { 'command': 'x-inject-error-list',
   'data': { 'node-name': 'str' },
   'returns': ['InjectErrorEntryInfo'],
+  'features': [ 'unstable' ] }
+
+##
+# @x-inject-error-delay-add:
+#
+# Add a latency injection rule to an inject-error filter node.
+#
+# @node-name: the name of the inject-error node to modify
+#
+# @rule: the rule to add.  Rules are evaluated in the order they were
+#     added and the first one that matches a request wins.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#    :title: Delay one request in a thousand by 10 to 60 seconds
+#
+#     -> { "execute": "x-inject-error-delay-add",
+#          "arguments": { "node-name": "err0",
+#                         "rule": { "id": "tail",
+#                                   "probability": 0.001,
+#                                   "delay-ms": 10000,
+#                                   "delay-max-ms": 60000 } } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-inject-error-delay-add',
+  'data': { 'node-name': 'str',
+            'rule': 'InjectDelayRuleOptions' },
+  'features': [ 'unstable' ] }
+
+##
+# @InjectDelayCount:
+#
+# @count: number of objects the command acted on
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectDelayCount',
+  'data': { 'count': 'int' } }
+
+##
+# @x-inject-error-delay-remove:
+#
+# Remove latency injection rules from an inject-error filter node.
+# Requests already being held are not affected; use
+# x-inject-error-delay-release to complete those.
+#
+# @node-name: the name of the inject-error node to modify
+#
+# @id: the rule to remove.  If absent, all rules are removed.
+#
+# Returns: the number of rules removed
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-delay-remove",
+#          "arguments": { "node-name": "err0", "id": "tail" } }
+#     <- { "return": { "count": 1 } }
+##
+{ 'command': 'x-inject-error-delay-remove',
+  'data': { 'node-name': 'str',
+            '*id': 'str' },
+  'returns': 'InjectDelayCount',
+  'features': [ 'unstable' ] }
+
+##
+# @InjectDelayRuleInfo:
+#
+# Information about a single latency injection rule.
+#
+# @id: name of the rule
+#
+# @ops: kinds of I/O the rule applies to
+#
+# @sector: first sector the rule applies to
+#
+# @count: number of sectors the rule applies to, absent if the rule
+#     applies to the whole device
+#
+# @probability: fraction of matching requests that are delayed
+#
+# @delay-ms: lower bound of the hold time in milliseconds
+#
+# @delay-max-ms: upper bound of the hold time in milliseconds
+#
+# @stall: whether matching requests are held indefinitely
+#
+# @errno: error returned once the hold expires, 0 if the request is
+#     passed on to the image
+#
+# @max-hits: remaining number of requests the rule applies to, absent
+#     if unlimited
+#
+# @hits: number of requests the rule has delayed so far
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectDelayRuleInfo',
+  'data': { 'id': 'str',
+            'ops': ['InjectDelayOp'],
+            'sector': 'int',
+            '*count': 'int',
+            'probability': 'number',
+            'delay-ms': 'int',
+            'delay-max-ms': 'int',
+            'stall': 'bool',
+            'errno': 'int',
+            '*max-hits': 'int',
+            'hits': 'int' } }
+
+##
+# @x-inject-error-delay-list:
+#
+# List the latency injection rules of an inject-error filter node.
+#
+# @node-name: the name of the inject-error node to query
+#
+# Returns: a list of latency injection rules
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-delay-list",
+#          "arguments": { "node-name": "err0" } }
+#     <- { "return": [ { "id": "tail",
+#                        "ops": [ "read", "write", "flush",
+#                                 "discard", "write-zeroes" ],
+#                        "sector": 0, "probability": 0.001,
+#                        "delay-ms": 10000, "delay-max-ms": 60000,
+#                        "stall": false, "errno": 0, "hits": 3 } ] }
+##
+{ 'command': 'x-inject-error-delay-list',
+  'data': { 'node-name': 'str' },
+  'returns': ['InjectDelayRuleInfo'],
+  'features': [ 'unstable' ] }
+
+##
+# @InjectDelayRequestInfo:
+#
+# Information about a single request currently held by an
+# inject-error filter node.
+#
+# @id: identifier of the held request, for use with
+#     x-inject-error-delay-release
+#
+# @rule-id: name of the rule that is holding the request.  Absent if
+#     the rule has since been removed.
+#
+# @op: kind of I/O the request performs
+#
+# @sector: first sector accessed by the request, absent for flushes
+#
+# @count: number of sectors accessed by the request, absent for
+#     flushes
+#
+# @stalled: true if the request is held indefinitely, false if it is
+#     held until a deadline
+#
+# @remaining-ms: milliseconds left before the request is released,
+#     absent for stalled requests
+#
+# @errno: error the request will fail with once released, 0 if it
+#     will be passed on to the image
+#
+# Since: 11.2
+##
+{ 'struct': 'InjectDelayRequestInfo',
+  'data': { 'id': 'int',
+            '*rule-id': 'str',
+            'op': 'InjectDelayOp',
+            '*sector': 'int',
+            '*count': 'int',
+            'stalled': 'bool',
+            '*remaining-ms': 'int',
+            'errno': 'int' } }
+
+##
+# @x-inject-error-delay-inflight:
+#
+# List the requests an inject-error filter node is currently holding.
+#
+# @node-name: the name of the inject-error node to query
+#
+# Returns: a list of held requests
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-delay-inflight",
+#          "arguments": { "node-name": "err0" } }
+#     <- { "return": [ { "id": 7, "rule-id": "stall", "op": "write",
+#                        "sector": 2048, "count": 8,
+#                        "stalled": true, "errno": 0 } ] }
+##
+{ 'command': 'x-inject-error-delay-inflight',
+  'data': { 'node-name': 'str' },
+  'returns': ['InjectDelayRequestInfo'],
+  'features': [ 'unstable' ] }
+
+##
+# @InjectDelayDisposition:
+#
+# What to do with a held request that is being released.
+#
+# @complete: pass the request on to the image so that it completes
+#     normally
+#
+# @error: fail the request
+#
+# Since: 11.2
+##
+{ 'enum': 'InjectDelayDisposition',
+  'data': [ 'complete', 'error' ] }
+
+##
+# @x-inject-error-delay-release:
+#
+# Release requests held by an inject-error filter node.
+#
+# @node-name: the name of the inject-error node to modify
+#
+# @request-id: the request to release, as reported by
+#     x-inject-error-delay-inflight.  If absent, all held requests are
+#     released.
+#
+# @disposition: how to complete the released requests.  If absent, the
+#     disposition configured by the rule that held them is used.
+#
+# @errno: error to fail the requests with when @disposition is
+#     ``error`` (default: EIO)
+#
+# Returns: the number of requests released
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-inject-error-delay-release",
+#          "arguments": { "node-name": "err0",
+#                         "disposition": "error" } }
+#     <- { "return": { "count": 2 } }
+##
+{ 'command': 'x-inject-error-delay-release',
+  'data': { 'node-name': 'str',
+            '*request-id': 'int',
+            '*disposition': 'InjectDelayDisposition',
+            '*errno': 'int' },
+  'returns': 'InjectDelayCount',
   'features': [ 'unstable' ] }
 
 ##
