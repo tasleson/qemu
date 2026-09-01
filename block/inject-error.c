@@ -329,6 +329,25 @@ block_init(bdrv_inject_error_init);
 
 /* QMP command implementations */
 
+/* Look up an inject-error node's state by node name. */
+static BDRVInjectErrorState *inject_error_find(const char *node_name,
+                                               Error **errp)
+{
+    BlockDriverState *bs = bdrv_find_node(node_name);
+
+    if (!bs) {
+        error_setg(errp, "Node '%s' not found", node_name);
+        return NULL;
+    }
+
+    if (bs->drv != &bdrv_inject_error) {
+        error_setg(errp, "Node '%s' is not an inject-error node", node_name);
+        return NULL;
+    }
+
+    return bs->opaque;
+}
+
 void qmp_x_inject_error_add(const char *node_name, int64_t sector,
                             bool has_count, int64_t count,
                             bool has_q_errno, int64_t q_errno,
@@ -337,17 +356,9 @@ void qmp_x_inject_error_add(const char *node_name, int64_t sector,
                             bool has_writes, bool writes,
                             Error **errp)
 {
-    BlockDriverState *bs;
-    BDRVInjectErrorState *s;
+    BDRVInjectErrorState *s = inject_error_find(node_name, errp);
 
-    bs = bdrv_find_node(node_name);
-    if (!bs) {
-        error_setg(errp, "Node '%s' not found", node_name);
-        return;
-    }
-
-    if (bs->drv != &bdrv_inject_error) {
-        error_setg(errp, "Node '%s' is not an inject-error node", node_name);
+    if (!s) {
         return;
     }
 
@@ -379,7 +390,6 @@ void qmp_x_inject_error_add(const char *node_name, int64_t sector,
         writes = false;
     }
 
-    s = bs->opaque;
     add_entry(s, sector, count, q_errno, reads, writes, behavior);
 }
 
@@ -387,19 +397,11 @@ void qmp_x_inject_error_remove(const char *node_name, int64_t sector,
                                bool has_count, int64_t count,
                                Error **errp)
 {
-    BlockDriverState *bs;
-    BDRVInjectErrorState *s;
+    BDRVInjectErrorState *s = inject_error_find(node_name, errp);
     InjectErrorEntry *entry, *next;
     int64_t offset, length;
 
-    bs = bdrv_find_node(node_name);
-    if (!bs) {
-        error_setg(errp, "Node '%s' not found", node_name);
-        return;
-    }
-
-    if (bs->drv != &bdrv_inject_error) {
-        error_setg(errp, "Node '%s' is not an inject-error node", node_name);
+    if (!s) {
         return;
     }
 
@@ -417,7 +419,6 @@ void qmp_x_inject_error_remove(const char *node_name, int64_t sector,
 
     offset = sector * BDRV_SECTOR_SIZE;
     length = count * BDRV_SECTOR_SIZE;
-    s = bs->opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
     QLIST_FOREACH_SAFE(entry, &s->entries, next, next) {
@@ -431,23 +432,13 @@ void qmp_x_inject_error_remove(const char *node_name, int64_t sector,
 InjectErrorEntryInfoList *qmp_x_inject_error_list(const char *node_name,
                                                   Error **errp)
 {
-    BlockDriverState *bs;
-    BDRVInjectErrorState *s;
+    BDRVInjectErrorState *s = inject_error_find(node_name, errp);
     InjectErrorEntryInfoList *head = NULL, **tail = &head;
     InjectErrorEntry *entry;
 
-    bs = bdrv_find_node(node_name);
-    if (!bs) {
-        error_setg(errp, "Node '%s' not found", node_name);
+    if (!s) {
         return NULL;
     }
-
-    if (bs->drv != &bdrv_inject_error) {
-        error_setg(errp, "Node '%s' is not an inject-error node", node_name);
-        return NULL;
-    }
-
-    s = bs->opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
     QLIST_FOREACH(entry, &s->entries, next) {
