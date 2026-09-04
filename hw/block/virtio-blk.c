@@ -344,6 +344,8 @@ static void virtio_blk_handle_flush(VirtIOBlockReq *req, MultiReqBuffer *mrb)
 {
     VirtIOBlock *s = req->dev;
 
+    trace_virtio_blk_handle_flush(VIRTIO_DEVICE(s), req);
+
     block_acct_start(blk_get_stats(s->blk), &req->acct, 0,
                      BLOCK_ACCT_FLUSH);
 
@@ -393,6 +395,13 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
     flags = virtio_ldl_p(vdev, &dwz_hdr->flags);
     max_sectors = is_write_zeroes ? s->conf.max_write_zeroes_sectors :
                   s->conf.max_discard_sectors;
+
+    if (is_write_zeroes) {
+        trace_virtio_blk_handle_write_zeroes(vdev, req, sector, num_sectors,
+                                             flags);
+    } else {
+        trace_virtio_blk_handle_discard(vdev, req, sector, num_sectors);
+    }
 
     /*
      * max_sectors is at most BDRV_REQUEST_MAX_SECTORS, this check
