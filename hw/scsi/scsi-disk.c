@@ -2271,6 +2271,7 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
         trace_scsi_disk_emulate_command_SAI_unsupported();
         goto illegal_request;
     case SYNCHRONIZE_CACHE:
+        trace_scsi_disk_emulate_command_SYNCHRONIZE_CACHE(r->req.cmd.lba);
         /* The request is used as the AIO opaque value, so add a ref.  */
         scsi_req_ref(&r->req);
         block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct, 0,
