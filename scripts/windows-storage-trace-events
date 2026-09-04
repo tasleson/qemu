@@ -1,0 +1,36 @@
+# Default trace event patterns for scripts/setup-windows-inject-vm.sh.
+#
+# Covers reads/writes/flush/discard on the virtio-blk boot and data disks,
+# and every SCSI command (including SYNCHRONIZE CACHE, INQUIRY, MODE SENSE)
+# issued to the virtio-scsi data disks. See docs/devel/tracing.rst.
+#
+# Usage: TRACE_EVENTS=scripts/windows-storage-trace-events ./scripts/setup-windows-inject-vm.sh run
+# (this is also the default when the file exists at its usual path)
+
+# virtio-blk (viostor): per-request read/write/flush/discard/write-zeroes
+virtio_blk_handle_read
+virtio_blk_handle_write
+virtio_blk_handle_flush
+virtio_blk_handle_discard
+virtio_blk_handle_write_zeroes
+virtio_blk_rw_complete
+virtio_blk_req_complete
+
+# virtio-scsi (vioscsi): raw CDB opcode in/out over the virtqueue
+virtio_scsi_cmd_req
+virtio_scsi_cmd_resp
+
+# Generic SCSI layer: every parsed command, including SYNCHRONIZE CACHE
+scsi_req_parsed
+scsi_req_parsed_lba
+
+# scsi-disk: named command handlers (SYNCHRONIZE CACHE, UNMAP, WRITE SAME, ...)
+scsi_disk_emulate_command_*
+scsi_disk_dma_command_*
+
+# Generic block layer: what actually reaches the backing file, after the
+# inject-error filter has had a chance to intercept/delay/fail it
+blk_co_preadv
+blk_co_pwritev
+bdrv_co_preadv_part
+bdrv_co_pwritev_part
