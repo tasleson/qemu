@@ -150,6 +150,10 @@ QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
                             # the host busy enough that a freshly-started
                             # QEMU's QMP monitor isn't ready to accept yet
 DUMP_TIMEOUT_S = 900  # a win-dmp writes out all of guest RAM; minutes, not seconds
+DUMP_START_TIMEOUT_S = 300  # dump-guest-memory stops the VM (drain + flush of
+                            # every image) before detaching; with the writers'
+                            # dirty data in the host page cache that flush can
+                            # outlast QMP_CMD_TIMEOUT_S by a lot
 DUMP_POLL_INTERVAL_S = 2
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15  # guest-agent silence this long, post-boot, is
@@ -639,20 +643,41 @@ def try_dump_guest_memory(qmp, path: Path) -> bool:
     # stays responsive. A synchronous dump blocks the main loop for the whole
     # write, and if that outlasts the QMP timeout the subsequent 'quit' times
     # out too and the QEMU process gets killed mid-dump.
+    #
+    # Even detached, the command stops the VM before returning, and stopping
+    # drains and flushes every image on the main loop. Give that its own
+    # longer timeout, and treat a timeout as "outcome unknown" rather than a
+    # refusal: QEMU may well go on to start the dump, and returning here would
+    # send 'quit' into the middle of it. query-dump is queued behind the
+    # dump command, so its first answer tells us which way it went.
+    qmp.settimeout(DUMP_START_TIMEOUT_S)
     try:
         qmp_call(qmp, "dump-guest-memory", paging=False, detach=True,
                  protocol=f"file:{path}", format="win-dmp")
+    except TimeoutError:
+        print(f"    dump-guest-memory not acknowledged after "
+              f"{DUMP_START_TIMEOUT_S}s, checking whether it started",
+              file=sys.stderr)
     except Exception as exc:
         print(f"    dump-guest-memory refused: {exc!r}", file=sys.stderr)
         return False
+    finally:
+        qmp.settimeout(QMP_CMD_TIMEOUT_S)
 
     deadline = time.monotonic() + DUMP_TIMEOUT_S
     status: dict = {}
     while time.monotonic() < deadline:
         try:
             status = qmp_call(qmp, "query-dump")
+        except TimeoutError:
+            # Main loop still busy (the VM stop, or the dump command itself).
+            continue
         except Exception as exc:
             print(f"    query-dump failed: {exc!r}", file=sys.stderr)
+            return False
+        if status["status"] == "none":
+            print("    dump-guest-memory never started (see qemu.log)",
+                  file=sys.stderr)
             return False
         if status["status"] == "completed":
             return True
