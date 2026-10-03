@@ -92,6 +92,7 @@ import base64
 import dataclasses
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -601,9 +602,18 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
     return argv
 
 
+# The legacy QMP client sends commands without an "id" unless we supply
+# one, and routes every ID-less reply to whichever ID-less command is
+# currently pending. After a single timeout the late reply would then be
+# handed to the *next* command, desynchronizing every reply after it for
+# the rest of the run. Unique IDs make late replies unroutable, so the
+# client drops them instead.
+_qmp_ids = itertools.count()
+
+
 def qmp_call(qmp, name: str, **kwargs) -> Any:
     args = {k.replace("_", "-"): v for k, v in kwargs.items()}
-    msg = {"execute": name}
+    msg = {"execute": name, "id": f"fuzz-{next(_qmp_ids)}"}
     if args:
         msg["arguments"] = args
     resp = qmp.cmd_obj(msg)
