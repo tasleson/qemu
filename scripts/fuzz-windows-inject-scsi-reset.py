@@ -149,9 +149,8 @@ QMP_CMD_TIMEOUT_S = 15
 QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
                             # the host busy enough that a freshly-started
                             # QEMU's QMP monitor isn't ready to accept yet
-QMP_DUMP_TIMEOUT_S = 180  # dump-guest-memory writes the guest's full RAM to
-                           # disk synchronously; this routinely runs well
-                           # past QMP_CMD_TIMEOUT_S on a Windows guest
+DUMP_TIMEOUT_S = 900  # a win-dmp writes out all of guest RAM; minutes, not seconds
+DUMP_POLL_INTERVAL_S = 2
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15  # guest-agent silence this long, post-boot, is
                                  # itself a strong crash signal (its service
@@ -635,16 +634,37 @@ def try_dump_guest_memory(qmp, path: Path) -> bool:
     # read-only (observed mode 0400), which makes QEMU's open() for the
     # new dump fail with EACCES even though we own the file.
     path.unlink(missing_ok=True)
-    qmp.settimeout(QMP_DUMP_TIMEOUT_S)
+
+    # Detached, so QEMU writes the dump from its own thread and the monitor
+    # stays responsive. A synchronous dump blocks the main loop for the whole
+    # write, and if that outlasts the QMP timeout the subsequent 'quit' times
+    # out too and the QEMU process gets killed mid-dump.
     try:
-        qmp_call(qmp, "dump-guest-memory", paging=False,
+        qmp_call(qmp, "dump-guest-memory", paging=False, detach=True,
                  protocol=f"file:{path}", format="win-dmp")
-        return True
     except Exception as exc:
-        print(f"    dump-guest-memory failed: {exc!r}", file=sys.stderr)
+        print(f"    dump-guest-memory refused: {exc!r}", file=sys.stderr)
         return False
-    finally:
-        qmp.settimeout(QMP_CMD_TIMEOUT_S)
+
+    deadline = time.monotonic() + DUMP_TIMEOUT_S
+    status: dict = {}
+    while time.monotonic() < deadline:
+        try:
+            status = qmp_call(qmp, "query-dump")
+        except Exception as exc:
+            print(f"    query-dump failed: {exc!r}", file=sys.stderr)
+            return False
+        if status["status"] == "completed":
+            return True
+        if status["status"] == "failed":
+            print("    dump-guest-memory failed while writing (see qemu.log)",
+                  file=sys.stderr)
+            return False
+        time.sleep(DUMP_POLL_INTERVAL_S)
+    print(f"    dump-guest-memory still running after {DUMP_TIMEOUT_S}s "
+          f"({status.get('completed')}/{status.get('total')} bytes), giving up",
+          file=sys.stderr)
+    return False
 
 
 # ------------------------------------------------------------------
