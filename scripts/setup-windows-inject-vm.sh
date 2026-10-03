@@ -336,6 +336,7 @@ run_vm() {
         -vga std \
         -device qemu-xhci,id=usb \
         -device usb-tablet,bus=usb.0 \
+        -device vmcoreinfo \
         \
         -qmp "unix:${QMP_SOCK},server=on,wait=off" \
         -monitor stdio \
@@ -344,8 +345,8 @@ run_vm() {
         -device virtio-serial \
         -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
         \
-        -net nic,model=virtio-net-pci \
-        -net passt,tcp-ports=3389:3389 \
+        -netdev bridge,br=virbr0,helper=/usr/libexec/qemu-bridge-helper,id=net0 \
+        -device virtio-net-pci,netdev=net0,id=nic0 \
         \
         -blockdev driver=file,filename="${BOOT_DISK}",node-name=file0 \
         -blockdev driver=qcow2,file=file0,node-name=raw0 \
