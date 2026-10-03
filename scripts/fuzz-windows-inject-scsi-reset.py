@@ -1101,6 +1101,17 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                 now = time.monotonic()
                 elapsed = now - start
 
+                # QEMU itself dying (e.g. an assert in the virtio-scsi reset
+                # path) also silences the agent and screen; don't mistake it
+                # for a guest crash and try to dump a process that's gone.
+                if proc.poll() is not None:
+                    result["cycle_telemetry"].append(cyc)
+                    result["outcome"] = "qemu-exited"
+                    result["qemu_returncode"] = proc.returncode
+                    result["elapsed_s"] = elapsed
+                    result["crash_cycle"] = cycle
+                    return result
+
                 # Telemetry: track the peak number of requests actually held by
                 # the stall, per node. A stall that never holds anything (peak 0)
                 # means the guest wasn't blocked -- the race can't fire.
@@ -1185,6 +1196,11 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                 # re-arming on top of requests still recovering from the last one.
                 time.sleep(inter_cycle_settle_s)
 
+        if proc.poll() is not None:
+            result["outcome"] = "qemu-exited"
+            result["qemu_returncode"] = proc.returncode
+            result["elapsed_s"] = time.monotonic() - start
+            return result
         if recovered:
             result["outcome"] = "recovered"
         elif qga_ping(qga_sock):
@@ -1243,6 +1259,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
         else:
             result["screenshot"] = str(screenshot) if screenshot.exists() else None
             result["serial_log"] = str(serial_log)
+            result["qemu_log"] = str(qemu_log_path)
             result["trace_log"] = str(trace_path) if trace_path and trace_path.exists() else None
             result["dump"] = str(dump_path) if dump_path.exists() else None
 
@@ -1464,7 +1481,7 @@ def main() -> int:
         print("    " + telemetry_summary(result))
         with results_path.open("a") as f:
             f.write(json.dumps(result) + "\n")
-        if result["outcome"] == "crash-suspected":
+        if result["outcome"] in ("crash-suspected", "qemu-exited"):
             crashes.append(result)
             if args.stop_on_first_crash:
                 break
