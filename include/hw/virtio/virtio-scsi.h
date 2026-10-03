@@ -98,6 +98,16 @@ struct VirtIOSCSI {
     bool dataplane_stopping;
     bool dataplane_fenced;
     uint32_t host_features;
+
+    /*
+     * Fuzzing/debug knob: delay the completion of the next
+     * x-tmf-delay-count TMF responses on the control queue by
+     * x-tmf-delay-ms milliseconds each. Settable at runtime via qom-set.
+     * Used to keep a guest-issued task reset in flight long enough to race a
+     * second reset. 0 count disables.
+     */
+    uint32_t tmf_delay_ms;
+    uint32_t tmf_delay_count;
 };
 
 void virtio_scsi_common_realize(DeviceState *dev,
