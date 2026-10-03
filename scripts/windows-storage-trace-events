@@ -20,6 +20,13 @@ virtio_blk_req_complete
 virtio_scsi_cmd_req
 virtio_scsi_cmd_resp
 
+# virtio-scsi task management: LUN/target/abort resets. This is the whole point
+# of the reset-race harness -- without these we cannot see whether the guest is
+# actually issuing the SCSI resets we are trying to race.
+virtio_scsi_tmf_req
+virtio_scsi_tmf_resp
+virtio_scsi_tmf_delay
+
 # Generic SCSI layer: every parsed command, including SYNCHRONIZE CACHE
 scsi_req_parsed
 scsi_req_parsed_lba

@@ -338,8 +338,9 @@ lasi_ncr710_scsi_device_created(const char *type) "LASI NCR710: SCSI device crea
 # virtio-scsi.c
 virtio_scsi_cmd_req(int lun, uint32_t tag, uint8_t cmd) "virtio_scsi_cmd_req lun=%u tag=0x%x cmd=0x%x"
 virtio_scsi_cmd_resp(int lun, uint32_t tag, int response, uint8_t status) "virtio_scsi_cmd_resp lun=%u tag=0x%x response=%d status=0x%x"
-virtio_scsi_tmf_req(int lun, uint32_t tag, int subtype) "virtio_scsi_tmf_req lun=%u tag=0x%x subtype=%d"
-virtio_scsi_tmf_resp(int lun, uint32_t tag, int response) "virtio_scsi_tmf_resp lun=%u tag=0x%x response=%d"
+virtio_scsi_tmf_req(int target, int lun, uint32_t tag, int subtype) "virtio_scsi_tmf_req target=%d lun=%u tag=0x%x subtype=%d"
+virtio_scsi_tmf_resp(int target, int lun, uint32_t tag, int response) "virtio_scsi_tmf_resp target=%d lun=%u tag=0x%x response=%d"
+virtio_scsi_tmf_delay(int target, int lun, uint32_t tag, uint32_t delay_ms) "virtio_scsi_tmf_delay target=%d lun=%u tag=0x%x delay_ms=%u"
 virtio_scsi_an_req(int lun, uint32_t event_requested) "virtio_scsi_an_req lun=%u event_requested=0x%x"
 virtio_scsi_an_resp(int lun, int response) "virtio_scsi_an_resp lun=%u response=%d"
 virtio_scsi_event(int lun, int event, int reason) "virtio_scsi_event lun=%u event=%d reason=%d"
