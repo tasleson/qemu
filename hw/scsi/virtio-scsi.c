@@ -298,7 +298,8 @@ typedef struct {
 static void virtio_scsi_tmf_dec_remaining(VirtIOSCSIReq *tmf)
 {
     if (qatomic_fetch_dec(&tmf->remaining) == 1) {
-        trace_virtio_scsi_tmf_resp(virtio_scsi_get_lun(tmf->req.tmf.lun),
+        trace_virtio_scsi_tmf_resp(tmf->req.tmf.lun[1],
+                                   virtio_scsi_get_lun(tmf->req.tmf.lun),
                                    tmf->req.tmf.tag, tmf->resp.tmf.response);
 
         virtio_scsi_complete_req(tmf, &tmf->dev->ctrl_lock);
@@ -480,7 +481,8 @@ static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
     req->req.tmf.subtype =
         virtio_tswap32(VIRTIO_DEVICE(s), req->req.tmf.subtype);
 
-    trace_virtio_scsi_tmf_req(virtio_scsi_get_lun(req->req.tmf.lun),
+    trace_virtio_scsi_tmf_req(req->req.tmf.lun[1],
+                              virtio_scsi_get_lun(req->req.tmf.lun),
                               req->req.tmf.tag, req->req.tmf.subtype);
 
     switch (req->req.tmf.subtype) {
@@ -626,6 +628,31 @@ fail:
     return ret;
 }
 
+/*
+ * Pending deferred TMF response (see VirtIOSCSI::tmf_delay_*). Holds the
+ * control-queue response until the timer fires so the guest's reset stays
+ * in flight long enough to race a second reset.
+ */
+typedef struct VirtIOSCSITMFDelay {
+    VirtIOSCSIReq *req;
+    QEMUTimer timer;
+} VirtIOSCSITMFDelay;
+
+static void virtio_scsi_tmf_delay_cb(void *opaque)
+{
+    VirtIOSCSITMFDelay *d = opaque;
+    VirtIOSCSIReq *req = d->req;
+    VirtIOSCSI *s = req->dev;
+
+    trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
+                               virtio_scsi_get_lun(req->req.tmf.lun),
+                               req->req.tmf.tag,
+                               req->resp.tmf.response);
+    virtio_scsi_complete_req(req, &s->ctrl_lock);
+    timer_deinit(&d->timer);
+    g_free(d);
+}
+
 static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
 {
     VirtIODevice *vdev = (VirtIODevice *)s;
@@ -664,11 +691,33 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
         }
     }
     if (r == 0) {
-        if (type == VIRTIO_SCSI_T_TMF)
-            trace_virtio_scsi_tmf_resp(virtio_scsi_get_lun(req->req.tmf.lun),
+        if (type == VIRTIO_SCSI_T_TMF) {
+            if (s->tmf_delay_count > 0 && s->tmf_delay_ms > 0) {
+                /*
+                 * Hold this TMF response for tmf_delay_ms before completing it,
+                 * leaving the guest's reset in flight. The tmf_resp trace is
+                 * emitted when the response is actually released (in the timer
+                 * callback) so the harness timeline reflects the real delay.
+                 */
+                VirtIOSCSITMFDelay *d = g_new0(VirtIOSCSITMFDelay, 1);
+
+                s->tmf_delay_count--;
+                d->req = req;
+                trace_virtio_scsi_tmf_delay(req->req.tmf.lun[1],
+                                            virtio_scsi_get_lun(req->req.tmf.lun),
+                                            req->req.tmf.tag, s->tmf_delay_ms);
+                timer_init_ms(&d->timer, QEMU_CLOCK_VIRTUAL,
+                              virtio_scsi_tmf_delay_cb, d);
+                timer_mod(&d->timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                              s->tmf_delay_ms);
+                return;
+            }
+            trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
+                                       virtio_scsi_get_lun(req->req.tmf.lun),
                                        req->req.tmf.tag,
                                        req->resp.tmf.response);
-        else if (type == VIRTIO_SCSI_T_AN_QUERY ||
+        } else if (type == VIRTIO_SCSI_T_AN_QUERY ||
                  type == VIRTIO_SCSI_T_AN_SUBSCRIBE)
             trace_virtio_scsi_an_resp(virtio_scsi_get_lun(req->req.an.lun),
                                       req->resp.an.response);
@@ -1397,6 +1446,8 @@ static const Property virtio_scsi_properties[] = {
                      TYPE_IOTHREAD, IOThread *),
     DEFINE_PROP_IOTHREAD_VQ_MAPPING_LIST("iothread-vq-mapping", VirtIOSCSI,
             parent_obj.conf.iothread_vq_mapping_list),
+    DEFINE_PROP_UINT32("x-tmf-delay-ms", VirtIOSCSI, tmf_delay_ms, 0),
+    DEFINE_PROP_UINT32("x-tmf-delay-count", VirtIOSCSI, tmf_delay_count, 0),
 };
 
 static const VMStateDescription vmstate_virtio_scsi = {
