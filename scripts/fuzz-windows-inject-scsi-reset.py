@@ -155,6 +155,8 @@ DUMP_START_TIMEOUT_S = 300  # dump-guest-memory stops the VM (drain + flush of
                             # dirty data in the host page cache that flush can
                             # outlast QMP_CMD_TIMEOUT_S by a lot
 DUMP_POLL_INTERVAL_S = 2
+STACK_CAPTURE_TIMEOUT_S = 120  # gdb attaching to a large QEMU and loading its
+                               # symbols takes a while
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15  # guest-agent silence this long, post-boot, is
                                  # itself a strong crash signal (its service
@@ -633,7 +635,46 @@ def screendump_hash(qmp, path: Path) -> Optional[str]:
         return None
 
 
-def try_dump_guest_memory(qmp, path: Path) -> bool:
+def capture_qemu_stacks(pid: int, out: Path) -> None:
+    """Record where every QEMU thread is, for a dump that has wedged.
+
+    The per-thread kernel state and wait channel show I/O sleeps (state D),
+    and a gdb backtrace shows what the main loop is stuck on. Best effort:
+    a missing gdb or a refused ptrace still leaves the /proc part.
+    """
+    lines = []
+    for task in sorted(Path(f"/proc/{pid}/task").glob("*"),
+                       key=lambda t: int(t.name)):
+        try:
+            comm = (task / "comm").read_text().strip()
+            state = (task / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            wchan = (task / "wchan").read_text().strip()
+        except OSError:
+            continue
+        lines.append(f"tid={task.name} comm={comm} state={state} wchan={wchan}")
+    text = "\n".join(lines) + "\n\n"
+
+    if shutil.which("gdb"):
+        # Keep gdb from stalling on debuginfod downloads mid-capture.
+        env = dict(os.environ, DEBUGINFOD_URLS="")
+        try:
+            r = subprocess.run(
+                ["gdb", "-batch", "-nx", "-p", str(pid),
+                 "-ex", "set pagination off",
+                 "-ex", "thread apply all bt"],
+                capture_output=True, text=True, env=env,
+                timeout=STACK_CAPTURE_TIMEOUT_S)
+            text += r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            text += f"gdb timed out after {STACK_CAPTURE_TIMEOUT_S}s\n"
+    else:
+        text += "gdb not installed; no userspace backtrace\n"
+
+    out.write_text(text)
+    print(f"    QEMU thread stacks saved to {out}", file=sys.stderr)
+
+
+def try_dump_guest_memory(qmp, path: Path, qemu_pid: int) -> bool:
     # A stale dump from a prior run reusing this run dir can be left
     # read-only (observed mode 0400), which makes QEMU's open() for the
     # new dump fail with EACCES even though we own the file.
@@ -658,6 +699,7 @@ def try_dump_guest_memory(qmp, path: Path) -> bool:
         print(f"    dump-guest-memory not acknowledged after "
               f"{DUMP_START_TIMEOUT_S}s, checking whether it started",
               file=sys.stderr)
+        capture_qemu_stacks(qemu_pid, path.with_name("qemu-stacks.txt"))
     except Exception as exc:
         print(f"    dump-guest-memory refused: {exc!r}", file=sys.stderr)
         return False
@@ -689,6 +731,7 @@ def try_dump_guest_memory(qmp, path: Path) -> bool:
     print(f"    dump-guest-memory still running after {DUMP_TIMEOUT_S}s "
           f"({status.get('completed')}/{status.get('total')} bytes), giving up",
           file=sys.stderr)
+    capture_qemu_stacks(qemu_pid, path.with_name("qemu-stacks.txt"))
     return False
 
 
@@ -1166,7 +1209,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                     result["outcome"] = "crash-suspected"
                     result["elapsed_s"] = elapsed
                     result["crash_cycle"] = cycle
-                    result["dump_ok"] = try_dump_guest_memory(qmp, dump_path)
+                    result["dump_ok"] = try_dump_guest_memory(qmp, dump_path, proc.pid)
                     return result
 
                 time.sleep(POLL_INTERVAL_S)
@@ -1236,7 +1279,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
             result["outcome"] = "recovered-unresponsive"
         result["elapsed_s"] = time.monotonic() - start
         if not recovered:
-            result["dump_ok"] = try_dump_guest_memory(qmp, dump_path)
+            result["dump_ok"] = try_dump_guest_memory(qmp, dump_path, proc.pid)
         return result
 
     except Exception as exc:
