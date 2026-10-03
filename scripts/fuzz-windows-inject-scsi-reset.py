@@ -151,9 +151,8 @@ QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
                             # QEMU's QMP monitor isn't ready to accept yet
 DUMP_TIMEOUT_S = 900  # a win-dmp writes out all of guest RAM; minutes, not seconds
 DUMP_START_TIMEOUT_S = 300  # dump-guest-memory stops the VM (drain + flush of
-                            # every image) before detaching; with the writers'
-                            # dirty data in the host page cache that flush can
-                            # outlast QMP_CMD_TIMEOUT_S by a lot
+                            # every image) before detaching, which can outlast
+                            # QMP_CMD_TIMEOUT_S on a busy host
 DUMP_POLL_INTERVAL_S = 2
 STACK_CAPTURE_TIMEOUT_S = 120  # gdb attaching to a large QEMU and loading its
                                # symbols takes a while
@@ -674,7 +673,20 @@ def capture_qemu_stacks(pid: int, out: Path) -> None:
     print(f"    QEMU thread stacks saved to {out}", file=sys.stderr)
 
 
-def try_dump_guest_memory(qmp, path: Path, qemu_pid: int) -> bool:
+def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
+                          err_nodes: list) -> bool:
+    # Disarm any stall rule still installed (the crash-suspected path dumps
+    # mid-stall). Stopping the VM drains, which wakes held requests, but the
+    # flush that follows the drain goes through inject-error like any other
+    # request: a still-armed rule holds it forever and the dump never starts.
+    # Remove without releasing, so held requests complete only once the
+    # drain runs, with the vCPUs already paused.
+    for node in err_nodes:
+        try:
+            qmp_call(qmp, "x-inject-error-delay-remove", node_name=node, id=node)
+        except RuntimeError:
+            pass  # already removed after the cycle's release
+
     # A stale dump from a prior run reusing this run dir can be left
     # read-only (observed mode 0400), which makes QEMU's open() for the
     # new dump fail with EACCES even though we own the file.
@@ -1209,7 +1221,8 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                     result["outcome"] = "crash-suspected"
                     result["elapsed_s"] = elapsed
                     result["crash_cycle"] = cycle
-                    result["dump_ok"] = try_dump_guest_memory(qmp, dump_path, proc.pid)
+                    result["dump_ok"] = try_dump_guest_memory(
+                        qmp, dump_path, proc.pid, err_nodes)
                     return result
 
                 time.sleep(POLL_INTERVAL_S)
@@ -1279,7 +1292,8 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
             result["outcome"] = "recovered-unresponsive"
         result["elapsed_s"] = time.monotonic() - start
         if not recovered:
-            result["dump_ok"] = try_dump_guest_memory(qmp, dump_path, proc.pid)
+            result["dump_ok"] = try_dump_guest_memory(
+                qmp, dump_path, proc.pid, err_nodes)
         return result
 
     except Exception as exc:
