@@ -126,7 +126,7 @@ PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
 
 DEFAULT_RAM = "8G"
-DEFAULT_CPUS = "4"
+DEFAULT_CPUS = "5"     # It' might be interesting to have odd number, we shall see
 LUN_IMAGE_SIZE = "1G"
 
 BOOT_TIMEOUT_S = 180
