@@ -927,6 +927,21 @@ def lun_write_delta(before: dict, after: dict, spec: "LunSpec") -> int:
                          spec.file_node))
 
 
+def total_lun_writes(wops: dict, lun_specs: list) -> int:
+    """Cumulative writes across the data LUNs only.
+
+    Deliberately excludes the boot disk. It is SATA/AHCI and has no
+    tail-latency rule on it, so Windows keeps writing to C: -- pagefile,
+    event log, registry -- long after every LUN under test has stopped
+    dead. Counting it made the I/O-stall detector permanently think the
+    guest was making progress. Same max-across-aliases trick as
+    lun_write_delta: query-blockstats reports one LUN's writes under
+    several identifiers and they must not be added together."""
+    return sum(max(wops.get(k, 0)
+                   for k in (s.dev_id, s.err_node, s.fmt_node, s.file_node))
+               for s in lun_specs)
+
+
 def rule_hits(qmp, err_nodes: list) -> dict:
     out: dict = {}
     for n in err_nodes:
@@ -1199,7 +1214,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # outlasted the longest hold.
         io_stall_threshold_s = delay_max_ms / 1000.0 + IO_STALL_MARGIN_S
         last_io_progress_t = test_start
-        prev_total_wr = sum(prev_wops.values())
+        prev_total_wr = total_lun_writes(prev_wops, lun_specs)
 
         while time.monotonic() < monitor_deadline:
             now = time.monotonic()
@@ -1244,7 +1259,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                     last_hash = h
                     last_change_t = now
 
-            total_wr = sum(write_ops_by_node(qmp).values())
+            total_wr = total_lun_writes(write_ops_by_node(qmp), lun_specs)
             if total_wr > prev_total_wr:
                 last_io_progress_t = now
             prev_total_wr = total_wr
