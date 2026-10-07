@@ -129,9 +129,26 @@ static void virtio_scsi_complete_req(VirtIOSCSIReq *req, QemuMutex *vq_lock)
     virtio_scsi_free_req(req);
 }
 
+/*
+ * The SCSI bus is named after the proxy device ("scsi0.0" for
+ * -device virtio-scsi-pci,id=scsi0). With several adapters it is the only
+ * thing in a trace line that says which one it came from.
+ */
+static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
+{
+    return s->bus.qbus.name;
+}
+
 static void virtio_scsi_bad_req(VirtIOSCSIReq *req, QemuMutex *vq_lock)
 {
-    virtio_error(VIRTIO_DEVICE(req->dev), "wrong size for virtio-scsi headers");
+    VirtIODevice *vdev = VIRTIO_DEVICE(req->dev);
+    bool was_broken = vdev->broken;
+
+    virtio_error(vdev, "wrong size for virtio-scsi headers");
+    if (!was_broken) {
+        trace_virtio_scsi_broken(virtio_scsi_bus_name(req->dev),
+                                 virtio_get_queue_index(req->vq));
+    }
 
     if (vq_lock) {
         qemu_mutex_lock(vq_lock);
@@ -230,6 +247,8 @@ static int virtio_scsi_parse_req(VirtIOSCSIReq *req,
 static VirtIOSCSIReq *virtio_scsi_pop_req(VirtIOSCSI *s, VirtQueue *vq, size_t extra_req_size,
                                           QemuMutex *vq_lock)
 {
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    bool was_broken = vdev->broken;
     VirtIOSCSIReq *req;
 
     if (vq_lock) {
@@ -243,6 +262,16 @@ static VirtIOSCSIReq *virtio_scsi_pop_req(VirtIOSCSI *s, VirtQueue *vq, size_t e
     }
 
     if (!req) {
+        /*
+         * virtio_error() reports what was wrong with the ring but not which
+         * device it gave up on, and the device stays dead after this. Say
+         * which adapter and which queue -- control (0) vs request (2+)
+         * separates a bad TMF from a bad I/O.
+         */
+        if (!was_broken && vdev->broken) {
+            trace_virtio_scsi_broken(virtio_scsi_bus_name(s),
+                                     virtio_get_queue_index(vq));
+        }
         return NULL;
     }
     virtio_scsi_init_req(s, vq, req);
@@ -300,7 +329,8 @@ static void virtio_scsi_tmf_dec_remaining(VirtIOSCSIReq *tmf)
     if (qatomic_fetch_dec(&tmf->remaining) == 1) {
         trace_virtio_scsi_tmf_resp(tmf->req.tmf.lun[1],
                                    virtio_scsi_get_lun(tmf->req.tmf.lun),
-                                   tmf->req.tmf.tag, tmf->resp.tmf.response);
+                                   tmf->req.tmf.tag, tmf->resp.tmf.response,
+                                   virtio_scsi_bus_name(tmf->dev));
 
         virtio_scsi_complete_req(tmf, &tmf->dev->ctrl_lock);
     }
@@ -483,7 +513,8 @@ static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
 
     trace_virtio_scsi_tmf_req(req->req.tmf.lun[1],
                               virtio_scsi_get_lun(req->req.tmf.lun),
-                              req->req.tmf.tag, req->req.tmf.subtype);
+                              req->req.tmf.tag, req->req.tmf.subtype,
+                              virtio_scsi_bus_name(s));
 
     switch (req->req.tmf.subtype) {
     case VIRTIO_SCSI_T_TMF_ABORT_TASK: {
@@ -647,7 +678,8 @@ static void virtio_scsi_tmf_delay_cb(void *opaque)
     trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
                                virtio_scsi_get_lun(req->req.tmf.lun),
                                req->req.tmf.tag,
-                               req->resp.tmf.response);
+                               req->resp.tmf.response,
+                               virtio_scsi_bus_name(s));
     virtio_scsi_complete_req(req, &s->ctrl_lock);
     timer_deinit(&d->timer);
     g_free(d);
@@ -705,7 +737,8 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
                 d->req = req;
                 trace_virtio_scsi_tmf_delay(req->req.tmf.lun[1],
                                             virtio_scsi_get_lun(req->req.tmf.lun),
-                                            req->req.tmf.tag, s->tmf_delay_ms);
+                                            req->req.tmf.tag, s->tmf_delay_ms,
+                                            virtio_scsi_bus_name(s));
                 timer_init_ms(&d->timer, QEMU_CLOCK_VIRTUAL,
                               virtio_scsi_tmf_delay_cb, d);
                 timer_mod(&d->timer,
@@ -716,7 +749,8 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
             trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
                                        virtio_scsi_get_lun(req->req.tmf.lun),
                                        req->req.tmf.tag,
-                                       req->resp.tmf.response);
+                                       req->resp.tmf.response,
+                                       virtio_scsi_bus_name(s));
         } else if (type == VIRTIO_SCSI_T_AN_QUERY ||
                  type == VIRTIO_SCSI_T_AN_SUBSCRIBE)
             trace_virtio_scsi_an_resp(virtio_scsi_get_lun(req->req.an.lun),
@@ -1065,6 +1099,7 @@ static void virtio_scsi_reset(VirtIODevice *vdev)
 
     assert(!s->dataplane_started);
 
+    trace_virtio_scsi_reset(virtio_scsi_bus_name(s));
     virtio_scsi_flush_defer_tmf_to_aio_context(s);
 
     qatomic_inc(&s->resetting);
