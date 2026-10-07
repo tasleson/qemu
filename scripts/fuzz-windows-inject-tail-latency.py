@@ -43,6 +43,7 @@
 
 import argparse
 import base64
+import collections
 import dataclasses
 import fcntl
 import hashlib
@@ -645,7 +646,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      adapters: int, lun_specs: list, seed: int, ram: str,
                      cpus: str, taskset_cores: Optional[str], probability: float,
                      delay_ms: int, delay_max_ms: int, ops: list,
-                     iothreads: Optional[int] = None) -> list:
+                     iothreads: Optional[int] = None,
+                     tmf_trace: bool = True) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -667,6 +669,9 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-display", "none",
         "-vga", "std",
         "-qmp", f"unix:{qmp_sock},server=on,wait=off",
+        # Puts a timestamp on virtio_error()'s messages, and on trace lines
+        # too, since they share the stream -- see TMF_TRACE_EVENTS.
+        "-msg", "timestamp=on",
         "-serial", f"file:{serial_log}",
         "-chardev", f"socket,path={qga_sock},server=on,wait=off,id=qga0",
         "-device", "virtio-serial",
@@ -688,6 +693,10 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
     # workload harsher where it matters: completions arrive on several
     # threads at once, which is far better at finding races in vioscsi's
     # per-adapter locking than one thread serializing everything.
+    if tmf_trace:
+        for event in TMF_TRACE_EVENTS:
+            argv += ["-trace", f"enable={event}"]
+
     n_iothreads = adapters if iothreads is None else iothreads
     for i in range(n_iothreads):
         argv += ["-object", f"iothread,id=iothread{i}"]
@@ -866,38 +875,123 @@ VIRTIO_BROKEN_PATTERNS = tuple(re.compile(p) for p in (
 ))
 
 
+# Tracepoints enabled with --tmf-trace (the default). Every one carries
+# bus=scsiN.0, so each line can be pinned to an adapter. With the log
+# trace backend they go to stderr -- the same stream, and with
+# "-msg timestamp=on" the same clock, as virtio_error()'s messages -- so
+# qemu.log reads as one ordered timeline of what each adapter was asked
+# to do right up to the moment it broke.
+TMF_TRACE_EVENTS = ("virtio_scsi_tmf_*", "virtio_scsi_reset",
+                    "virtio_scsi_broken")
+TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?virtio_scsi_(\w+) ")
+TRACE_FIELD_RE = re.compile(r"(\w+)=(\S+)")
+TRACE_CONTEXT_LINES = 20  # per-adapter history attached to a broken event
+
+# include/standard-headers/linux/virtio_scsi.h
+TMF_SUBTYPES = {0: "abort_task", 1: "abort_task_set", 2: "clear_aca",
+                3: "clear_task_set", 4: "i_t_nexus_reset",
+                5: "logical_unit_reset", 6: "query_task",
+                7: "query_task_set"}
+TMF_RESPONSES = {0: "ok", 2: "aborted", 3: "bad_target", 4: "reset",
+                 5: "busy", 9: "failure", 10: "function_succeeded",
+                 11: "function_rejected", 12: "incorrect_lun"}
+VIRTIO_SCSI_QUEUE_KINDS = {0: "control", 1: "event"}  # 2+ are request queues
+
+
 class QemuStderr:
     """Incremental reader for QEMU's stderr log.
 
     QEMU writes a handful of lines here over a whole run and the harness
     used to ignore all of them, which is how a wedged virtio device went
-    unnoticed for 45 minutes. Every new line is kept for the result, and
-    the virtio_error() family is called out separately because it means a
-    device is broken for good rather than merely complaining."""
+    unnoticed for 45 minutes. Plain lines are kept for the result, and the
+    virtio_error() family is called out because it means a device is
+    broken for good rather than merely complaining.
+
+    virtio-scsi trace lines are tallied per adapter instead of kept
+    verbatim (there can be thousands; qemu.log has them all). When an
+    adapter's virtio_scsi_broken line arrives, the last few trace lines
+    for that same adapter are attached to it: that is the question this
+    exists to answer -- what was this adapter being asked to do right
+    before its ring went bad?"""
 
     def __init__(self, path: Path):
         self.path = path
         self.pos = 0
         self.lines: list = []
+        self.trace_counts: dict = {}
+        self.broken_events: list = []
+        self._recent: dict = {}
+        self._pending_broken: list = []
 
-    def poll(self) -> list:
-        """Return the virtio-broken lines newly seen since the last call."""
+    def poll(self) -> None:
         try:
             with self.path.open("r", errors="replace") as f:
                 f.seek(self.pos)
                 new = f.readlines()
                 self.pos = f.tell()
         except OSError:
-            return []
-        broken = []
+            return
         for line in new:
             line = line.strip()
             if not line:
                 continue
+            m = TRACE_LINE_RE.match(line)
+            if m:
+                self._trace(m.group(2), line)
+                continue
             self.lines.append(line)
             if any(pat.search(line) for pat in VIRTIO_BROKEN_PATTERNS):
-                broken.append(line)
-        return broken
+                self._pending_broken.append(line)
+
+    def take_broken(self) -> list:
+        """virtio_error() lines seen since the last call.
+
+        Kept until claimed rather than returned from poll(), so one seen
+        while reading boot and pre-flight output is still reported once
+        the soak starts instead of being silently dropped with the rest of
+        the boot noise."""
+        lines, self._pending_broken = self._pending_broken, []
+        return lines
+
+    def take_counts(self) -> dict:
+        """Per-adapter trace tallies so far, and start a fresh tally.
+
+        Only the tallies restart. The per-adapter history attached to a
+        broken event is one continuous, timestamped timeline: an adapter
+        reset during pre-flight is exactly the context worth seeing if
+        that adapter breaks soon after."""
+        counts, self.trace_counts = self.trace_counts, {}
+        return counts
+
+    def tmf_requests(self) -> int:
+        return sum(n for per_bus in self.trace_counts.values()
+                   for k, n in per_bus.items() if k.startswith("tmf_req"))
+
+    def _trace(self, event: str, line: str) -> None:
+        fields = dict(TRACE_FIELD_RE.findall(line))
+        bus = fields.get("bus", "?")
+        key = event
+        if event == "tmf_req":
+            key += ":" + TMF_SUBTYPES.get(int(fields.get("subtype", -1)),
+                                          fields.get("subtype", "?"))
+        elif event == "tmf_resp":
+            key += ":" + TMF_RESPONSES.get(int(fields.get("response", -1)),
+                                           fields.get("response", "?"))
+        per_bus = self.trace_counts.setdefault(bus, {})
+        per_bus[key] = per_bus.get(key, 0) + 1
+
+        recent = self._recent.setdefault(
+            bus, collections.deque(maxlen=TRACE_CONTEXT_LINES))
+        if event == "broken":
+            queue = int(fields.get("queue", -1))
+            self.broken_events.append({
+                "bus": bus,
+                "queue": queue,
+                "queue_kind": VIRTIO_SCSI_QUEUE_KINDS.get(queue, "request"),
+                "line": line,
+                "preceding": list(recent),
+            })
+        recent.append(line)
 
 
 def write_ops_by_node(qmp) -> dict:
@@ -1007,7 +1101,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              probability: float, delay_ms: int, delay_max_ms: int, ops: list,
              seed: int, heartbeat_s: float, vioscsi_telemetry_script: str,
              disk_dir: Optional[Path] = None,
-             iothreads: Optional[int] = None) -> dict:
+             iothreads: Optional[int] = None,
+             tmf_trace: bool = True) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1038,6 +1133,17 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
     def write_status(extra: dict) -> None:
         status_path.write_text(json.dumps({**result, **extra}, indent=2))
+
+    qemu_stderr: Optional[QemuStderr] = None
+
+    def record_trace() -> None:
+        """Fold QEMU's stderr and per-adapter TMF tallies into the result."""
+        if qemu_stderr is None:
+            return
+        qemu_stderr.poll()
+        result["qemu_stderr"] = qemu_stderr.lines
+        result["tmf_trace"] = qemu_stderr.trace_counts
+        result["broken_events"] = qemu_stderr.broken_events
 
     def collect_vioscsi_telemetry() -> None:
         if not vioscsi_telemetry_script:
@@ -1087,7 +1193,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         argv = build_qemu_argv(boot_overlay, vars_overlay, qmp_sock, qga_sock,
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
-                                delay_max_ms, ops, iothreads)
+                                delay_max_ms, ops, iothreads, tmf_trace)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -1095,6 +1201,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "delay_ms": delay_ms, "delay_max_ms": delay_max_ms, "ops": ops,
                 "seed": seed,
                 "iothreads": adapters if iothreads is None else iothreads,
+                "tmf_trace": tmf_trace,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1234,7 +1341,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         prev_wops = write_ops_by_node(qmp)
 
         qemu_stderr = QemuStderr(qemu_log_path)
-        qemu_stderr.poll()  # discard anything from boot; we want the soak
+        qemu_stderr.poll()
+        # Firmware, driver init and the pre-flight probe all issue resets
+        # and TMFs of their own (each adapter resets three times on a bare
+        # boot). Keep those apart so the soak's tallies mean something.
+        # Any virtio_error() already seen stays pending and is reported on
+        # the first pass of the loop below -- an adapter that broke during
+        # pre-flight is just as broken.
+        result["tmf_trace_pre_soak"] = qemu_stderr.take_counts()
 
         agent_alive = True
         agent_lost_t: Optional[float] = None
@@ -1252,7 +1366,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             now = time.monotonic()
             elapsed = now - start
 
-            broken_lines = qemu_stderr.poll()
+            qemu_stderr.poll()
+            broken_lines = qemu_stderr.take_broken()
             if broken_lines:
                 result["outcome"] = "virtio-broken"
                 result["elapsed_s"] = elapsed
@@ -1290,9 +1405,22 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 print(f"    adapters with no LUN activity: {dead or 'none'} "
                       f"(of {len(act)}, over a {io_probe_window_s:.0f}s window)",
                       file=sys.stderr)
+                # The virtio_scsi_broken trace line lands a moment after
+                # virtio_error()'s message and may have missed the poll
+                # that saw the message; the window above has given it time.
+                record_trace()
+                for ev in result["broken_events"]:
+                    last_tmf = next((ln for ln in reversed(ev["preceding"])
+                                     if "virtio_scsi_tmf_" in ln), None)
+                    print(f"    {ev['bus']} broke on queue {ev['queue']} "
+                          f"({ev['queue_kind']}); last TMF on that adapter: "
+                          f"{last_tmf or 'none in the last ' + str(TRACE_CONTEXT_LINES) + ' events'}",
+                          file=sys.stderr)
                 write_status({"elapsed_s": elapsed})
 
                 collect_vioscsi_telemetry()
+                # Adapters keep falling over while telemetry is collected.
+                record_trace()
                 write_status({"elapsed_s": elapsed})
                 return result
 
@@ -1346,16 +1474,19 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 held = held_counts(qmp, err_nodes)
                 hb = {"elapsed_s": round(elapsed, 0), "write_ops_per_s": round(wps, 1),
                       "rule_hits": hits, "held_now": held,
-                      "agent_alive": agent_alive}
+                      "agent_alive": agent_alive,
+                      "tmf_trace": qemu_stderr.trace_counts}
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
                       f"{elapsed / 3600:.2f}h elapsed, {wps:.1f} wps, "
-                      f"rule hits={sum(hits.values())}, held now={sum(held.values())}")
+                      f"rule hits={sum(hits.values())}, held now={sum(held.values())}, "
+                      f"TMFs={qemu_stderr.tmf_requests()}")
                 write_status(hb)
 
             time.sleep(POLL_INTERVAL_S)
 
         result["outcome"] = "completed"
         result["elapsed_s"] = time.monotonic() - start
+        record_trace()
         result["rule_hits"] = rule_hits(qmp, err_nodes)
         collect_vioscsi_telemetry()
         write_status({"elapsed_s": result["elapsed_s"]})
@@ -1436,6 +1567,12 @@ def main() -> int:
                      "held 61-65s), the rest complete normally, and the "
                      "harness watches for a bugcheck over the full run.",
         epilog=usage_note(), formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tmf-trace", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="trace virtio-scsi TMFs, device resets and broken "
+                          "rings per adapter into qemu.log, and attach each "
+                          "adapter's recent TMFs to the result when it "
+                          "breaks (default: on)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -1570,7 +1707,7 @@ def main() -> int:
                        args.probability, args.delay_ms, args.delay_max_ms, ops,
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
-                       args.disk_dir, args.iothreads)
+                       args.disk_dir, args.iothreads, args.tmf_trace)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
