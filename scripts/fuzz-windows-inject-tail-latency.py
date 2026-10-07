@@ -98,6 +98,9 @@ STACK_CAPTURE_TIMEOUT_S = 120
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15
 STATIC_SCREEN_THRESHOLD_S = 20
+# Slack on top of the longest injected hold before "no block I/O completing"
+# counts as a stall rather than every writer waiting on a held request.
+IO_STALL_MARGIN_S = 30
 DEFAULT_HEARTBEAT_S = 300  # how often to log a progress line on an hours-long run
 
 # The pre-flight I/O probe's window has to span at least one full duty cycle
@@ -409,30 +412,34 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int,
 
 
 def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
-                               timeout: float = VIOSCSI_TELEMETRY_TIMEOUT_S) -> str:
+                               timeout: float = VIOSCSI_TELEMETRY_TIMEOUT_S
+                               ) -> tuple[bool, str]:
     """Run the guest's vioscsi telemetry PowerShell script and save its
-    output to out_path on the host. Never raises -- a telemetry capture
-    failure (e.g. the guest going dark right as a crash is suspected)
-    shouldn't abort the harness, just get recorded as a short status."""
+    output to out_path on the host. Returns (ok, status message). Never
+    raises -- a telemetry capture failure (e.g. the guest going dark right
+    as a crash is suspected) shouldn't abort the harness, just get
+    recorded as a short status; the caller decides whether to grab a
+    postmortem dump."""
     pid = qga_exec(qga_sock, PS_EXE,
                     ["-NoProfile", "-NonInteractive", "-File", script_path],
                     capture=True, timeout=timeout)
     if pid is None:
         msg = f"guest-exec failed to launch telemetry script {script_path!r}"
         out_path.write_text(msg + "\n")
-        return msg
+        return False, msg
     status = qga_exec_wait(qga_sock, pid, timeout=timeout)
     if status is None:
         msg = f"telemetry script timed out after {timeout:.0f}s"
         out_path.write_text(msg + "\n")
-        return msg
+        return False, msg
     out = b64_text(status.get("out-data"))
     err = b64_text(status.get("err-data"))
     text = out
     if err:
         text += f"\n--- stderr ---\n{err}"
     out_path.write_text(text)
-    return f"exitcode={status.get('exitcode')}, saved to {out_path}"
+    ok = status.get("exitcode") == 0 and bool(out.strip())
+    return ok, f"exitcode={status.get('exitcode')}, saved to {out_path}"
 
 
 def writer_states(qga_sock: Path, pids: list) -> list:
@@ -824,9 +831,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              ram: str, cpus: str, taskset_cores: Optional[str], keep_all: bool,
              qmp_module, io_driver: str, diskspd_path: str, fio_path: str,
              probability: float, delay_ms: int, delay_max_ms: int, ops: list,
-             seed: int, heartbeat_s: float, vioscsi_telemetry_script: str) -> dict:
+             seed: int, heartbeat_s: float, vioscsi_telemetry_script: str,
+             disk_dir: Optional[Path] = None) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    # LUN images (the disks under I/O test) may live on a different
+    # filesystem than the rest of the run artifacts.
+    lun_dir = disk_dir if disk_dir is not None else run_dir
+    lun_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.json"
 
     boot_overlay = run_dir / "boot.qcow2"
@@ -861,17 +873,17 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["writer_states"] = stop_writers(qga_sock, writer_pids)
         print(f"    collecting vioscsi telemetry via {vioscsi_telemetry_script}",
               file=sys.stderr)
-        msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
-                                         vioscsi_telemetry_log)
+        ok, msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
+                                             vioscsi_telemetry_log)
         result["vioscsi_telemetry"] = msg
         result["vioscsi_telemetry_log"] = str(vioscsi_telemetry_log)
-        if "timed out" in msg:
-            print("    telemetry collection still timed out -- capturing a "
+        if not ok:
+            print(f"    telemetry collection failed ({msg}) -- capturing a "
                   "screenshot and a guest memory dump for postmortem",
                   file=sys.stderr)
-            result["telemetry_timeout_screenshot"] = (
+            result["telemetry_failure_screenshot"] = (
                 screendump_hash(qmp, screenshot) is not None)
-            result["telemetry_timeout_dump"] = try_dump_guest_memory(
+            result["telemetry_failure_dump"] = try_dump_guest_memory(
                 qmp, dump_path, proc.pid, err_nodes)
 
     try:
@@ -882,7 +894,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             for t in range(targets):
                 for l in range(luns_per_target):
                     tag = f"{a}-{t}-{l}"
-                    img = run_dir / f"lun{tag}.qcow2"
+                    img = lun_dir / f"lun{tag}-{run_dir.name}.qcow2"
                     make_blank_image(img)
                     lun_specs.append(LunSpec(
                         adapter=a, target=t, lun=l, image=img,
@@ -1040,6 +1052,13 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         agent_lost_t: Optional[float] = None
         last_hash = None
         last_change_t = test_start
+        # A guest that is still completing writes is alive no matter what the
+        # (static) screen or a starved guest agent look like. Held requests
+        # legitimately stall completions, so only call it a stall once it has
+        # outlasted the longest hold.
+        io_stall_threshold_s = delay_max_ms / 1000.0 + IO_STALL_MARGIN_S
+        last_io_progress_t = test_start
+        prev_total_wr = sum(prev_wops.values())
 
         while time.monotonic() < monitor_deadline:
             now = time.monotonic()
@@ -1066,9 +1085,15 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                     last_hash = h
                     last_change_t = now
 
+            total_wr = sum(write_ops_by_node(qmp).values())
+            if total_wr > prev_total_wr:
+                last_io_progress_t = now
+            prev_total_wr = total_wr
+
             if (not agent_alive and agent_lost_t is not None
                     and now - agent_lost_t > AGENT_SILENCE_THRESHOLD_S
-                    and now - last_change_t > STATIC_SCREEN_THRESHOLD_S):
+                    and now - last_change_t > STATIC_SCREEN_THRESHOLD_S
+                    and now - last_io_progress_t > io_stall_threshold_s):
                 result["outcome"] = "crash-suspected"
                 result["elapsed_s"] = elapsed
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
@@ -1135,8 +1160,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 swtpm.kill()
                 swtpm.wait()
 
-        keep_debug_artifacts = (keep_all or result.get("telemetry_timeout_screenshot")
-                                 or result.get("telemetry_timeout_dump"))
+        keep_debug_artifacts = (keep_all or result.get("telemetry_failure_screenshot")
+                                 or result.get("telemetry_failure_dump"))
         if result["outcome"] == "completed" and not keep_debug_artifacts:
             for f in [boot_overlay, vars_overlay, screenshot] + [s.image for s in lun_specs]:
                 f.unlink(missing_ok=True)
@@ -1242,6 +1267,10 @@ def main() -> int:
                           "(e.g. '0-1')")
     ap.add_argument("--seed", type=int, default=1,
                      help="inject-error PRNG seed, for reproducing a run")
+    ap.add_argument("--disk-dir", type=Path, default=None, metavar="DIR",
+                     help="directory in which to create the LUN disk images "
+                          "under I/O test (default: the per-run directory "
+                          f"under {SOAK_DIR})")
     ap.add_argument("--keep-all", action="store_true",
                      help="keep overlays/images even for a clean 'completed' run")
     args = ap.parse_args()
@@ -1298,7 +1327,8 @@ def main() -> int:
                        args.io_driver, args.diskspd_path, args.fio_path,
                        args.probability, args.delay_ms, args.delay_max_ms, ops,
                        args.seed, args.heartbeat_seconds,
-                       args.vioscsi_telemetry_script)
+                       args.vioscsi_telemetry_script,
+                       args.disk_dir)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
