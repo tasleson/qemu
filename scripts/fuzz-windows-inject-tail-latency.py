@@ -942,19 +942,23 @@ def total_lun_writes(wops: dict, lun_specs: list) -> int:
                for s in lun_specs)
 
 
-LUN_ACTIVITY_WINDOW_S = 3.0
-
-
-def lun_activity_by_adapter(qmp, lun_specs: list,
-                             window_s: float = LUN_ACTIVITY_WINDOW_S) -> dict:
-    """Per-adapter liveness, sampled over a short window.
+def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float) -> dict:
+    """Per-adapter liveness, sampled over window_s.
 
     QEMU's virtio_error() messages don't say which device went broken,
     and x-query-virtio-status -- the command that would -- aborts QEMU on
     this tree. But LUNs are grouped by adapter, so watching which ones
     still complete writes identifies the dead adapter(s) by elimination:
-    a broken virtio device stops servicing its queues, so all 15 LUNs
-    behind it go quiet together while the other adapters carry on."""
+    a broken virtio device stops servicing its queues, so all its LUNs go
+    quiet together while the other adapters carry on.
+
+    window_s has no default on purpose. It must span a full hold cycle --
+    the same reasoning as io_probe_window_s -- or healthy LUNs that
+    happen to be sitting in a 61-65s hold are counted as quiet. A first
+    cut used a flat 3s and reported live adapters as 4/15 and 5/15, which
+    reads like partial failure and is really just a window far shorter
+    than the thing it is sampling. Only an adapter at 0 of N is
+    meaningful even so; the per-LUN counts stay noisy."""
     before = write_ops_by_node(qmp)
     time.sleep(window_s)
     after = write_ops_by_node(qmp)
@@ -1255,25 +1259,39 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 result["qemu_stderr"] = qemu_stderr.lines
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
                 result["held_now"] = held_counts(qmp, err_nodes)
-                result["adapter_activity"] = lun_activity_by_adapter(
-                    qmp, lun_specs)
-                dead = [a for a, v in sorted(result["adapter_activity"].items())
-                        if v["live_luns"] == 0]
-                result["dead_adapters"] = dead
+                # Sampled here rather than left to the heartbeat: breakage
+                # often lands before the first one is due, and then the
+                # result says nothing about whether the guest was still
+                # answering when its adapters died.
+                result["agent_alive"] = qga_ping(qga_sock)
                 result["error"] = (
                     "QEMU marked a virtio device broken (NEEDS_RESET) -- it "
                     "will not service that device's queues again, so every "
                     "LUN behind it is dead for the rest of the run: "
-                    + "; ".join(broken_lines)
-                    + f". Adapters with no LUN activity: {dead or 'none'}")
+                    + "; ".join(broken_lines))
                 print(f"    virtio device broken after {elapsed:.0f}s: "
                       f"{broken_lines[0]}", file=sys.stderr)
-                print(f"    adapters with no LUN activity: {dead or 'none'} "
-                      f"(of {len(result['adapter_activity'])})", file=sys.stderr)
-                # Persist before collecting telemetry: that talks to a guest
-                # that has just lost its disks, so it can take minutes or be
-                # killed, and the finding must not die with it.
+                # Persist what is already known before anything slow: the
+                # window below takes a full hold cycle, and telemetry talks
+                # to a guest that has just lost its disks. Neither must be
+                # able to take the finding down with it.
                 write_status({"elapsed_s": elapsed})
+
+                act = lun_activity_by_adapter(qmp, lun_specs,
+                                               io_probe_window_s)
+                dead = [a for a, v in sorted(act.items())
+                        if v["live_luns"] == 0]
+                result["adapter_activity"] = act
+                result["activity_window_s"] = round(io_probe_window_s, 1)
+                result["dead_adapters"] = dead
+                result["write_ops_per_s"] = round(
+                    sum(v["writes"] for v in act.values()) / io_probe_window_s, 1)
+                result["error"] += f". Adapters with no LUN activity: {dead or 'none'}"
+                print(f"    adapters with no LUN activity: {dead or 'none'} "
+                      f"(of {len(act)}, over a {io_probe_window_s:.0f}s window)",
+                      file=sys.stderr)
+                write_status({"elapsed_s": elapsed})
+
                 collect_vioscsi_telemetry()
                 write_status({"elapsed_s": elapsed})
                 return result
