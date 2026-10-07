@@ -942,6 +942,34 @@ def total_lun_writes(wops: dict, lun_specs: list) -> int:
                for s in lun_specs)
 
 
+LUN_ACTIVITY_WINDOW_S = 3.0
+
+
+def lun_activity_by_adapter(qmp, lun_specs: list,
+                             window_s: float = LUN_ACTIVITY_WINDOW_S) -> dict:
+    """Per-adapter liveness, sampled over a short window.
+
+    QEMU's virtio_error() messages don't say which device went broken,
+    and x-query-virtio-status -- the command that would -- aborts QEMU on
+    this tree. But LUNs are grouped by adapter, so watching which ones
+    still complete writes identifies the dead adapter(s) by elimination:
+    a broken virtio device stops servicing its queues, so all 15 LUNs
+    behind it go quiet together while the other adapters carry on."""
+    before = write_ops_by_node(qmp)
+    time.sleep(window_s)
+    after = write_ops_by_node(qmp)
+    out: dict = {}
+    for spec in lun_specs:
+        a = out.setdefault(f"scsi{spec.adapter}",
+                           {"luns": 0, "live_luns": 0, "writes": 0})
+        delta = lun_write_delta(before, after, spec)
+        a["luns"] += 1
+        a["writes"] += delta
+        if delta > 0:
+            a["live_luns"] += 1
+    return out
+
+
 def rule_hits(qmp, err_nodes: list) -> dict:
     out: dict = {}
     for n in err_nodes:
@@ -1227,13 +1255,25 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 result["qemu_stderr"] = qemu_stderr.lines
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
                 result["held_now"] = held_counts(qmp, err_nodes)
+                result["adapter_activity"] = lun_activity_by_adapter(
+                    qmp, lun_specs)
+                dead = [a for a, v in sorted(result["adapter_activity"].items())
+                        if v["live_luns"] == 0]
+                result["dead_adapters"] = dead
                 result["error"] = (
                     "QEMU marked a virtio device broken (NEEDS_RESET) -- it "
                     "will not service that device's queues again, so every "
                     "LUN behind it is dead for the rest of the run: "
-                    + "; ".join(broken_lines))
+                    + "; ".join(broken_lines)
+                    + f". Adapters with no LUN activity: {dead or 'none'}")
                 print(f"    virtio device broken after {elapsed:.0f}s: "
                       f"{broken_lines[0]}", file=sys.stderr)
+                print(f"    adapters with no LUN activity: {dead or 'none'} "
+                      f"(of {len(result['adapter_activity'])})", file=sys.stderr)
+                # Persist before collecting telemetry: that talks to a guest
+                # that has just lost its disks, so it can take minutes or be
+                # killed, and the finding must not die with it.
+                write_status({"elapsed_s": elapsed})
                 collect_vioscsi_telemetry()
                 write_status({"elapsed_s": elapsed})
                 return result
