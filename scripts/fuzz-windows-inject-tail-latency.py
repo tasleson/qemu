@@ -49,6 +49,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -830,6 +831,75 @@ def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
 # ------------------------------------------------------------------
 
 
+# virtio_error() in hw/virtio/virtio.c is how QEMU reacts to a guest that
+# puts something impossible in a virtqueue. It does not just complain: it
+# sets VIRTIO_CONFIG_S_NEEDS_RESET and vdev->broken, and virtqueue_pop()
+# then refuses to touch that device's queues ever again (see the
+# vdev->broken checks in virtio.c). So the device is dead for the rest of
+# the run, and every LUN behind it silently stops doing I/O.
+#
+# There is no QMP way to ask for this. 'broken' is not a QOM property, and
+# x-query-virtio-status -- the obvious candidate -- aborts QEMU outright on
+# this tree (visit_start_struct assertion, reproducible on any virtio
+# device on a bare -S VM), so it cannot be used here. What is left, and is
+# in fact perfectly reliable, is QEMU's own stderr, which the harness
+# already captures. These are virtio_error()'s messages from virtio.c (the
+# generic ring handling) plus virtio-scsi.c, with the printf escapes
+# loosened.
+VIRTIO_BROKEN_PATTERNS = tuple(re.compile(p) for p in (
+    r"virtio: zero sized buffers are not allowed",
+    r"virtio: too many write descriptors in",
+    r"virtio: bogus descriptor or out of resources",
+    r"virtio: queue \d+ size \d+ exceeds max size",
+    r"Desc next is \d+",
+    r"Invalid size for indirect buffer table",
+    r"Incorrect order for descriptors",
+    r"Cannot map descriptor ring",
+    r"Cannot map indirect buffer",
+    r"Looped descriptor",
+    r"Region caches not initialized",
+    r"Virtqueue size exceeded",
+    r"Guest moved used index from \d+ to \d+",
+    r"Guest says index \d+ is available",
+    r"VQ \d+ size 0x[0-9a-f]+ Guest index 0x[0-9a-f]+",
+    r"wrong size for virtio-scsi headers",
+))
+
+
+class QemuStderr:
+    """Incremental reader for QEMU's stderr log.
+
+    QEMU writes a handful of lines here over a whole run and the harness
+    used to ignore all of them, which is how a wedged virtio device went
+    unnoticed for 45 minutes. Every new line is kept for the result, and
+    the virtio_error() family is called out separately because it means a
+    device is broken for good rather than merely complaining."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.pos = 0
+        self.lines: list = []
+
+    def poll(self) -> list:
+        """Return the virtio-broken lines newly seen since the last call."""
+        try:
+            with self.path.open("r", errors="replace") as f:
+                f.seek(self.pos)
+                new = f.readlines()
+                self.pos = f.tell()
+        except OSError:
+            return []
+        broken = []
+        for line in new:
+            line = line.strip()
+            if not line:
+                continue
+            self.lines.append(line)
+            if any(pat.search(line) for pat in VIRTIO_BROKEN_PATTERNS):
+                broken.append(line)
+        return broken
+
+
 def write_ops_by_node(qmp) -> dict:
     """identifier -> cumulative completed write operations. See
     fuzz-windows-inject-scsi-reset.py's write_ops_by_node for why both
@@ -1116,6 +1186,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         last_heartbeat = test_start
         prev_wops = write_ops_by_node(qmp)
 
+        qemu_stderr = QemuStderr(qemu_log_path)
+        qemu_stderr.poll()  # discard anything from boot; we want the soak
+
         agent_alive = True
         agent_lost_t: Optional[float] = None
         last_hash = None
@@ -1131,6 +1204,24 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         while time.monotonic() < monitor_deadline:
             now = time.monotonic()
             elapsed = now - start
+
+            broken_lines = qemu_stderr.poll()
+            if broken_lines:
+                result["outcome"] = "virtio-broken"
+                result["elapsed_s"] = elapsed
+                result["qemu_stderr"] = qemu_stderr.lines
+                result["rule_hits"] = rule_hits(qmp, err_nodes)
+                result["held_now"] = held_counts(qmp, err_nodes)
+                result["error"] = (
+                    "QEMU marked a virtio device broken (NEEDS_RESET) -- it "
+                    "will not service that device's queues again, so every "
+                    "LUN behind it is dead for the rest of the run: "
+                    + "; ".join(broken_lines))
+                print(f"    virtio device broken after {elapsed:.0f}s: "
+                      f"{broken_lines[0]}", file=sys.stderr)
+                collect_vioscsi_telemetry()
+                write_status({"elapsed_s": elapsed})
+                return result
 
             if proc.poll() is not None:
                 result["outcome"] = "qemu-exited"
