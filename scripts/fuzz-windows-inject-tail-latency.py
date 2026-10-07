@@ -622,12 +622,14 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-chardev", f"socket,path={qga_sock},server=on,wait=off,id=qga0",
         "-device", "virtio-serial",
         "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
-        # Boot disk stays a plain passthrough -- the tail-latency rule only
-        # targets the SCSI data LUNs below.
+        # Boot disk is SATA/AHCI and stays a plain passthrough -- the
+        # tail-latency rule only targets the SCSI data LUNs below, not the
+        # virtio-blk boot path.
+        "-device", "ahci,id=ahci0",
         "-blockdev", f"driver=file,filename={boot_overlay},node-name=file0",
         "-blockdev", "driver=qcow2,file=file0,node-name=raw0",
         "-blockdev", "driver=inject-error,image=raw0,node-name=err0",
-        "-device", "virtio-blk-pci,drive=err0,bootindex=0,id=disk0",
+        "-device", "ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0",
     ]
 
     for a in range(adapters):

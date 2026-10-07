@@ -7,9 +7,10 @@
 # inject-error / SCSI response injection branch.
 #
 # Creates:
-#   - A virtio-blk boot disk (Windows install target), behind an
-#     inject-error filter
-#   - A second virtio-blk data disk, behind an inject-error filter
+#   - A SATA (AHCI) boot disk (Windows install target), behind an
+#     inject-error filter -- kept off virtio-blk so boot itself doesn't
+#     depend on the viostor driver under test
+#   - A virtio-blk data disk, behind an inject-error filter
 #   - Two virtio-scsi data disks, behind inject-error filters
 #   - UEFI (OVMF, Secure Boot capable) firmware + per-VM NVRAM
 #   - An emulated TPM 2.0 (swtpm), required by Windows 11 setup
@@ -154,7 +155,7 @@ Trace log:  ${TRACE_LOG} (plain text; tracing is on by default whenever
             ${TRACE_EVENTS_DEFAULT} exists)
 
 Block nodes for injection:
-  err0   boot disk       (virtio-blk, disk0)  -- the running system's disk
+  err0   boot disk       (SATA/AHCI, disk0)   -- the running system's disk
   err1   blk data disk   (virtio-blk, diskblk1)
   err2   scsi data disk1 (virtio-scsi, disk1)
   err3   scsi data disk2 (virtio-scsi, disk2)
@@ -162,18 +163,21 @@ Block nodes for injection:
   Note: err0 is the running system's disk.  Injecting there can bugcheck
         the guest, and a stall on it will hold up VM shutdown until
         released.  Prefer err1/err2/err3 for sustained fault injection;
-        use err0 only for boot-disk-specific viostor scenarios.
+        err0 is SATA/AHCI (no guest driver under test), so it's mainly
+        useful for firmware/OVMF-era boot scenarios, not viostor.sys.
 
 After booting, inject errors/responses via QMP, e.g.:
   $QEMU_BUILD/run qmp-shell ${QMP_SOCK}
 
 Windows setup notes:
-  - At "Where do you want to install Windows?", click "Load driver" and
-    browse the virtio-win CD (E:) to load viostor (virtio-blk) so the
-    boot disk is visible, and NetKVM for networking.
-  - vioscsi (virtio-scsi) driver only needs installing after first boot,
-    once Windows enumerates the two SCSI data disks (Device Manager will
-    show them as unknown storage controllers until then).
+  - The boot disk is SATA/AHCI, so Windows Setup sees it natively --
+    no "Load driver" step is needed to install to it. At "Where do you
+    want to install Windows?", just load NetKVM for networking from the
+    virtio-win CD (E:) if you want networking during setup.
+  - viostor (virtio-blk) is only needed once Windows enumerates the
+    blk data disk; vioscsi (virtio-scsi) only needs installing after
+    first boot, once Windows enumerates the two SCSI data disks (Device
+    Manager will show them as unknown storage controllers until then).
   - Windows 11 requires Secure Boot + TPM 2.0; both are already wired up
     (OVMF secure-boot template with default keys enrolled, and swtpm).
 EOF
@@ -292,9 +296,8 @@ run_vm() {
     local drivers_cd_args=()
     if [ -f "${VIRTIO_ISO}" ]; then
         drivers_cd_args=(
-            -device ahci,id=ahci0
             -drive "id=cdrom_drivers,if=none,format=raw,media=cdrom,file=${VIRTIO_ISO},readonly=on"
-            -device ide-cd,bus=ahci0.0,drive=cdrom_drivers
+            -device ide-cd,bus=ahci0.1,drive=cdrom_drivers
         )
     else
         echo "Warning: virtio-win driver ISO not found at ${VIRTIO_ISO} (drivers CD not attached)"
@@ -303,10 +306,10 @@ run_vm() {
     echo "Starting VM..."
     echo "  QMP socket: ${QMP_SOCK}"
     echo "  QGA socket: ${QGA_SOCK} (guest-agent virtio-serial channel)"
-    echo "  Boot disk:  ${BOOT_DISK} (virtio-blk, inject-error filter, err0)"
+    echo "  Boot disk:  ${BOOT_DISK} (SATA/AHCI, inject-error filter, err0)"
     echo "  Data disks: err1 (virtio-blk), err2/err3 (virtio-scsi)"
     if [ ${#drivers_cd_args[@]} -gt 0 ]; then
-        echo "  Drivers CD: ${VIRTIO_ISO} (ahci0.0)"
+        echo "  Drivers CD: ${VIRTIO_ISO} (ahci0.1)"
     fi
     for pair in "err0:${delay0}" "err1:${delay1}" "err2:${delay2}" "err3:${delay3}"; do
         node="${pair%%:*}"
@@ -348,10 +351,11 @@ run_vm() {
         -netdev bridge,br=virbr0,helper=/usr/libexec/qemu-bridge-helper,id=net0 \
         -device virtio-net-pci,netdev=net0,id=nic0 \
         \
+        -device ahci,id=ahci0 \
         -blockdev driver=file,filename="${BOOT_DISK}",node-name=file0 \
         -blockdev driver=qcow2,file=file0,node-name=raw0 \
         -blockdev driver=inject-error,image=raw0,node-name=err0"${delay0}" \
-        -device virtio-blk-pci,drive=err0,bootindex=0,id=disk0 \
+        -device ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0 \
         \
         -blockdev driver=file,filename="${BLK_DATA_DISK}",node-name=file1 \
         -blockdev driver=qcow2,file=file1,node-name=raw1 \
@@ -392,14 +396,17 @@ cmd_install() {
 
     echo "Installing from: ${win_iso}"
     echo "Drivers CD:       ${VIRTIO_ISO}"
-    echo "Install Windows to the boot disk (virtio-blk, 'Load driver' -> viostor)."
+    echo "Install Windows to the boot disk (SATA/AHCI, visible natively --"
+    echo "no 'Load driver' step needed for it; load NetKVM if you want"
+    echo "networking during setup)."
     echo ""
 
-    # The drivers CD (ahci0.0) is attached by run_vm itself; the Windows
-    # installer ISO just needs another port on that same controller.
+    # The boot disk (ahci0.0) and drivers CD (ahci0.1) are attached by
+    # run_vm itself; the Windows installer ISO just needs another port on
+    # that same controller.
     run_vm \
         -drive id=cdrom_win,if=none,format=raw,media=cdrom,file="${win_iso}",readonly=on \
-        -device ide-cd,bus=ahci0.1,drive=cdrom_win,bootindex=1
+        -device ide-cd,bus=ahci0.2,drive=cdrom_win,bootindex=1
 }
 
 cmd_run() {
