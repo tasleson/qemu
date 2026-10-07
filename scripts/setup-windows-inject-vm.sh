@@ -24,10 +24,10 @@
 
 set -euo pipefail
 
-QEMU_SRC="/home/tasleson/projects/qemu"
+QEMU_SRC="$HOME/projects/qemu"
 QEMU_BUILD="${QEMU_SRC}/build"
 QEMU="${QEMU_BUILD}/qemu-system-x86_64"
-VM_DIR="/home/tasleson/VirtualMachines/qemu/windows_inject"
+VM_DIR="$HOME/VirtualMachines/qemu/windows_inject"
 QMP_SOCK="${VM_DIR}/qmp.sock"
 QGA_SOCK="${VM_DIR}/qga.sock"
 TPM_DIR="${VM_DIR}/tpm"
@@ -48,7 +48,7 @@ OVMF_VARS_TEMPLATE="/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.qcow2"
 OVMF_VARS="${VM_DIR}/OVMF_VARS.qcow2"
 
 VIRTIO_ISO="${VM_DIR}/virtio-win.iso"
-WIN_ISO_DEFAULT="/home/tasleson/Downloads/Win11_25H2_English_x64_v2.iso"
+WIN_ISO_DEFAULT="$HOME/Downloads/Win11_25H2_English_x64_v2.iso"
 
 TRACE_EVENTS_DEFAULT="${QEMU_SRC}/scripts/windows-storage-trace-events"
 TRACE_LOG="${VM_DIR}/trace.log"

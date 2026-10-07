@@ -47,11 +47,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-QEMU_SRC = Path("/home/tasleson/projects/qemu")
+QEMU_SRC = Path.home() / "projects/qemu"
 QEMU_BUILD = QEMU_SRC / "build"
 QEMU_BIN = QEMU_BUILD / "qemu-system-x86_64"
 QEMU_IMG = QEMU_BUILD / "qemu-img"
-VM_DIR = Path("/home/tasleson/VirtualMachines/qemu/windows_inject")
+VM_DIR = Path.home() / "VirtualMachines/qemu/windows_inject"
 FUZZ_DIR = VM_DIR / "fuzz"
 
 BOOT_DISK = VM_DIR / "boot.qcow2"

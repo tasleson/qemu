@@ -31,10 +31,10 @@
 
 set -euo pipefail
 
-QEMU_SRC="/home/tasleson/projects/qemu"
+QEMU_SRC="$HOME/projects/qemu"
 QEMU_BUILD="${QEMU_SRC}/build"
 QEMU="${QEMU_BUILD}/qemu-system-x86_64"
-VM_DIR="/home/tasleson/VirtualMachines/qemu/error_inject"
+VM_DIR="$HOME/VirtualMachines/qemu/error_inject"
 QMP_SOCK="${VM_DIR}/qmp.sock"
 
 RAM="4G"

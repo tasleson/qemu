@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-QEMU_SRC="${QEMU_SRC:-/home/tasleson/projects/qemu}"
-QMP="${QMP:-/home/tasleson/VirtualMachines/qemu/error_inject/qmp.sock}"
+QEMU_SRC="${QEMU_SRC:-$HOME/projects/qemu}"
+QMP="${QMP:-$HOME/VirtualMachines/qemu/error_inject/qmp.sock}"
 SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@localhost"
 INJECT="${QEMU_SRC}/build/run ${QEMU_SRC}/scripts/scsi-inject.py -s ${QMP}"
 
