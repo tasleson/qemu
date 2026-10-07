@@ -198,14 +198,42 @@ def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
     return resp is not None and "return" in resp
 
 
-def qga_exec(sock_path: Path, path: str, args: list, capture: bool,
-             timeout: float = GUEST_EXEC_TIMEOUT_S) -> Optional[int]:
+class GuestExecError(RuntimeError):
+    """A guest-exec request that did not come back with a pid.
+
+    The message distinguishes which of two very different failures
+    happened, because they call for opposite responses. If the agent
+    refused the request, the command or the guest is wrong. If the agent
+    never answered, QEMU's main loop is most likely too backed up to
+    service the agent's virtio-serial channel -- and the process may well
+    be running, with only the reply lost. Collapsing both into "failed to
+    launch" sends you looking for a guest-side bug that isn't there.
+    """
+
+
+def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
+             timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
     resp = qga_call(sock_path, "guest-exec",
                      {"path": path, "arg": args, "capture-output": capture},
                      timeout=timeout)
-    if resp and "return" in resp:
-        return resp["return"].get("pid")
-    return None
+    if resp is None:
+        raise GuestExecError(
+            f"guest-exec ({what}): no reply from the guest agent within "
+            f"{timeout:.0f}s while asking it to run {path!r}. The agent's "
+            f"virtio-serial channel is serviced from QEMU's main loop, so a "
+            f"main loop saturated with LUN I/O stalls it -- the process may "
+            f"have started and only the reply was lost")
+    if "error" in resp:
+        err = resp["error"] if isinstance(resp["error"], dict) else {}
+        raise GuestExecError(
+            f"guest-exec ({what}): the guest agent refused to run {path!r}: "
+            f"{err.get('class', '?')}: {err.get('desc', resp['error'])}")
+    pid = resp.get("return", {}).get("pid")
+    if pid is None:
+        raise GuestExecError(
+            f"guest-exec ({what}): the guest agent accepted {path!r} but "
+            f"returned no pid: {resp!r}")
+    return pid
 
 
 def qga_exec_wait(sock_path: Path, pid: int, timeout: float) -> Optional[dict]:
@@ -228,10 +256,11 @@ def encode_ps(script: str) -> str:
     return base64.b64encode(script.encode("utf-16-le")).decode()
 
 
-def ps_exec(sock_path: Path, script: str, capture: bool,
-            timeout: float = GUEST_EXEC_TIMEOUT_S) -> Optional[int]:
+def ps_exec(sock_path: Path, what: str, script: str, capture: bool,
+            timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
     args = ["-NoProfile", "-NonInteractive", "-EncodedCommand", encode_ps(script)]
-    return qga_exec(sock_path, PS_EXE, args, capture=capture, timeout=timeout)
+    return qga_exec(sock_path, what, PS_EXE, args, capture=capture,
+                     timeout=timeout)
 
 
 # ------------------------------------------------------------------
@@ -331,9 +360,8 @@ def build_fio_args(drive_number: int, duration_s: float) -> list:
 
 
 def resolve_drive_numbers(qga_sock: Path, serials: list) -> dict:
-    pid = ps_exec(qga_sock, build_resolve_script(serials), capture=True)
-    if pid is None:
-        raise RuntimeError("guest-exec (resolve disk numbers) failed to launch")
+    pid = ps_exec(qga_sock, "resolve disk numbers",
+                   build_resolve_script(serials), capture=True)
     status = qga_exec_wait(qga_sock, pid, timeout=GUEST_EXEC_TIMEOUT_S)
     if status is None:
         raise RuntimeError("guest-exec (resolve disk numbers) timed out")
@@ -354,19 +382,18 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                    io_driver: str = "powershell",
                    diskspd_path: str = DEFAULT_DISKSPD_PATH,
                    fio_path: str = DEFAULT_FIO_PATH) -> int:
+    what = f"writer for PhysicalDrive{drive_number}"
     if io_driver == "diskspd":
-        pid = qga_exec(qga_sock, diskspd_path,
-                        build_diskspd_args(drive_number, duration_s),
-                        capture=False)
-    elif io_driver == "fio":
-        pid = qga_exec(qga_sock, fio_path,
-                        build_fio_args(drive_number, duration_s),
-                        capture=False)
-    else:
-        pid = ps_exec(qga_sock, build_writer_script(drive_number, duration_s), capture=False)
-    if pid is None:
-        raise RuntimeError(f"guest-exec (writer for PhysicalDrive{drive_number}) failed to launch")
-    return pid
+        return qga_exec(qga_sock, what, diskspd_path,
+                         build_diskspd_args(drive_number, duration_s),
+                         capture=False)
+    if io_driver == "fio":
+        return qga_exec(qga_sock, what, fio_path,
+                         build_fio_args(drive_number, duration_s),
+                         capture=False)
+    return ps_exec(qga_sock, what,
+                    build_writer_script(drive_number, duration_s),
+                    capture=False)
 
 
 def diskspd_diagnostic(qga_sock: Path, diskspd_path: str, drive_number: int,
@@ -377,11 +404,12 @@ def diskspd_diagnostic(qga_sock: Path, diskspd_path: str, drive_number: int,
     # ordinary GUEST_EXEC_TIMEOUT_S, or this diagnostic itself "times out"
     # on perfectly healthy I/O and reports nothing useful.
     diag_timeout = delay_max_ms / 1000.0 + GUEST_EXEC_TIMEOUT_S
-    pid = qga_exec(qga_sock, diskspd_path, build_diskspd_args(drive_number, 1),
-                   capture=True, timeout=diag_timeout)
-    if pid is None:
-        return (f"diskspd failed to even launch at {diskspd_path!r} "
-                f"(guest-exec returned no pid -- path wrong or not present?)")
+    try:
+        pid = qga_exec(qga_sock, "diskspd diagnostic", diskspd_path,
+                        build_diskspd_args(drive_number, 1),
+                        capture=True, timeout=diag_timeout)
+    except GuestExecError as exc:
+        return f"diskspd failed to even launch at {diskspd_path!r}: {exc}"
     status = qga_exec_wait(qga_sock, pid, timeout=diag_timeout)
     if status is None:
         return "diskspd diagnostic run timed out"
@@ -397,11 +425,12 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int,
     # read-back/verify phase before exiting, so give it room past
     # delay_max_ms rather than the ordinary GUEST_EXEC_TIMEOUT_S.
     diag_timeout = delay_max_ms / 1000.0 + GUEST_EXEC_TIMEOUT_S
-    pid = qga_exec(qga_sock, fio_path, build_fio_args(drive_number, 1),
-                   capture=True, timeout=diag_timeout)
-    if pid is None:
-        return (f"fio failed to even launch at {fio_path!r} "
-                f"(guest-exec returned no pid -- path wrong or not present?)")
+    try:
+        pid = qga_exec(qga_sock, "fio diagnostic", fio_path,
+                        build_fio_args(drive_number, 1),
+                        capture=True, timeout=diag_timeout)
+    except GuestExecError as exc:
+        return f"fio failed to even launch at {fio_path!r}: {exc}"
     status = qga_exec_wait(qga_sock, pid, timeout=diag_timeout)
     if status is None:
         return "fio diagnostic run timed out"
@@ -420,11 +449,12 @@ def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
     as a crash is suspected) shouldn't abort the harness, just get
     recorded as a short status; the caller decides whether to grab a
     postmortem dump."""
-    pid = qga_exec(qga_sock, PS_EXE,
-                    ["-NoProfile", "-NonInteractive", "-File", script_path],
-                    capture=True, timeout=timeout)
-    if pid is None:
-        msg = f"guest-exec failed to launch telemetry script {script_path!r}"
+    try:
+        pid = qga_exec(qga_sock, "vioscsi telemetry", PS_EXE,
+                        ["-NoProfile", "-NonInteractive", "-File", script_path],
+                        capture=True, timeout=timeout)
+    except GuestExecError as exc:
+        msg = str(exc)
         out_path.write_text(msg + "\n")
         return False, msg
     status = qga_exec_wait(qga_sock, pid, timeout=timeout)
@@ -474,8 +504,11 @@ def stop_writers(qga_sock: Path, pids: list,
     still under full write load."""
     for st in writer_states(qga_sock, pids):
         if not st["exited"]:
-            qga_exec(qga_sock, TASKKILL_EXE, ["/F", "/PID", str(st["pid"])],
-                      capture=False)
+            try:
+                qga_exec(qga_sock, f"taskkill pid {st['pid']}", TASKKILL_EXE,
+                          ["/F", "/PID", str(st["pid"])], capture=False)
+            except GuestExecError:
+                pass  # best-effort; wait_for_writers reports what survived
     return wait_for_writers(qga_sock, pids, timeout)
 
 
