@@ -1051,8 +1051,9 @@ def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float) -> dict:
     happen to be sitting in a 61-65s hold are counted as quiet. A first
     cut used a flat 3s and reported live adapters as 4/15 and 5/15, which
     reads like partial failure and is really just a window far shorter
-    than the thing it is sampling. Only an adapter at 0 of N is
-    meaningful even so; the per-LUN counts stay noisy."""
+    than the thing it is sampling. Deciding which adapters are dead from
+    these counts is adapters_without_io()'s job -- "zero writes" is not
+    the test."""
     before = write_ops_by_node(qmp)
     time.sleep(window_s)
     after = write_ops_by_node(qmp)
@@ -1066,6 +1067,24 @@ def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float) -> dict:
         if delta > 0:
             a["live_luns"] += 1
     return out
+
+
+def adapters_without_io(activity: dict, held: dict, lun_specs: list) -> list:
+    """Adapters whose writes over the window don't exceed what they held.
+
+    A broken device still finishes requests it had already popped: they
+    sit in the inject-error hold and complete when it expires. A window
+    long enough to be fair to healthy LUNs -- a full hold cycle -- sees
+    every one of them, so "no writes at all" misses a dead adapter. It
+    did once, reporting none dead while scsi0 sat at 7 writes against
+    ~28000 on each of its neighbours. What a dead adapter can still
+    complete is bounded by what it was holding when it broke, held being
+    the per-node held_counts() taken at that moment."""
+    held_by_adapter: collections.Counter = collections.Counter()
+    for spec in lun_specs:
+        held_by_adapter[f"scsi{spec.adapter}"] += held.get(spec.err_node, 0)
+    return [a for a, v in sorted(activity.items())
+            if v["writes"] <= held_by_adapter[a]]
 
 
 def rule_hits(qmp, err_nodes: list) -> dict:
@@ -1394,15 +1413,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
                 act = lun_activity_by_adapter(qmp, lun_specs,
                                                io_probe_window_s)
-                dead = [a for a, v in sorted(act.items())
-                        if v["live_luns"] == 0]
+                dead = adapters_without_io(act, result["held_now"], lun_specs)
                 result["adapter_activity"] = act
                 result["activity_window_s"] = round(io_probe_window_s, 1)
                 result["dead_adapters"] = dead
                 result["write_ops_per_s"] = round(
                     sum(v["writes"] for v in act.values()) / io_probe_window_s, 1)
-                result["error"] += f". Adapters with no LUN activity: {dead or 'none'}"
-                print(f"    adapters with no LUN activity: {dead or 'none'} "
+                result["error"] += f". Adapters no longer doing I/O: {dead or 'none'}"
+                print(f"    adapters no longer doing I/O: {dead or 'none'} "
                       f"(of {len(act)}, over a {io_probe_window_s:.0f}s window)",
                       file=sys.stderr)
                 # The virtio_scsi_broken trace line lands a moment after
