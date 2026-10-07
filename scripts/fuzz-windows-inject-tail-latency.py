@@ -86,7 +86,14 @@ DEFAULT_CPUS = "5"
 LUN_IMAGE_SIZE = "4G"
 
 BOOT_TIMEOUT_S = 180
-GUEST_EXEC_TIMEOUT_S = 30
+# Generous on purpose. The guest agent's virtio-serial channel competes with
+# every LUN's I/O for QEMU's attention, so at high LUN counts a reply can be
+# queued behind a lot of work without anything actually being wrong -- 30s
+# was enough to abort a 75-LUN run during writer ramp-up. WRITER_LAUNCH_
+# TIMEOUT_S, not this, is what bounds an unattended run: a genuinely dead
+# guest must not cost 75 x this before the harness gives up.
+GUEST_EXEC_TIMEOUT_S = 120
+WRITER_LAUNCH_TIMEOUT_S = 600
 WARMUP_S = 5.0  # just long enough for guest-exec to actually launch the
                 # writer before the pre-flight probe starts timing itself
 QMP_CMD_TIMEOUT_S = 15
@@ -636,7 +643,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      qga_sock: Path, serial_log: Path, tpm_sock: Path,
                      adapters: int, lun_specs: list, seed: int, ram: str,
                      cpus: str, taskset_cores: Optional[str], probability: float,
-                     delay_ms: int, delay_max_ms: int, ops: list) -> list:
+                     delay_ms: int, delay_max_ms: int, ops: list,
+                     iothreads: Optional[int] = None) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -672,8 +680,22 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-device", "ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0",
     ]
 
+    # Give each adapter its own iothread so LUN I/O stops sharing a thread
+    # with the guest agent's virtio-serial channel and the QMP socket the
+    # harness polls -- otherwise the harness's own control plane queues
+    # behind the data plane it is trying to stress. It also makes the
+    # workload harsher where it matters: completions arrive on several
+    # threads at once, which is far better at finding races in vioscsi's
+    # per-adapter locking than one thread serializing everything.
+    n_iothreads = adapters if iothreads is None else iothreads
+    for i in range(n_iothreads):
+        argv += ["-object", f"iothread,id=iothread{i}"]
+
     for a in range(adapters):
-        argv += ["-device", f"virtio-scsi-pci,id=scsi{a}"]
+        props = f"virtio-scsi-pci,id=scsi{a}"
+        if n_iothreads:
+            props += f",iothread=iothread{a % n_iothreads}"
+        argv += ["-device", props]
 
     for spec in lun_specs:
         rule_props = tail_rule_props(spec.err_node, probability, delay_ms,
@@ -867,7 +889,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              qmp_module, io_driver: str, diskspd_path: str, fio_path: str,
              probability: float, delay_ms: int, delay_max_ms: int, ops: list,
              seed: int, heartbeat_s: float, vioscsi_telemetry_script: str,
-             disk_dir: Optional[Path] = None) -> dict:
+             disk_dir: Optional[Path] = None,
+             iothreads: Optional[int] = None) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -947,13 +970,15 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         argv = build_qemu_argv(boot_overlay, vars_overlay, qmp_sock, qga_sock,
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
-                                delay_max_ms, ops)
+                                delay_max_ms, ops, iothreads)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
                 "duration_s": duration_s, "probability": probability,
                 "delay_ms": delay_ms, "delay_max_ms": delay_max_ms, "ops": ops,
-                "seed": seed, "argv": argv}
+                "seed": seed,
+                "iothreads": adapters if iothreads is None else iothreads,
+                "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
         swtpm = start_swtpm(tpm_sock)
@@ -1017,11 +1042,19 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["drive_numbers"] = drive_numbers
 
         writer_pids = []
+        # Published by reference, before the loop, so a launch that fails
+        # part way through still records how many writers did come up --
+        # "32 of 75 started" is the whole diagnosis in that case.
+        result["writer_pids"] = writer_pids
+        launch_deadline = time.monotonic() + WRITER_LAUNCH_TIMEOUT_S
         for spec in lun_specs:
             drive_no = drive_numbers[spec.serial]
+            if time.monotonic() > launch_deadline:
+                raise RuntimeError(
+                    f"only got {len(writer_pids)} of {total_luns} writer(s) "
+                    f"started within {WRITER_LAUNCH_TIMEOUT_S}s")
             writer_pids.append(launch_writer(qga_sock, drive_no, writer_duration,
                                               io_driver, diskspd_path, fio_path))
-        result["writer_pids"] = writer_pids
 
         time.sleep(WARMUP_S)
 
@@ -1239,6 +1272,12 @@ def main() -> int:
                      "held 61-65s), the rest complete normally, and the "
                      "harness watches for a bugcheck over the full run.",
         epilog=usage_note(), formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--iothreads", type=int, default=None,
+                     help="number of QEMU iothreads to create, assigned "
+                          "round-robin to the adapters (default: one per "
+                          "adapter). 0 leaves all adapter I/O in QEMU's main "
+                          "loop, where it contends with the guest agent and "
+                          "QMP -- useful only to reproduce an old run")
     ap.add_argument("--adapters", type=int, default=1,
                      help="number of vioscsi (virtio-scsi-pci) adapters to "
                           "create (default: %(default)s); --targets and "
@@ -1323,6 +1362,10 @@ def main() -> int:
         print("Error: --adapters, --targets and --luns-per-target must all "
               "be >= 1.", file=sys.stderr)
         return 1
+    if args.iothreads is not None and args.iothreads < 0:
+        print("Error: --iothreads must be >= 0 (0 keeps adapter I/O in "
+              "QEMU's main loop).", file=sys.stderr)
+        return 1
     # virtio-scsi's own limits (VIRTIO_SCSI_MAX_TARGET / VIRTIO_SCSI_MAX_LUN
     # in include/hw/virtio/virtio-scsi.h) -- fail fast with a clear message
     # instead of QEMU rejecting the device partway through startup.
@@ -1363,7 +1406,7 @@ def main() -> int:
                        args.probability, args.delay_ms, args.delay_max_ms, ops,
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
-                       args.disk_dir)
+                       args.disk_dir, args.iothreads)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
