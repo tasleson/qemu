@@ -161,6 +161,8 @@ struct VirtQueue
 
     /* What the chain looked like when the ring was declared broken */
     VirtQueueChainPeek *chain_error;
+    /* See virtio_queue_aio_attach_host_notifier_watch() */
+    VirtQueueWatchFn *watch;
 };
 
 const char *virtio_device_names[] = {
@@ -4447,6 +4449,45 @@ void virtio_queue_aio_detach_host_notifier(VirtQueue *vq, AioContext *ctx)
      * we potentially re-attach it.  The attach_host_notifier functions will
      * ensure that notifications are enabled again when they are needed.
      */
+}
+
+static void virtio_queue_host_notifier_watch_read(EventNotifier *n)
+{
+    VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
+
+    if (event_notifier_test_and_clear(n) && vq->watch) {
+        vq->watch(vq->vdev, vq);
+    }
+}
+
+/*
+ * Attach a notifier handler that only observes: each guest kick calls
+ * @watch, and nothing is popped. For a device that has detached its queue
+ * handlers (during a drain, say) but still wants to see what the guest
+ * publishes while they are gone. @watch is called once straight away, in
+ * @ctx, and has to (re-)arm notifications each time by calling
+ * virtio_queue_set_notification(vq, 1): nothing else enables them, and with
+ * VIRTIO_RING_F_EVENT_IDX the guest stops kicking after the first one
+ * otherwise. Replace it with virtio_queue_aio_attach_host_notifier(), which
+ * kicks the queue so whatever was published meanwhile is processed.
+ */
+void virtio_queue_aio_attach_host_notifier_watch(VirtQueue *vq, AioContext *ctx,
+                                                 VirtQueueWatchFn *watch)
+{
+    vq->watch = watch;
+    aio_set_event_notifier(ctx, &vq->host_notifier,
+                           virtio_queue_host_notifier_watch_read, NULL, NULL);
+
+    /*
+     * Leave the ring alone here. The caller may not be running in @ctx, and
+     * the handler just detached may still be popping there: a
+     * virtio_queue_set_notification() from this thread stores a
+     * shadow_avail_idx that can be older than that handler's
+     * last_avail_idx, and the handler would then pop avail slots the guest
+     * never published. Kick instead, so @watch arms notifications from @ctx
+     * once any such handler has returned.
+     */
+    event_notifier_set(&vq->host_notifier);
 }
 
 void virtio_queue_host_notifier_read(EventNotifier *n)
