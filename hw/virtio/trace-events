@@ -81,6 +81,9 @@ virtqueue_alloc_element(void *elem, size_t sz, unsigned in_num, unsigned out_num
 virtqueue_fill(void *vq, const void *elem, unsigned int len, unsigned int idx) "vq %p elem %p len %u idx %u"
 virtqueue_flush(void *vq, unsigned int count) "vq %p count %u"
 virtqueue_pop(void *vq, void *elem, unsigned int in_num, unsigned int out_num) "vq %p elem %p in_num %u out_num %u"
+virtqueue_chain_error(const char *dev, unsigned int queue, unsigned int pos, unsigned int head, bool head_ok, uint64_t addr, uint32_t len, unsigned int flags) "dev=%s queue=%u pos=%u head=%u head_ok=%d addr=0x%"PRIx64" len=%u flags=0x%x"
+virtqueue_chain_summary(const char *dev, unsigned int queue, bool indirect, unsigned int entries, unsigned int zero_len, int first_zero, bool all_zero, uint64_t hash, uint64_t hdr0, uint64_t hdr1) "dev=%s queue=%u indirect=%d entries=%u zero_len=%u first_zero=%d all_zero=%d hash=0x%"PRIx64" hdr0=0x%"PRIx64" hdr1=0x%"PRIx64
+virtqueue_chain_entry(const char *dev, unsigned int queue, int i, uint64_t addr, uint32_t len, unsigned int flags, unsigned int next) "dev=%s queue=%u i=%d addr=0x%"PRIx64" len=%u flags=0x%x next=%u"
 virtio_queue_notify(void *vdev, int n, void *vq) "vdev %p n %d vq %p"
 virtio_notify_irqfd_deferred_fn(void *vdev, void *vq) "vdev %p vq %p"
 virtio_notify(void *vdev, void *vq) "vdev %p vq %p"

@@ -15,12 +15,14 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-virtio.h"
 #include "trace.h"
+#include "qemu/cutils.h"
 #include "qemu/defer-call.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/target-info.h"
+#include "qemu/units.h"
 #include "qom/object_interfaces.h"
 #include "hw/core/cpu.h"
 #include "hw/virtio/virtio.h"
@@ -156,6 +158,9 @@ struct VirtQueue
     EventNotifier host_notifier;
     bool host_notifier_enabled;
     QLIST_ENTRY(VirtQueue) node;
+
+    /* What the chain looked like when the ring was declared broken */
+    VirtQueueChainPeek *chain_error;
 };
 
 const char *virtio_device_names[] = {
@@ -1734,6 +1739,233 @@ static void *virtqueue_alloc_element(size_t sz, unsigned out_num, unsigned in_nu
     return elem;
 }
 
+/*
+ * How much of an indirect table virtqueue_split_peek() will read. Well past
+ * any real table (a 1024-entry one is 16 KiB), small enough that a garbage
+ * length can't make a diagnostic allocate gigabytes.
+ */
+#define VIRTQUEUE_PEEK_TABLE_MAX (64 * KiB)
+#define FNV1A_64_OFFSET 0xcbf29ce484222325ULL
+#define FNV1A_64_PRIME 0x100000001b3ULL
+
+static uint64_t virtqueue_peek_hash(uint64_t h, const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= FNV1A_64_PRIME;
+    }
+    return h;
+}
+
+static void virtqueue_peek_decode(VirtIODevice *vdev, const uint8_t *raw,
+                                  VirtQueuePeekDesc *d)
+{
+    d->addr = virtio_ldq_p(vdev, raw + offsetof(VRingDesc, addr));
+    d->len = virtio_ldl_p(vdev, raw + offsetof(VRingDesc, len));
+    d->flags = virtio_lduw_p(vdev, raw + offsetof(VRingDesc, flags));
+    d->next = virtio_lduw_p(vdev, raw + offsetof(VRingDesc, next));
+}
+
+static void virtqueue_peek_note(VirtQueueChainPeek *p, uint32_t i,
+                                const VirtQueuePeekDesc *d)
+{
+    if (i < VIRTQUEUE_PEEK_ENTRIES) {
+        p->entry[i] = *d;
+        p->saved = i + 1;
+    }
+    if (d->len == 0) {
+        if (p->first_zero < 0) {
+            p->first_zero = i;
+            p->zero_entry = *d;
+        }
+        p->zero_len++;
+    }
+}
+
+static bool virtqueue_peek_read(VirtIODevice *vdev, hwaddr addr, void *buf,
+                                hwaddr len)
+{
+    return address_space_read(vdev->dma_as, addr, MEMTXATTRS_UNSPECIFIED,
+                              buf, len) == MEMTX_OK;
+}
+
+/*
+ * The range of avail positions the guest has published and the device has
+ * not popped yet: [*first, *end) in free-running 16-bit indices. Reads guest
+ * memory directly and changes no device state, so it is safe from any thread.
+ */
+bool virtqueue_split_pending(VirtQueue *vq, uint16_t *first, uint16_t *end)
+{
+    VirtIODevice *vdev = vq->vdev;
+    uint8_t raw[sizeof(uint16_t)];
+
+    if (!vq->vring.num || !vq->vring.avail ||
+        virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
+        return false;
+    }
+    if (!virtqueue_peek_read(vdev, vq->vring.avail + offsetof(VRingAvail, idx),
+                             raw, sizeof(raw))) {
+        return false;
+    }
+    *first = qatomic_read(&vq->last_avail_idx);
+    *end = virtio_lduw_p(vdev, raw);
+    return true;
+}
+
+/*
+ * Fill @p with what avail position @pos names right now: the head, the head
+ * descriptor, and the indirect table or direct chain behind it. Never calls
+ * virtio_error() and never uses the region caches, so it is safe on the
+ * error path and from threads that don't own the queue. A field it could
+ * not read is left zero with the matching _ok flag false.
+ */
+void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
+{
+    VirtIODevice *vdev = vq->vdev;
+    unsigned int num = vq->vring.num;
+    uint8_t raw[sizeof(VRingDesc)];
+    uint16_t head;
+
+    memset(p, 0, sizeof(*p));
+    p->pos = pos;
+    p->first_zero = -1;
+    p->hash = FNV1A_64_OFFSET;
+
+    if (!num || !vq->vring.avail || !vq->vring.desc ||
+        virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
+        return;
+    }
+    if (!virtqueue_peek_read(vdev, vq->vring.avail +
+                             offsetof(VRingAvail, ring[pos % num]),
+                             raw, sizeof(uint16_t))) {
+        return;
+    }
+    head = virtio_lduw_p(vdev, raw);
+    p->head = head;
+    if (head >= num ||
+        !virtqueue_peek_read(vdev, vq->vring.desc + head * sizeof(VRingDesc),
+                             raw, sizeof(raw))) {
+        return;
+    }
+    virtqueue_peek_decode(vdev, raw, &p->desc);
+    p->head_ok = true;
+
+    if (p->desc.flags & VRING_DESC_F_INDIRECT) {
+        uint32_t len = MIN(p->desc.len, VIRTQUEUE_PEEK_TABLE_MAX);
+        g_autofree uint8_t *table = NULL;
+
+        p->indirect = true;
+        len -= len % sizeof(VRingDesc);
+        if (!len) {
+            return;
+        }
+        table = g_malloc(len);
+        if (!virtqueue_peek_read(vdev, p->desc.addr, table, len)) {
+            return;
+        }
+        p->table_ok = len == p->desc.len;
+        p->entries = len / sizeof(VRingDesc);
+        p->hash = virtqueue_peek_hash(p->hash, table, len);
+        p->all_zero = buffer_is_zero(table, len);
+        for (uint32_t i = 0; i < p->entries; i++) {
+            VirtQueuePeekDesc d;
+
+            virtqueue_peek_decode(vdev, table + i * sizeof(VRingDesc), &d);
+            virtqueue_peek_note(p, i, &d);
+        }
+    } else {
+        VirtQueuePeekDesc d = p->desc;
+        uint32_t i = 0;
+
+        for (;;) {
+            hwaddr next;
+
+            p->hash = virtqueue_peek_hash(p->hash, raw, sizeof(raw));
+            virtqueue_peek_note(p, i++, &d);
+            if (!(d.flags & VRING_DESC_F_NEXT)) {
+                p->table_ok = true;
+                break;
+            }
+            next = vq->vring.desc + d.next * sizeof(VRingDesc);
+            if (d.next >= num || i >= num ||
+                !virtqueue_peek_read(vdev, next, raw, sizeof(raw))) {
+                break;
+            }
+            virtqueue_peek_decode(vdev, raw, &d);
+        }
+        p->entries = i;
+    }
+
+    if (p->saved && p->entry[0].addr) {
+        p->hdr_ok = virtqueue_peek_read(vdev, p->entry[0].addr, p->hdr,
+                                        sizeof(p->hdr));
+    }
+}
+
+/*
+ * The chain at the avail position the device was popping when the ring was
+ * declared broken, as it was at that moment. False if the queue has not
+ * failed that way since its last reset.
+ */
+bool virtqueue_get_chain_error(VirtQueue *vq, VirtQueueChainPeek *p)
+{
+    if (!vq->chain_error) {
+        return false;
+    }
+    *p = *vq->chain_error;
+    return true;
+}
+
+/*
+ * A name for @vdev in diagnostics that matches the command line: the proxy's
+ * id ("scsi0" for -device virtio-scsi-pci,id=scsi0), else the device name.
+ */
+const char *virtio_device_diag_id(VirtIODevice *vdev)
+{
+    BusState *bus = qdev_get_parent_bus(DEVICE(vdev));
+
+    if (bus && bus->parent && bus->parent->id) {
+        return bus->parent->id;
+    }
+    return vdev->name;
+}
+
+/*
+ * virtio_error() says what was wrong but not where, and the guest can change
+ * the memory before anyone looks. Capture the chain now, keep it for the
+ * device (virtqueue_get_chain_error()), and trace it.
+ */
+static void virtqueue_note_chain_error(VirtQueue *vq, uint16_t pos)
+{
+    VirtQueueChainPeek *p;
+    const char *dev = virtio_device_diag_id(vq->vdev);
+    unsigned int queue = vq->queue_index;
+
+    if (!vq->chain_error) {
+        vq->chain_error = g_new(VirtQueueChainPeek, 1);
+    }
+    p = vq->chain_error;
+    virtqueue_split_peek(vq, pos, p);
+
+    trace_virtqueue_chain_error(dev, queue, p->pos, p->head, p->head_ok,
+                                p->desc.addr, p->desc.len, p->desc.flags);
+    trace_virtqueue_chain_summary(dev, queue, p->indirect, p->entries,
+                                  p->zero_len, p->first_zero, p->all_zero,
+                                  p->hash,
+                                  p->hdr_ok ? ldq_le_p(p->hdr) : 0,
+                                  p->hdr_ok ? ldq_le_p(p->hdr + 8) : 0);
+    for (uint32_t i = 0; i < p->saved; i++) {
+        trace_virtqueue_chain_entry(dev, queue, i, p->entry[i].addr,
+                                    p->entry[i].len, p->entry[i].flags,
+                                    p->entry[i].next);
+    }
+    if (p->first_zero >= (int32_t)p->saved) {
+        trace_virtqueue_chain_entry(dev, queue, p->first_zero,
+                                    p->zero_entry.addr, p->zero_entry.len,
+                                    p->zero_entry.flags, p->zero_entry.next);
+    }
+}
+
 static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
 {
     unsigned int i, head, max, idx;
@@ -1748,6 +1980,9 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
     struct iovec QEMU_UNINITIALIZED iov[VIRTQUEUE_MAX_SIZE];
     VRingDesc desc;
     int rc;
+    bool was_broken = vdev->broken;
+    bool have_pos = false;
+    uint16_t pos = 0;
 
     address_space_cache_init_empty(&indirect_desc_cache);
 
@@ -1769,6 +2004,8 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         goto done;
     }
 
+    pos = vq->last_avail_idx;
+    have_pos = true;
     if (!virtqueue_get_head(vq, vq->last_avail_idx++, &head)) {
         goto done;
     }
@@ -1874,6 +2111,9 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
 done:
     address_space_cache_destroy(&indirect_desc_cache);
 
+    if (!elem && have_pos && !was_broken && vdev->broken) {
+        virtqueue_note_chain_error(vq, pos);
+    }
     return elem;
 
 err_undo_map:
@@ -2351,6 +2591,7 @@ static void __virtio_queue_reset(VirtIODevice *vdev, uint32_t i)
     vdev->vq[i].notification = true;
     vdev->vq[i].vring.num = vdev->vq[i].vring.num_default;
     vdev->vq[i].inuse = 0;
+    g_clear_pointer(&vdev->vq[i].chain_error, g_free);
     virtio_virtqueue_reset_region_cache(&vdev->vq[i]);
 }
 
@@ -2604,6 +2845,7 @@ void virtio_delete_queue(VirtQueue *vq)
     vq->handle_output = NULL;
     g_free(vq->used_elems);
     vq->used_elems = NULL;
+    g_clear_pointer(&vq->chain_error, g_free);
     virtio_virtqueue_reset_region_cache(vq);
 }
 

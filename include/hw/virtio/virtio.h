@@ -322,6 +322,47 @@ void virtqueue_fill(VirtQueue *vq, const VirtQueueElement *elem,
 
 void virtqueue_map(VirtIODevice *vdev, VirtQueueElement *elem);
 void *virtqueue_pop(VirtQueue *vq, size_t sz);
+
+/*
+ * Read-only view of one avail-ring entry and the descriptor chain it names,
+ * taken straight from guest memory. Split rings only. Meant for diagnosing
+ * a ring the device has given up on: comparing what an entry held when the
+ * guest published it with what it held when the device read it says whether
+ * the guest changed a buffer it no longer owned.
+ */
+#define VIRTQUEUE_PEEK_ENTRIES 8
+#define VIRTQUEUE_PEEK_HDR_SIZE 16
+
+typedef struct VirtQueuePeekDesc {
+    uint64_t addr;
+    uint32_t len;
+    uint16_t flags;
+    uint16_t next;
+} VirtQueuePeekDesc;
+
+typedef struct VirtQueueChainPeek {
+    uint16_t pos;           /* avail ring position (free-running index) */
+    uint16_t head;          /* descriptor index the avail entry names */
+    bool head_ok;           /* head < queue size and the descriptor was read */
+    VirtQueuePeekDesc desc; /* the head descriptor */
+    bool indirect;
+    bool table_ok;          /* the indirect table / chain was read in full */
+    uint32_t entries;       /* table entries, or chain length if direct */
+    uint32_t zero_len;      /* entries with len == 0 */
+    int32_t first_zero;     /* index of the first such entry, -1 if none */
+    bool all_zero;          /* every byte of the indirect table is zero */
+    uint64_t hash;          /* FNV-1a over the raw table / chain bytes */
+    uint32_t saved;         /* how many of entry[] are valid */
+    VirtQueuePeekDesc entry[VIRTQUEUE_PEEK_ENTRIES];
+    VirtQueuePeekDesc zero_entry; /* entry first_zero, if any */
+    bool hdr_ok;            /* hdr[] holds the start of the first buffer */
+    uint8_t hdr[VIRTQUEUE_PEEK_HDR_SIZE];
+} VirtQueueChainPeek;
+
+bool virtqueue_split_pending(VirtQueue *vq, uint16_t *first, uint16_t *end);
+void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p);
+bool virtqueue_get_chain_error(VirtQueue *vq, VirtQueueChainPeek *p);
+const char *virtio_device_diag_id(VirtIODevice *vdev);
 unsigned int virtqueue_drop_all(VirtQueue *vq);
 void *qemu_get_virtqueue_element(VirtIODevice *vdev, QEMUFile *f, size_t sz);
 void qemu_put_virtqueue_element(VirtIODevice *vdev, QEMUFile *f,
