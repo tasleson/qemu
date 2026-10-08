@@ -110,6 +110,10 @@ DUMP_TIMEOUT_S = 900
 DUMP_START_TIMEOUT_S = 300
 DUMP_POLL_INTERVAL_S = 2
 STACK_CAPTURE_TIMEOUT_S = 120
+# x-stop-on-broken asks for the stop right after virtio_error() prints, but
+# the main loop carries it out a moment later, so a poll that has just read
+# the message can still find the VM running. Give it this long to pause.
+STOP_ON_BROKEN_SETTLE_S = 2.0
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15
 STATIC_SCREEN_THRESHOLD_S = 20
@@ -1290,13 +1294,18 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         there), so holds stop for the rest of the run."""
         if not stop_on_broken or "break_dump" in result:
             return False
-        try:
-            status = qmp_call(qmp, "query-status")
-        except Exception as exc:
-            print(f"    query-status failed: {exc!r}", file=sys.stderr)
-            return False
-        if status.get("status") != "paused":
-            return False
+        settle_deadline = time.monotonic() + STOP_ON_BROKEN_SETTLE_S
+        while True:
+            try:
+                status = qmp_call(qmp, "query-status")
+            except Exception as exc:
+                print(f"    query-status failed: {exc!r}", file=sys.stderr)
+                return False
+            if status.get("status") == "paused":
+                break
+            if time.monotonic() >= settle_deadline:
+                return False
+            time.sleep(0.1)
         print(f"    VM paused at the ring break (x-stop-on-broken); dumping "
               f"guest memory to {break_dump_path}", file=sys.stderr)
         write_status({"elapsed_s": time.monotonic() - start})
