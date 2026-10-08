@@ -429,6 +429,59 @@ static void test_zero_length_pending_at_tmf(void *obj, void *data,
 }
 
 /*
+ * An indirect table address that isn't RAM (here, unassigned space between
+ * the end of the small qtest RAM and the PCI BARs). The diagnostics peek at
+ * it both when the TMF snapshots the pending entry and when it breaks the
+ * queue; they must decline the read rather than dispatch to whatever is
+ * there, and the device must still go to NEEDS_RESET and recover.
+ */
+#define VIRTIO_SCSI_TEST_NON_RAM_ADDR 0x40000000ULL
+
+static void test_unreadable_chain_pending_at_tmf(void *obj, void *data,
+                                                 QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QTestState *qts = global_qtest;
+    QVirtioSCSIQueues *vs;
+    QVirtQueue *vq;
+    uint32_t head;
+    gint64 start;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+    vq = vs->vq[2];
+    if (!vq->indirect ||
+        !(vs->dev->features & (1ull << VIRTIO_F_VERSION_1)) ||
+        strcmp(qtest_get_arch(), "x86_64")) {
+        g_test_skip("needs x86_64, indirect descriptors and VERSION_1");
+        qvirtio_scsi_pci_free(vs);
+        return;
+    }
+
+    /* An indirect head whose table lives at a non-RAM address */
+    head = vq->free_head++;
+    vq->num_free--;
+    qtest_writeq(qts, vq->desc + 16 * head, VIRTIO_SCSI_TEST_NON_RAM_ADDR);
+    qtest_writel(qts, vq->desc + 16 * head + 8,
+                 2 * sizeof(struct vring_desc));
+    qtest_writew(qts, vq->desc + 16 * head + 12, VRING_DESC_F_INDIRECT);
+
+    qvirtqueue_publish(qts, vs->dev, vq, head);
+    virtio_scsi_lun_reset(vs);
+    vs->dev->bus->virtqueue_kick(vs->dev, vq);
+
+    start = g_get_monotonic_time();
+    while (!(vs->dev->bus->get_status(vs->dev) &
+             VIRTIO_CONFIG_S_NEEDS_RESET)) {
+        g_assert(g_get_monotonic_time() - start <= QVIRTIO_SCSI_TIMEOUT_US);
+    }
+    g_assert_false(qvirtqueue_get_buf(qts, vq, NULL, NULL));
+
+    qvirtio_reset(scsi->vdev);
+    qvirtio_scsi_pci_free(vs);
+}
+
+/*
  * Two requests in flight at once that share a command header -- what a
  * driver reissuing a request the device still holds looks like. The device
  * reports the overlap but still processes both.
@@ -546,6 +599,8 @@ static void register_virtio_scsi_test(void)
 
     qos_add_test("zero-length-pending-at-tmf", "virtio-scsi",
                  test_zero_length_pending_at_tmf, &opts);
+    qos_add_test("unreadable-chain-pending-at-tmf", "virtio-scsi",
+                 test_unreadable_chain_pending_at_tmf, &opts);
     qos_add_test("shared-header-overlap", "virtio-scsi",
                  test_shared_header_overlap, &opts);
 
