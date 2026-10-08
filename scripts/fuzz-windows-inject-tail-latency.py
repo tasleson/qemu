@@ -653,7 +653,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      cpus: str, taskset_cores: Optional[str], probability: float,
                      delay_ms: int, delay_max_ms: int, ops: list,
                      iothreads: Optional[int] = None,
-                     tmf_trace: bool = True) -> list:
+                     tmf_trace: bool = True,
+                     stop_on_broken: bool = True) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -711,6 +712,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         props = f"virtio-scsi-pci,id=scsi{a}"
         if n_iothreads:
             props += f",iothread=iothread{a % n_iothreads}"
+        if stop_on_broken:
+            props += ",x-stop-on-broken=on"
         argv += ["-device", props]
 
     for spec in lun_specs:
@@ -887,9 +890,65 @@ VIRTIO_BROKEN_PATTERNS = tuple(re.compile(p) for p in (
 # "-msg timestamp=on" the same clock, as virtio_error()'s messages -- so
 # qemu.log reads as one ordered timeline of what each adapter was asked
 # to do right up to the moment it broke.
+#
+# The rest explain a break when one happens, and are quiet otherwise: TMF
+# and drain snapshots (a line or two per reset), the chain the device
+# failed on and what it looked like when published (only at a break), and
+# requests popped while the device still held one with the same command
+# header or head (capped at 256 lines per adapter; the count keeps going in
+# the snapshot and verdict lines). virtqueue_chain_* comes from the virtio
+# core and names the adapter by proxy id (dev=scsi0) rather than bus.
 TMF_TRACE_EVENTS = ("virtio_scsi_tmf_*", "virtio_scsi_reset",
-                    "virtio_scsi_broken")
-TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?virtio_scsi_(\w+) ")
+                    "virtio_scsi_broken", "virtio_scsi_broken_*",
+                    "virtio_scsi_drain_*", "virtio_scsi_req_overlap",
+                    "virtio_scsi_stop_on_broken", "virtqueue_chain_*")
+TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?(virtio_scsi|virtqueue_chain)_(\w+) ")
+# Diagnostic lines: attached to the broken event they explain, or tallied
+# separately, rather than counted with the TMFs or kept as TMF context.
+DIAG_EVENTS = ("broken_verdict", "broken_before", "broken_before_detail",
+               "broken_before_entry", "req_overlap", "tmf_snapshot",
+               "drain_begin", "drain_snapshot", "stop_on_broken")
+
+# What virtio_scsi_broken_verdict says happened to the request the ring
+# broke on, comparing its first sighting while pending (at a TMF or during a
+# drain) with what the device read. See virtio_scsi_diag_broken() in
+# hw/scsi/virtio-scsi.c.
+VERDICT_MEANINGS = {
+    "zeroed": "valid when published, all zeros when the device read it: the "
+              "guest rewrote a request it had already handed over (the "
+              "signature of an early-completed SRB whose extension, and so "
+              "its indirect table, BuildIo zeroed)",
+    "rewritten": "valid when published, different when the device read it: "
+                 "the guest reused the request's memory while it was still "
+                 "queued (check the entries for another request's shape, or "
+                 "for garbage, which would mean a stray write)",
+    "head-changed": "the avail slot named a different descriptor when read "
+                    "than when published: guest ring bookkeeping",
+    "no-snapshot": "never seen pending, so there is nothing to compare: "
+                   "published and consumed outside any TMF or drain",
+    "no-chain": "broke on something other than a descriptor chain (e.g. "
+                "request headers of the wrong size)",
+    "not-request": "broke on the control or event queue, not a request queue",
+}
+
+
+def explain_break(ev: dict) -> str:
+    verdict = ev.get("verdict")
+    if verdict is None:
+        return "no verdict traced (QEMU without the diagnostics?)"
+    if verdict == "unchanged":
+        zero = int(ev.get("before", {}).get("zero_len", 0))
+        meaning = ("failed exactly as the guest published it -- "
+                   + (f"{zero} zero-length element(s) already present: the "
+                      "driver built the request that way"
+                      if zero else
+                      "and nothing zero-length in it: look at QEMU"))
+    else:
+        meaning = VERDICT_MEANINGS.get(verdict, "unknown verdict")
+    if ev.get("verdict_detail", {}).get("head_inflight") == "1":
+        meaning += ("; the failing head was also still in flight in QEMU, "
+                    "so the guest re-published a descriptor it never got back")
+    return meaning
 TRACE_FIELD_RE = re.compile(r"(\w+)=(\S+)")
 TRACE_CONTEXT_LINES = 20  # per-adapter history attached to a broken event
 
@@ -926,8 +985,10 @@ class QemuStderr:
         self.lines: list = []
         self.trace_counts: dict = {}
         self.broken_events: list = []
+        self.overlaps: dict = {}
         self._recent: dict = {}
         self._pending_broken: list = []
+        self._chain: dict = {}
 
     def poll(self) -> None:
         try:
@@ -943,7 +1004,10 @@ class QemuStderr:
                 continue
             m = TRACE_LINE_RE.match(line)
             if m:
-                self._trace(m.group(2), line)
+                if m.group(2) == "virtqueue_chain":
+                    self._chain_line(m.group(3), line)
+                else:
+                    self._trace(m.group(3), line)
                 continue
             self.lines.append(line)
             if any(pat.search(line) for pat in VIRTIO_BROKEN_PATTERNS):
@@ -973,9 +1037,52 @@ class QemuStderr:
         return sum(n for per_bus in self.trace_counts.values()
                    for k, n in per_bus.items() if k.startswith("tmf_req"))
 
+    def _chain_line(self, event: str, line: str) -> None:
+        """The virtio core's dump of the chain a ring broke on. It comes
+        just before that adapter's virtio_scsi_broken line, which picks it
+        up."""
+        fields = dict(TRACE_FIELD_RE.findall(line))
+        bus = fields.get("dev", "?") + ".0"
+        if event == "error":
+            self._chain[bus] = {**fields, "descs": []}
+            return
+        chain = self._chain.setdefault(bus, {"descs": []})
+        if event == "summary":
+            chain.update(fields)
+        elif event == "entry":
+            chain["descs"].append(fields)
+
+    def _last_broken(self, bus: str) -> Optional[dict]:
+        return next((ev for ev in reversed(self.broken_events)
+                     if ev["bus"] == bus), None)
+
+    def _diag(self, event: str, bus: str, fields: dict) -> None:
+        if "overlaps" in fields or event == "req_overlap":
+            n = int(fields.get("count", fields.get("overlaps", 0)))
+            self.overlaps[bus] = max(self.overlaps.get(bus, 0), n)
+        ev = self._last_broken(bus)
+        if ev is None:
+            return
+        if event == "broken_before":
+            ev["before"] = {**fields, "descs": []}
+        elif event == "broken_before_detail":
+            ev.setdefault("before", {"descs": []}).update(fields)
+        elif event == "broken_before_entry":
+            ev.setdefault("before", {"descs": []})["descs"].append(fields)
+        elif event == "broken_verdict":
+            ev["verdict"] = fields.get("verdict")
+            ev["verdict_detail"] = fields
+        elif event == "stop_on_broken":
+            ev["stopped_vm"] = True
+        if "verdict" in ev:
+            ev["mechanism"] = explain_break(ev)
+
     def _trace(self, event: str, line: str) -> None:
         fields = dict(TRACE_FIELD_RE.findall(line))
         bus = fields.get("bus", "?")
+        if event in DIAG_EVENTS:
+            self._diag(event, bus, fields)
+            return
         key = event
         if event == "tmf_req":
             key += ":" + TMF_SUBTYPES.get(int(fields.get("subtype", -1)),
@@ -996,6 +1103,7 @@ class QemuStderr:
                 "queue_kind": VIRTIO_SCSI_QUEUE_KINDS.get(queue, "request"),
                 "line": line,
                 "preceding": list(recent),
+                "chain": self._chain.pop(bus, None),
             })
         recent.append(line)
 
@@ -1127,7 +1235,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              seed: int, heartbeat_s: float, vioscsi_telemetry_script: str,
              disk_dir: Optional[Path] = None,
              iothreads: Optional[int] = None,
-             tmf_trace: bool = True) -> dict:
+             tmf_trace: bool = True,
+             stop_on_broken: bool = True) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1145,6 +1254,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     vioscsi_telemetry_log = run_dir / "vioscsi-telemetry.log"
     screenshot = run_dir / "screen.ppm"
     dump_path = run_dir / "crash.dmp"
+    break_dump_path = run_dir / "break.dmp"
     qemu_log_path = run_dir / "qemu.log"
 
     qmp = None
@@ -1169,10 +1279,45 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["qemu_stderr"] = qemu_stderr.lines
         result["tmf_trace"] = qemu_stderr.trace_counts
         result["broken_events"] = qemu_stderr.broken_events
+        result["req_overlaps"] = qemu_stderr.overlaps
+
+    def dump_if_stopped_on_broken() -> bool:
+        """If x-stop-on-broken paused the VM at a ring break, dump guest
+        memory while the failing request is still where the driver left
+        it, then resume. True if it did.
+
+        Note try_dump_guest_memory removes the delay rules first (see
+        there), so holds stop for the rest of the run."""
+        if not stop_on_broken or "break_dump" in result:
+            return False
+        try:
+            status = qmp_call(qmp, "query-status")
+        except Exception as exc:
+            print(f"    query-status failed: {exc!r}", file=sys.stderr)
+            return False
+        if status.get("status") != "paused":
+            return False
+        print(f"    VM paused at the ring break (x-stop-on-broken); dumping "
+              f"guest memory to {break_dump_path}", file=sys.stderr)
+        write_status({"elapsed_s": time.monotonic() - start})
+        result["break_dump"] = try_dump_guest_memory(
+            qmp, break_dump_path, proc.pid, err_nodes)
+        result["break_dump_path"] = str(break_dump_path)
+        result["delay_rules_removed"] = True
+        try:
+            qmp_call(qmp, "cont")
+        except Exception as exc:
+            result["break_resume_error"] = repr(exc)
+            print(f"    cont after the break dump failed: {exc!r}",
+                  file=sys.stderr)
+        write_status({"elapsed_s": time.monotonic() - start})
+        return True
 
     def capture_postmortem() -> None:
         result["telemetry_failure_screenshot"] = (
             screendump_hash(qmp, screenshot) is not None)
+        if result.get("break_dump"):
+            return  # the one taken at the break is the one that matters
         result["telemetry_failure_dump"] = try_dump_guest_memory(
             qmp, dump_path, proc.pid, err_nodes)
 
@@ -1233,7 +1378,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         argv = build_qemu_argv(boot_overlay, vars_overlay, qmp_sock, qga_sock,
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
-                                delay_max_ms, ops, iothreads, tmf_trace)
+                                delay_max_ms, ops, iothreads, tmf_trace,
+                                stop_on_broken)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -1242,6 +1388,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "seed": seed,
                 "iothreads": adapters if iothreads is None else iothreads,
                 "tmf_trace": tmf_trace,
+                "stop_on_broken": stop_on_broken,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1333,6 +1480,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         err_nodes = [s.err_node for s in lun_specs]
         total_wps = 0.0
         wps_per_lun: dict = {}
+        broke_in_preflight = False
         for attempt in range(IO_PROBE_ATTEMPTS):
             w_before = write_ops_by_node(qmp)
             time.sleep(io_probe_window_s)
@@ -1342,13 +1490,18 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             total_wps = sum(wps_per_lun.values())
             if total_wps >= MIN_WRITE_OPS_PER_S:
                 break
+            # A ring that broke during the probe has paused the VM, which
+            # is why there was no I/O. The soak loop reports the break.
+            if dump_if_stopped_on_broken():
+                broke_in_preflight = True
+                break
             if attempt + 1 < IO_PROBE_ATTEMPTS:
                 print(f"    no write I/O seen yet (attempt {attempt + 1}/"
                       f"{IO_PROBE_ATTEMPTS}), retrying...", file=sys.stderr)
         result["writer_states"] = writer_states(qga_sock, writer_pids)
         result["pre_test_write_ops_per_s"] = wps_per_lun
         result["pre_test_write_ops_per_s_total"] = round(total_wps, 1)
-        if total_wps < MIN_WRITE_OPS_PER_S:
+        if total_wps < MIN_WRITE_OPS_PER_S and not broke_in_preflight:
             result["outcome"] = "no-io"
             result["elapsed_s"] = time.monotonic() - start
             diag = ""
@@ -1414,6 +1567,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 result["qemu_stderr"] = qemu_stderr.lines
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
                 result["held_now"] = held_counts(qmp, err_nodes)
+                # Before anything that needs the guest: it may be paused.
+                dump_if_stopped_on_broken()
                 # Sampled here rather than left to the heartbeat: breakage
                 # often lands before the first one is due, and then the
                 # result says nothing about whether the guest was still
@@ -1455,6 +1610,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                           f"({ev['queue_kind']}); last TMF on that adapter: "
                           f"{last_tmf or 'none in the last ' + str(TRACE_CONTEXT_LINES) + ' events'}",
                           file=sys.stderr)
+                    verdict = ev.get("verdict", "none")
+                    print(f"    {ev['bus']} verdict: {verdict} -- "
+                          f"{ev.get('mechanism') or explain_break(ev)}",
+                          file=sys.stderr)
+                if result["req_overlaps"]:
+                    print(f"    requests popped while the device still held "
+                          f"one with the same header or head: "
+                          f"{result['req_overlaps']}", file=sys.stderr)
                 write_status({"elapsed_s": elapsed})
 
                 collect_vioscsi_telemetry()
@@ -1612,6 +1775,13 @@ def main() -> int:
                           "rings per adapter into qemu.log, and attach each "
                           "adapter's recent TMFs to the result when it "
                           "breaks (default: on)")
+    ap.add_argument("--stop-on-broken", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="pause the VM the moment a virtio-scsi ring breaks "
+                          "(x-stop-on-broken), dump guest memory to break.dmp "
+                          "while the failing request is still where the "
+                          "driver left it, then resume. The dump removes the "
+                          "delay rules (default: on)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -1746,7 +1916,8 @@ def main() -> int:
                        args.probability, args.delay_ms, args.delay_max_ms, ops,
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
-                       args.disk_dir, args.iothreads, args.tmf_trace)
+                       args.disk_dir, args.iothreads, args.tmf_trace,
+                       args.stop_on_broken)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
