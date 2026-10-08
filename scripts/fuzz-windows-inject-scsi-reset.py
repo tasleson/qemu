@@ -95,6 +95,7 @@ import hashlib
 import itertools
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -218,39 +219,77 @@ Environment overrides for running on different machines:
 # ------------------------------------------------------------------
 
 
+# A guest-sync-delimited reply, and the request that resets the agent's
+# parser, are both preceded by this byte; it never occurs in JSON text.
+# The agent answers the request-side byte with a parse error of its own,
+# which the sync skips like any other reply that isn't its echo.
+QGA_SENTINEL = b"\xff"
+
+
+def _qga_request(execute: str, arguments: Optional[dict] = None) -> bytes:
+    msg: dict = {"execute": execute}
+    if arguments is not None:
+        msg["arguments"] = arguments
+    return (json.dumps(msg) + "\n").encode()
+
+
+def _qga_replies(s: socket.socket, deadline: float):
+    """Yield each reply the agent sends on the socket until the deadline."""
+    buf = b""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        s.settimeout(remaining)
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            return
+        if not chunk:
+            return
+        # The sentinel only marks where a reply starts, so treating it as
+        # a line break also throws away any half-written stale reply.
+        buf += chunk.replace(QGA_SENTINEL, b"\n")
+        *lines, buf = buf.split(b"\n")
+        for line in lines:
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(resp, dict) and ("return" in resp or "error" in resp):
+                yield resp
+
+
 def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
              timeout: float = 5.0) -> Optional[dict]:
+    """Run one guest agent command and return its reply, or None.
+
+    The agent's virtio-serial channel outlives our connection: a reply to
+    a request whose client gave up -- timed out, or asked while the VM was
+    paused -- is still delivered, to whoever connects next, and would be
+    taken for the answer to the next command. So first synchronize with
+    guest-sync-delimited, as the agent's protocol asks, and drop
+    everything up to the echo of our own token. The agent answers in
+    order, so the next reply after that is ours.
+    """
+    deadline = time.monotonic() + timeout
+    token = random.getrandbits(63)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(str(sock_path))
-            msg: dict = {"execute": execute}
-            if arguments is not None:
-                msg["arguments"] = arguments
-            s.sendall((json.dumps(msg) + "\n").encode())
-            buf = b""
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                try:
-                    chunk = s.recv(65536)
-                except socket.timeout:
+            replies = _qga_replies(s, deadline)
+            s.sendall(QGA_SENTINEL +
+                      _qga_request("guest-sync-delimited", {"id": token}))
+            for resp in replies:
+                if resp.get("return") == token:
                     break
-                if not chunk:
-                    break
-                buf += chunk
-                for line in buf.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        resp = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(resp, dict) and ("return" in resp or "error" in resp):
-                        return resp
+            else:
+                return None
+            s.sendall(_qga_request(execute, arguments))
+            return next(replies, None)
     except (OSError, ConnectionError):
         return None
-    return None
 
 
 def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
