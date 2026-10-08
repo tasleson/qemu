@@ -145,6 +145,8 @@ uint32_t qvirtqueue_add_indirect(QTestState *qts, QVirtQueue *vq,
                                  QVRingIndirectDesc *indirect);
 void qvirtqueue_set_avail_idx(QTestState *qts, QVirtioDevice *d,
                               QVirtQueue *vq, uint16_t idx);
+uint16_t qvirtqueue_publish(QTestState *qts, QVirtioDevice *d, QVirtQueue *vq,
+                            uint32_t free_head);
 void qvirtqueue_kick(QTestState *qts, QVirtioDevice *d, QVirtQueue *vq,
                      uint32_t free_head);
 bool qvirtqueue_get_buf(QTestState *qts, QVirtQueue *vq, uint32_t *desc_idx,
