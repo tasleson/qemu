@@ -658,7 +658,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      delay_ms: int, delay_max_ms: int, ops: list,
                      iothreads: Optional[int] = None,
                      tmf_trace: bool = True,
-                     stop_on_broken: bool = True) -> list:
+                     stop_on_broken: bool = True,
+                     ring_diag: bool = True) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -718,6 +719,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
             props += f",iothread=iothread{a % n_iothreads}"
         if stop_on_broken:
             props += ",x-stop-on-broken=on"
+        if not ring_diag:
+            props += ",x-diag=off"
         argv += ["-device", props]
 
     for spec in lun_specs:
@@ -918,35 +921,65 @@ DIAG_EVENTS = ("broken_verdict", "broken_before", "broken_before_detail",
 # drain) with what the device read. See virtio_scsi_diag_broken() in
 # hw/scsi/virtio-scsi.c.
 VERDICT_MEANINGS = {
-    "zeroed": "valid when published, all zeros when the device read it: the "
+    "zeroed": "valid while pending, all zeros when the device read it: the "
               "guest rewrote a request it had already handed over (the "
               "signature of an early-completed SRB whose extension, and so "
               "its indirect table, BuildIo zeroed)",
-    "rewritten": "valid when published, different when the device read it: "
+    "rewritten": "valid while pending, different when the device read it: "
                  "the guest reused the request's memory while it was still "
                  "queued (check the entries for another request's shape, or "
                  "for garbage, which would mean a stray write)",
     "head-changed": "the avail slot named a different descriptor when read "
-                    "than when published: guest ring bookkeeping",
+                    "than while pending: guest ring bookkeeping",
     "no-snapshot": "never seen pending, so there is nothing to compare: "
                    "published and consumed outside any TMF or drain",
     "no-chain": "broke on something other than a descriptor chain (e.g. "
                 "request headers of the wrong size)",
     "not-request": "broke on the control or event queue, not a request queue",
+    "unreadable": "part of the chain points at memory that isn't RAM (MMIO "
+                  "or unmapped), so there was nothing to read or compare: a "
+                  "garbage descriptor address -- see addr in the chain record",
+    "diag-off": "run with --no-ring-diag, so nothing was recorded to compare; "
+                "the chain record still shows what the device failed on",
 }
+
+# Where the "before" picture of the failing entry was taken. Only a kick
+# seen during a drain is (to within microseconds) the moment the guest
+# published it; the other two are taken at the reset, and the entry may have
+# been published -- and changed -- any time before that.
+FIRST_SIGHT = {
+    "kick": "as the guest published it (a kick during the reset's drain)",
+    "drain": "only when the reset's drain began",
+    "tmf": "only when the TMF arrived",
+}
+
+
+def first_sight(before: dict) -> str:
+    where = FIRST_SIGHT.get(before.get("source"), "at an unknown point")
+    age_ms = int(before.get("age_us", 0)) / 1000
+    return f"first seen {where}, {age_ms:.1f} ms before the device read it"
 
 
 def explain_break(ev: dict) -> str:
     verdict = ev.get("verdict")
     if verdict is None:
         return "no verdict traced (QEMU without the diagnostics?)"
+    before = ev.get("before", {})
     if verdict == "unchanged":
-        zero = int(ev.get("before", {}).get("zero_len", 0))
-        meaning = ("failed exactly as the guest published it -- "
-                   + (f"{zero} zero-length element(s) already present: the "
-                      "driver built the request that way"
-                      if zero else
-                      "and nothing zero-length in it: look at QEMU"))
+        zero = int(before.get("zero_len", 0))
+        if not zero:
+            meaning = ("failed exactly as first seen, with nothing "
+                       "zero-length in it: look at QEMU")
+        elif before.get("source") == "kick":
+            meaning = (f"failed exactly as the guest published it, with {zero} "
+                       "zero-length element(s) already in it: the driver "
+                       "built the request that way")
+        else:
+            meaning = (f"failed exactly as first seen, with {zero} "
+                       "zero-length element(s) already in it -- but it was "
+                       "first seen at the reset, not as published, so it "
+                       "could have been published intact and changed before "
+                       "then; this does not rule out a rewrite")
     else:
         meaning = VERDICT_MEANINGS.get(verdict, "unknown verdict")
     if ev.get("verdict_detail", {}).get("head_inflight") == "1":
@@ -1240,7 +1273,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              disk_dir: Optional[Path] = None,
              iothreads: Optional[int] = None,
              tmf_trace: bool = True,
-             stop_on_broken: bool = True) -> dict:
+             stop_on_broken: bool = True,
+             ring_diag: bool = True) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1388,7 +1422,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
                                 delay_max_ms, ops, iothreads, tmf_trace,
-                                stop_on_broken)
+                                stop_on_broken, ring_diag)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -1398,6 +1432,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "iothreads": adapters if iothreads is None else iothreads,
                 "tmf_trace": tmf_trace,
                 "stop_on_broken": stop_on_broken,
+                "ring_diag": ring_diag,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1620,7 +1655,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                           f"{last_tmf or 'none in the last ' + str(TRACE_CONTEXT_LINES) + ' events'}",
                           file=sys.stderr)
                     verdict = ev.get("verdict", "none")
-                    print(f"    {ev['bus']} verdict: {verdict} -- "
+                    seen = (f" ({first_sight(ev['before'])})"
+                            if "before" in ev else "")
+                    print(f"    {ev['bus']} verdict: {verdict}{seen} -- "
                           f"{ev.get('mechanism') or explain_break(ev)}",
                           file=sys.stderr)
                 if result["req_overlaps"]:
@@ -1791,6 +1828,15 @@ def main() -> int:
                           "while the failing request is still where the "
                           "driver left it, then resume. The dump removes the "
                           "delay rules (default: on)")
+    ap.add_argument("--ring-diag", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="virtio-scsi's healthy-path break diagnostics: "
+                          "per-request overlap tracking, TMF and drain "
+                          "snapshots, and the drain watch, which changes "
+                          "when the guest kicks during a reset. "
+                          "--no-ring-diag (x-diag=off) leaves only the "
+                          "chain captured at a break, to A/B their effect "
+                          "on timing (default: on)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -1926,7 +1972,7 @@ def main() -> int:
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
                        args.disk_dir, args.iothreads, args.tmf_trace,
-                       args.stop_on_broken)
+                       args.stop_on_broken, args.ring_diag)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
