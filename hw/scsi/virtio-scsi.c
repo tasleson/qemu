@@ -173,6 +173,7 @@ static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
  *   rewritten     the chain changed some other way
  *   unreadable    part of the chain points at memory that isn't RAM (see
  *                 virtqueue_split_peek()), so there is nothing to compare
+ *   diag-off      x-diag=off: none of this was collected
  *
  * Independently, every request popped is checked against those still in
  * flight on the adapter: one with the same command header address or the
@@ -302,6 +303,9 @@ static void virtio_scsi_diag_tmf(VirtIOSCSI *s)
     uint32_t seq;
     uint64_t overlaps;
 
+    if (!s->diag) {
+        return;
+    }
     WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
         seq = ++s->tmf_seq;
         added = virtio_scsi_diag_snapshot_all(s, "tmf", &pending);
@@ -347,6 +351,10 @@ static void virtio_scsi_diag_track(VirtIOSCSIReq *req)
     VirtIOSCSIReq *old_buf = NULL, *old_head = NULL;
     uint64_t count = 0;
     bool trace_it = false;
+
+    if (!s->diag) {
+        return;
+    }
 
     req->diag_buf = req->elem.out_num ? req->elem.out_addr[0] : 0;
     req->diag_head = queue << 16 | req->elem.index;
@@ -477,6 +485,13 @@ static void virtio_scsi_diag_broken(VirtIOSCSI *s, VirtQueue *vq)
         qemu_system_vmstop_request_prepare();
         qemu_system_vmstop_request(RUN_STATE_PAUSED);
         trace_virtio_scsi_stop_on_broken(bus, queue);
+    }
+
+    if (!s->diag) {
+        /* The core's virtqueue_chain_* trace still says what failed */
+        trace_virtio_scsi_broken_verdict(bus, queue, 0, "diag-off", false,
+                                         0, 0);
+        return;
     }
 
     have_chain = virtqueue_get_chain_error(vq, &now);
@@ -1722,6 +1737,9 @@ static void virtio_scsi_drained_begin(SCSIBus *bus)
      * guest publishes meanwhile sits there. Record it as it arrives; see
      * virtio_scsi_diag_broken().
      */
+    if (!s->diag) {
+        return;
+    }
     WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
         unsigned pending = 0;
 
@@ -1757,9 +1775,12 @@ static void virtio_scsi_drained_end(SCSIBus *bus)
         return;
     }
 
-    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
-        trace_virtio_scsi_drain_snapshot(virtio_scsi_bus_name(s), s->tmf_seq,
-                                         s->drain_kicks, s->drain_new);
+    if (s->diag) {
+        WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+            trace_virtio_scsi_drain_snapshot(virtio_scsi_bus_name(s),
+                                             s->tmf_seq, s->drain_kicks,
+                                             s->drain_new);
+        }
     }
 
     /* This replaces the diagnostic watch drained_begin attached */
@@ -1922,6 +1943,7 @@ static const Property virtio_scsi_properties[] = {
     DEFINE_PROP_UINT32("x-tmf-delay-ms", VirtIOSCSI, tmf_delay_ms, 0),
     DEFINE_PROP_UINT32("x-tmf-delay-count", VirtIOSCSI, tmf_delay_count, 0),
     DEFINE_PROP_BOOL("x-stop-on-broken", VirtIOSCSI, stop_on_broken, false),
+    DEFINE_PROP_BOOL("x-diag", VirtIOSCSI, diag, true),
 };
 
 static const VMStateDescription vmstate_virtio_scsi = {
