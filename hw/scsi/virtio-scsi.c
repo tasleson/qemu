@@ -181,6 +181,7 @@ static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
 
 typedef struct VirtIOSCSISnapshot {
     bool valid;
+    uint64_t ext_pos;       /* peek.pos extended, see diag_extend() */
     const char *source;     /* "tmf", "drain" or "kick" */
     uint32_t tmf_seq;
     int64_t time_us;
@@ -190,6 +191,8 @@ typedef struct VirtIOSCSISnapshot {
 typedef struct VirtIOSCSIDiagQueue {
     uint32_t num;
     VirtIOSCSISnapshot *snap;   /* num entries, indexed by pos % num */
+    bool popped_valid;
+    uint64_t popped;            /* last_avail_idx, extended to 64 bits */
 } VirtIOSCSIDiagQueue;
 
 static bool virtio_scsi_stopped_on_broken;
@@ -198,6 +201,26 @@ static uint64_t virtio_scsi_peek_tag(const VirtQueueChainPeek *p)
 {
     /* struct virtio_scsi_cmd_req starts with lun[8], then the tag */
     return p->hdr_ok ? ldq_le_p(p->hdr + 8) : 0;
+}
+
+/*
+ * Avail positions are 16 bits and wrap every 65536 pops, so on its own a
+ * snapshot of position P from a lap ago looks just like one from this lap,
+ * and would be compared with an unrelated request. Keep last_avail_idx
+ * extended to 64 bits -- sampled on every request popped and at every
+ * snapshot pass, far more often than once a lap -- and stamp snapshots with
+ * the extended position. A signed delta tolerates the index stepping back.
+ * Called with diag_lock held.
+ */
+static uint64_t virtio_scsi_diag_extend(VirtIOSCSIDiagQueue *dq, uint16_t last)
+{
+    if (!dq->popped_valid) {
+        dq->popped = last;
+        dq->popped_valid = true;
+    } else {
+        dq->popped += (int16_t)(last - (uint16_t)dq->popped);
+    }
+    return dq->popped;
 }
 
 /* Called with diag_lock held */
@@ -210,12 +233,14 @@ static unsigned virtio_scsi_diag_snapshot_queue(VirtIOSCSI *s, uint32_t n,
     VirtIOSCSIDiagQueue *dq = &s->diag_queues[n];
     uint32_t num = virtio_queue_get_num(vdev, virtio_get_queue_index(vq));
     uint16_t first, end, count;
+    uint64_t ext_first;
     unsigned added = 0;
     int64_t now = g_get_monotonic_time();
 
     if (!num || !virtqueue_split_pending(vq, &first, &end)) {
         return 0;
     }
+    ext_first = virtio_scsi_diag_extend(dq, first);
     count = end - first;
     if (count > num) {
         return 0; /* the guest's avail index is garbage; nothing to trust */
@@ -231,7 +256,8 @@ static unsigned virtio_scsi_diag_snapshot_queue(VirtIOSCSI *s, uint32_t n,
     /* Forget what the device has popped since: only pending entries stay */
     for (uint32_t i = 0; i < num; i++) {
         if (dq->snap[i].valid &&
-            (uint16_t)(dq->snap[i].peek.pos - first) >= count) {
+            (dq->snap[i].ext_pos < ext_first ||
+             dq->snap[i].ext_pos >= ext_first + count)) {
             dq->snap[i].valid = false;
         }
     }
@@ -239,12 +265,14 @@ static unsigned virtio_scsi_diag_snapshot_queue(VirtIOSCSI *s, uint32_t n,
     /* The first sight of a position is the one that matters */
     for (uint16_t pos = first; pos != end; pos++) {
         VirtIOSCSISnapshot *snap = &dq->snap[pos % num];
+        uint64_t ext_pos = ext_first + (uint16_t)(pos - first);
 
-        if (snap->valid && snap->peek.pos == pos) {
+        if (snap->valid && snap->ext_pos == ext_pos) {
             continue;
         }
         virtqueue_split_peek(vq, pos, &snap->peek);
         snap->valid = true;
+        snap->ext_pos = ext_pos;
         snap->source = source;
         snap->tmf_seq = s->tmf_seq;
         snap->time_us = now;
@@ -324,6 +352,9 @@ static void virtio_scsi_diag_track(VirtIOSCSIReq *req)
     req->diag_pop_us = g_get_monotonic_time();
 
     WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        virtio_scsi_diag_extend(
+            &s->diag_queues[queue - VIRTIO_SCSI_VQ_NUM_FIXED],
+            virtio_queue_get_last_avail_idx(VIRTIO_DEVICE(s), queue));
         if (req->diag_buf) {
             old_buf = g_hash_table_lookup(s->inflight_buf, &req->diag_buf);
             g_hash_table_replace(s->inflight_buf, &req->diag_buf, req);
@@ -450,7 +481,13 @@ static void virtio_scsi_diag_broken(VirtIOSCSI *s, VirtQueue *vq)
             VirtIOSCSIDiagQueue *dq =
                 &s->diag_queues[queue - VIRTIO_SCSI_VQ_NUM_FIXED];
 
-            if (dq->num) {
+            /* now.pos is the entry just popped, just behind last_avail_idx */
+            uint16_t last = virtio_queue_get_last_avail_idx(VIRTIO_DEVICE(s),
+                                                            queue);
+            uint64_t ext_fail = virtio_scsi_diag_extend(dq, last) -
+                                (uint16_t)(last - now.pos);
+
+            if (dq->num && dq->snap[now.pos % dq->num].ext_pos == ext_fail) {
                 snap = dq->snap[now.pos % dq->num];
             }
             head_inflight = g_hash_table_contains(
@@ -487,6 +524,7 @@ static void virtio_scsi_diag_reset(VirtIOSCSI *s)
         if (dq->snap) {
             memset(dq->snap, 0, dq->num * sizeof(*dq->snap));
         }
+        dq->popped_valid = false;
     }
 }
 
