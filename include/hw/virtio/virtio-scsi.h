@@ -111,8 +111,11 @@ struct VirtIOSCSI {
 
     /*
      * Diagnostics for a request ring the device gives up on (see
-     * virtio_scsi_diag_broken()).
+     * virtio_scsi_diag_broken()). x-stop-on-broken pauses the VM the first
+     * time any virtio-scsi device breaks, so the guest's view of the
+     * failing request can be dumped before it moves on.
      */
+    bool stop_on_broken;
     QemuMutex diag_lock;            /* protects everything below */
     uint32_t tmf_seq;               /* TMFs seen, numbers each snapshot */
     struct VirtIOSCSIDiagQueue *diag_queues; /* one per request queue */
