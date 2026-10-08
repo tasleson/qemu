@@ -355,6 +355,7 @@ typedef struct VirtQueueChainPeek {
     uint32_t saved;         /* how many of entry[] are valid */
     VirtQueuePeekDesc entry[VIRTQUEUE_PEEK_ENTRIES];
     VirtQueuePeekDesc zero_entry; /* entry first_zero, if any */
+    bool read_failed;       /* some address was not plain RAM, so unread */
     bool hdr_ok;            /* hdr[] holds the start of the first buffer */
     uint8_t hdr[VIRTQUEUE_PEEK_HDR_SIZE];
 } VirtQueueChainPeek;

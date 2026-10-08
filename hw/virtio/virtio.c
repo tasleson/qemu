@@ -1784,11 +1784,39 @@ static void virtqueue_peek_note(VirtQueueChainPeek *p, uint32_t i,
     }
 }
 
-static bool virtqueue_peek_read(VirtIODevice *vdev, hwaddr addr, void *buf,
-                                hwaddr len)
+/*
+ * Copy guest memory for a peek, from RAM only. The addresses come from the
+ * guest, and an ordinary address_space_read() of one that lands on MMIO
+ * dispatches to the device -- taking the BQL from an IOThread, while callers
+ * may hold a device lock that the main loop, holding the BQL, is waiting
+ * for. A diagnostic has no business touching devices anyway, so anything
+ * that isn't plain RAM fails the read, and @p records that it did.
+ */
+static bool virtqueue_peek_read(VirtIODevice *vdev, VirtQueueChainPeek *p,
+                                hwaddr addr, void *buf, hwaddr len)
 {
-    return address_space_read(vdev->dma_as, addr, MEMTXATTRS_UNSPECIFIED,
-                              buf, len) == MEMTX_OK;
+    uint8_t *out = buf;
+
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        hwaddr xlat, l = len;
+        MemoryRegion *mr = address_space_translate(vdev->dma_as, addr, &xlat,
+                                                   &l, false,
+                                                   MEMTXATTRS_UNSPECIFIED);
+
+        if (!l || !mr->ram_block ||
+            !memory_access_is_direct(mr, false, MEMTXATTRS_UNSPECIFIED)) {
+            if (p) {
+                p->read_failed = true;
+            }
+            return false;
+        }
+        memcpy(out, qemu_map_ram_ptr(mr->ram_block, xlat), l);
+        addr += l;
+        out += l;
+        len -= l;
+    }
+    return true;
 }
 
 /*
@@ -1805,7 +1833,8 @@ bool virtqueue_split_pending(VirtQueue *vq, uint16_t *first, uint16_t *end)
         virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
         return false;
     }
-    if (!virtqueue_peek_read(vdev, vq->vring.avail + offsetof(VRingAvail, idx),
+    if (!virtqueue_peek_read(vdev, NULL,
+                             vq->vring.avail + offsetof(VRingAvail, idx),
                              raw, sizeof(raw))) {
         return false;
     }
@@ -1837,7 +1866,7 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
         virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
         return;
     }
-    if (!virtqueue_peek_read(vdev, vq->vring.avail +
+    if (!virtqueue_peek_read(vdev, p, vq->vring.avail +
                              offsetof(VRingAvail, ring[pos % num]),
                              raw, sizeof(uint16_t))) {
         return;
@@ -1845,7 +1874,7 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
     head = virtio_lduw_p(vdev, raw);
     p->head = head;
     if (head >= num ||
-        !virtqueue_peek_read(vdev, vq->vring.desc + head * sizeof(VRingDesc),
+        !virtqueue_peek_read(vdev, p, vq->vring.desc + head * sizeof(VRingDesc),
                              raw, sizeof(raw))) {
         return;
     }
@@ -1862,7 +1891,7 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
             return;
         }
         table = g_malloc(len);
-        if (!virtqueue_peek_read(vdev, p->desc.addr, table, len)) {
+        if (!virtqueue_peek_read(vdev, p, p->desc.addr, table, len)) {
             return;
         }
         p->table_ok = len == p->desc.len;
@@ -1890,7 +1919,7 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
             }
             next = vq->vring.desc + d.next * sizeof(VRingDesc);
             if (d.next >= num || i >= num ||
-                !virtqueue_peek_read(vdev, next, raw, sizeof(raw))) {
+                !virtqueue_peek_read(vdev, p, next, raw, sizeof(raw))) {
                 break;
             }
             virtqueue_peek_decode(vdev, raw, &d);
@@ -1899,7 +1928,7 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
     }
 
     if (p->saved && p->entry[0].addr) {
-        p->hdr_ok = virtqueue_peek_read(vdev, p->entry[0].addr, p->hdr,
+        p->hdr_ok = virtqueue_peek_read(vdev, p, p->entry[0].addr, p->hdr,
                                         sizeof(p->hdr));
     }
 }
@@ -1950,7 +1979,8 @@ static void virtqueue_note_chain_error(VirtQueue *vq, uint16_t pos)
     virtqueue_split_peek(vq, pos, p);
 
     trace_virtqueue_chain_error(dev, queue, p->pos, p->head, p->head_ok,
-                                p->desc.addr, p->desc.len, p->desc.flags);
+                                p->desc.addr, p->desc.len, p->desc.flags,
+                                p->read_failed);
     trace_virtqueue_chain_summary(dev, queue, p->indirect, p->entries,
                                   p->zero_len, p->first_zero, p->all_zero,
                                   p->hash,
