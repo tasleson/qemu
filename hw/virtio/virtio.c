@@ -1927,8 +1927,12 @@ void virtqueue_split_peek(VirtQueue *vq, uint16_t pos, VirtQueueChainPeek *p)
         p->entries = i;
     }
 
+    /*
+     * The first buffer isn't part of the chain, and hdr_ok already says
+     * whether it was read; leave read_failed to mean the chain itself.
+     */
     if (p->saved && p->entry[0].addr) {
-        p->hdr_ok = virtqueue_peek_read(vdev, p, p->entry[0].addr, p->hdr,
+        p->hdr_ok = virtqueue_peek_read(vdev, NULL, p->entry[0].addr, p->hdr,
                                         sizeof(p->hdr));
     }
 }
