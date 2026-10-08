@@ -343,6 +343,14 @@ virtio_scsi_tmf_resp(int target, int lun, uint32_t tag, int response, const char
 virtio_scsi_tmf_delay(int target, int lun, uint32_t tag, uint32_t delay_ms, const char *bus) "virtio_scsi_tmf_delay target=%d lun=%u tag=0x%x delay_ms=%u bus=%s"
 virtio_scsi_reset(const char *bus) "virtio_scsi_reset bus=%s"
 virtio_scsi_broken(const char *bus, int queue) "virtio_scsi_broken bus=%s queue=%d"
+virtio_scsi_broken_verdict(const char *bus, unsigned int queue, unsigned int pos, const char *verdict, bool head_inflight, uint32_t tmf_seq, uint64_t overlaps) "virtio_scsi_broken_verdict bus=%s queue=%u pos=%u verdict=%s head_inflight=%d tmf_seq=%u overlaps=%"PRIu64
+virtio_scsi_broken_before(const char *bus, unsigned int queue, unsigned int pos, const char *source, uint32_t tmf_seq, int64_t age_us, unsigned int head, uint32_t len, unsigned int entries, unsigned int zero_len) "virtio_scsi_broken_before bus=%s queue=%u pos=%u source=%s tmf_seq=%u age_us=%"PRId64" head=%u len=%u entries=%u zero_len=%u"
+virtio_scsi_broken_before_detail(const char *bus, unsigned int queue, bool indirect, bool all_zero, int first_zero, uint64_t hash, uint64_t tag, bool read_failed) "virtio_scsi_broken_before_detail bus=%s queue=%u indirect=%d all_zero=%d first_zero=%d hash=0x%"PRIx64" tag=0x%"PRIx64" read_failed=%d"
+virtio_scsi_broken_before_entry(const char *bus, unsigned int queue, int i, uint64_t addr, uint32_t len, unsigned int flags, unsigned int next) "virtio_scsi_broken_before_entry bus=%s queue=%u i=%d addr=0x%"PRIx64" len=%u flags=0x%x next=%u"
+virtio_scsi_tmf_snapshot(const char *bus, uint32_t tmf_seq, unsigned int pending, unsigned int added, uint64_t overlaps) "virtio_scsi_tmf_snapshot bus=%s tmf_seq=%u pending=%u added=%u overlaps=%"PRIu64
+virtio_scsi_drain_begin(const char *bus, uint32_t tmf_seq, unsigned int pending, unsigned int added) "virtio_scsi_drain_begin bus=%s tmf_seq=%u pending=%u added=%u"
+virtio_scsi_drain_snapshot(const char *bus, uint32_t tmf_seq, uint32_t kicks, uint32_t added) "virtio_scsi_drain_snapshot bus=%s tmf_seq=%u kicks=%u added=%u"
+virtio_scsi_req_overlap(const char *bus, const char *kind, unsigned int queue, unsigned int head, uint64_t tag, unsigned int old_queue, unsigned int old_head, uint64_t old_tag, int64_t age_us, uint64_t count) "virtio_scsi_req_overlap bus=%s kind=%s queue=%u head=%u tag=0x%"PRIx64" old_queue=%u old_head=%u old_tag=0x%"PRIx64" age_us=%"PRId64" count=%"PRIu64
 virtio_scsi_an_req(int lun, uint32_t event_requested) "virtio_scsi_an_req lun=%u event_requested=0x%x"
 virtio_scsi_an_resp(int lun, int response) "virtio_scsi_an_resp lun=%u response=%d"
 virtio_scsi_event(int lun, int event, int reason) "virtio_scsi_event lun=%u event=%d reason=%d"

@@ -108,6 +108,19 @@ struct VirtIOSCSI {
      */
     uint32_t tmf_delay_ms;
     uint32_t tmf_delay_count;
+
+    /*
+     * Diagnostics for a request ring the device gives up on (see
+     * virtio_scsi_diag_broken()).
+     */
+    QemuMutex diag_lock;            /* protects everything below */
+    uint32_t tmf_seq;               /* TMFs seen, numbers each snapshot */
+    struct VirtIOSCSIDiagQueue *diag_queues; /* one per request queue */
+    GHashTable *inflight_buf;       /* command header GPA -> VirtIOSCSIReq */
+    GHashTable *inflight_head;      /* queue << 16 | head -> VirtIOSCSIReq */
+    uint64_t overlaps;              /* see virtio_scsi_diag_track() */
+    uint32_t drain_kicks;           /* kicks in this drain, incl. our own */
+    uint32_t drain_new;             /* positions first seen during it */
 };
 
 void virtio_scsi_common_realize(DeviceState *dev,

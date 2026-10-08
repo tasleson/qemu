@@ -54,6 +54,14 @@ typedef struct VirtIOSCSIReq {
     SCSIRequest *sreq;
     size_t resp_size;
     enum SCSIXferMode mode;
+
+    /* See virtio_scsi_diag_track() */
+    bool diag_tracked;
+    uint64_t diag_buf;      /* GPA of the command header */
+    uint32_t diag_head;     /* queue << 16 | head */
+    uint64_t diag_tag;
+    int64_t diag_pop_us;
+
     union {
         VirtIOSCSICmdResp     cmd;
         VirtIOSCSICtrlTMFResp tmf;
@@ -96,8 +104,11 @@ static void virtio_scsi_init_req(VirtIOSCSI *s, VirtQueue *vq, VirtIOSCSIReq *re
     memset((uint8_t *)req + zero_skip, 0, sizeof(*req) - zero_skip);
 }
 
+static void virtio_scsi_diag_untrack(VirtIOSCSIReq *req);
+
 static void virtio_scsi_free_req(VirtIOSCSIReq *req)
 {
+    virtio_scsi_diag_untrack(req);
     qemu_iovec_destroy(&req->resp_iov);
     qemu_sglist_destroy(&req->qsgl);
     g_free(req);
@@ -110,6 +121,7 @@ static void virtio_scsi_complete_req(VirtIOSCSIReq *req, QemuMutex *vq_lock)
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
 
     qemu_iovec_from_buf(&req->resp_iov, 0, &req->resp, req->resp_size);
+    virtio_scsi_diag_untrack(req);
 
     if (vq_lock) {
         qemu_mutex_lock(vq_lock);
@@ -139,6 +151,389 @@ static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
     return s->bus.qbus.name;
 }
 
+/*
+ * Diagnostics for a request ring the device gives up on.
+ *
+ * When virtio_error() breaks a request queue, the core keeps the chain it
+ * failed on (virtqueue_get_chain_error()). On its own that says what the
+ * device read, not whether it is what the guest published. So unpopped
+ * request-queue entries are also snapshotted the first time they are seen
+ * while the device is not consuming them -- when a TMF arrives, and on each
+ * guest kick while a drain has the queue handlers detached (a LUN reset
+ * drains, so both cover the reset window). At a break the failing
+ * position's snapshot is compared with what was read, giving a verdict:
+ *
+ *   no-snapshot   the entry was never seen pending (published and popped
+ *                 outside a TMF or drain)
+ *   head-changed  the avail slot now names a different descriptor
+ *   unchanged     same chain, byte for byte: what was published is what
+ *                 failed (look at zero_len in the snapshot)
+ *   zeroed        the indirect table was valid and is now all zeros
+ *   rewritten     the chain changed some other way
+ *   unreadable    the head descriptor is unchanged but the chain behind it
+ *                 points at memory that isn't RAM (see
+ *                 virtqueue_split_peek()), so there is nothing to compare
+ *
+ * Independently, every request popped is checked against those still in
+ * flight on the adapter: one with the same command header address or the
+ * same head means the guest reissued memory the device still owns.
+ */
+#define VIRTIO_SCSI_OVERLAP_TRACE_MAX 256
+#define VIRTIO_SCSI_DIAG_REARM_MAX 4
+
+typedef struct VirtIOSCSISnapshot {
+    bool valid;
+    uint64_t ext_pos;       /* peek.pos extended, see diag_extend() */
+    const char *source;     /* "tmf", "drain" or "kick" */
+    uint32_t tmf_seq;
+    int64_t time_us;
+    VirtQueueChainPeek peek;
+} VirtIOSCSISnapshot;
+
+typedef struct VirtIOSCSIDiagQueue {
+    uint32_t num;
+    VirtIOSCSISnapshot *snap;   /* num entries, indexed by pos % num */
+    bool popped_valid;
+    uint64_t popped;            /* last_avail_idx, extended to 64 bits */
+} VirtIOSCSIDiagQueue;
+
+static uint64_t virtio_scsi_peek_tag(const VirtQueueChainPeek *p)
+{
+    /* struct virtio_scsi_cmd_req starts with lun[8], then the tag */
+    return p->hdr_ok ? ldq_le_p(p->hdr + 8) : 0;
+}
+
+/*
+ * Avail positions are 16 bits and wrap every 65536 pops, so on its own a
+ * snapshot of position P from a lap ago looks just like one from this lap,
+ * and would be compared with an unrelated request. Keep last_avail_idx
+ * extended to 64 bits -- sampled on every request popped and at every
+ * snapshot pass, far more often than once a lap -- and stamp snapshots with
+ * the extended position. A signed delta tolerates the index stepping back.
+ * Called with diag_lock held.
+ */
+static uint64_t virtio_scsi_diag_extend(VirtIOSCSIDiagQueue *dq, uint16_t last)
+{
+    if (!dq->popped_valid) {
+        dq->popped = last;
+        dq->popped_valid = true;
+    } else {
+        dq->popped += (int16_t)(last - (uint16_t)dq->popped);
+    }
+    return dq->popped;
+}
+
+/* Called with diag_lock held */
+static unsigned virtio_scsi_diag_snapshot_queue(VirtIOSCSI *s, uint32_t n,
+                                                const char *source,
+                                                unsigned *pending)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    VirtQueue *vq = VIRTIO_SCSI_COMMON(s)->cmd_vqs[n];
+    VirtIOSCSIDiagQueue *dq = &s->diag_queues[n];
+    uint32_t num = virtio_queue_get_num(vdev, virtio_get_queue_index(vq));
+    uint16_t first, end, count;
+    uint64_t ext_first;
+    unsigned added = 0;
+    int64_t now = g_get_monotonic_time();
+
+    if (!num || !virtqueue_split_pending(vq, &first, &end)) {
+        return 0;
+    }
+    ext_first = virtio_scsi_diag_extend(dq, first);
+    count = end - first;
+    if (count > num) {
+        return 0; /* the guest's avail index is garbage; nothing to trust */
+    }
+    *pending += count;
+
+    if (dq->num != num) {
+        g_free(dq->snap);
+        dq->snap = g_new0(VirtIOSCSISnapshot, num);
+        dq->num = num;
+    }
+
+    /* Forget what the device has popped since: only pending entries stay */
+    for (uint32_t i = 0; i < num; i++) {
+        if (dq->snap[i].valid &&
+            (dq->snap[i].ext_pos < ext_first ||
+             dq->snap[i].ext_pos >= ext_first + count)) {
+            dq->snap[i].valid = false;
+        }
+    }
+
+    /* The first sight of a position is the one that matters */
+    for (uint16_t pos = first; pos != end; pos++) {
+        VirtIOSCSISnapshot *snap = &dq->snap[pos % num];
+        uint64_t ext_pos = ext_first + (uint16_t)(pos - first);
+
+        if (snap->valid && snap->ext_pos == ext_pos) {
+            continue;
+        }
+        virtqueue_split_peek(vq, pos, &snap->peek);
+        snap->valid = true;
+        snap->ext_pos = ext_pos;
+        snap->source = source;
+        snap->tmf_seq = s->tmf_seq;
+        snap->time_us = now;
+        added++;
+    }
+    return added;
+}
+
+/* Called with diag_lock held */
+static unsigned virtio_scsi_diag_snapshot_all(VirtIOSCSI *s, const char *source,
+                                              unsigned *pending)
+{
+    unsigned added = 0;
+
+    for (uint32_t n = 0; n < s->parent_obj.conf.num_queues; n++) {
+        added += virtio_scsi_diag_snapshot_queue(s, n, source, pending);
+    }
+    return added;
+}
+
+/* A TMF arrived: record what is pending before the reset touches anything */
+static void virtio_scsi_diag_tmf(VirtIOSCSI *s)
+{
+    unsigned pending = 0, added;
+    uint32_t seq;
+    uint64_t overlaps;
+
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        seq = ++s->tmf_seq;
+        added = virtio_scsi_diag_snapshot_all(s, "tmf", &pending);
+        overlaps = s->overlaps;
+    }
+    trace_virtio_scsi_tmf_snapshot(virtio_scsi_bus_name(s), seq, pending,
+                                   added, overlaps);
+}
+
+/*
+ * Guest kick while the drain has the queue handlers detached. See
+ * virtio_queue_aio_attach_host_notifier_watch(): re-arm notifications after
+ * each pass, and look again in case something landed in between.
+ */
+static void virtio_scsi_diag_watch(VirtIODevice *vdev, VirtQueue *vq)
+{
+    VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+    uint32_t n = virtio_get_queue_index(vq) - VIRTIO_SCSI_VQ_NUM_FIXED;
+    unsigned pending = 0;
+
+    QEMU_LOCK_GUARD(&s->diag_lock);
+    s->drain_kicks++;
+    for (int i = 0; i < VIRTIO_SCSI_DIAG_REARM_MAX; i++) {
+        unsigned added = virtio_scsi_diag_snapshot_queue(s, n, "kick",
+                                                         &pending);
+
+        s->drain_new += added;
+        virtio_queue_set_notification(vq, 1);
+        if (!added && i) {
+            break;
+        }
+    }
+}
+
+/*
+ * Track a popped request as in flight, and report it if it reuses the
+ * command header or head of one the device still has.
+ */
+static void virtio_scsi_diag_track(VirtIOSCSIReq *req)
+{
+    VirtIOSCSI *s = req->dev;
+    uint32_t queue = virtio_get_queue_index(req->vq);
+    VirtIOSCSIReq *old_buf = NULL, *old_head = NULL;
+    uint64_t count = 0;
+    bool trace_it = false;
+
+    req->diag_buf = req->elem.out_num ? req->elem.out_addr[0] : 0;
+    req->diag_head = queue << 16 | req->elem.index;
+    req->diag_tag = req->req.cmd.tag;
+    req->diag_pop_us = g_get_monotonic_time();
+
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        virtio_scsi_diag_extend(
+            &s->diag_queues[queue - VIRTIO_SCSI_VQ_NUM_FIXED],
+            virtio_queue_get_last_avail_idx(VIRTIO_DEVICE(s), queue));
+        if (req->diag_buf) {
+            old_buf = g_hash_table_lookup(s->inflight_buf, &req->diag_buf);
+            g_hash_table_replace(s->inflight_buf, &req->diag_buf, req);
+        }
+        old_head = g_hash_table_lookup(s->inflight_head,
+                                       GUINT_TO_POINTER(req->diag_head));
+        g_hash_table_replace(s->inflight_head,
+                             GUINT_TO_POINTER(req->diag_head), req);
+        req->diag_tracked = true;
+        if (old_buf || old_head) {
+            count = ++s->overlaps;
+            trace_it = count <= VIRTIO_SCSI_OVERLAP_TRACE_MAX;
+        }
+    }
+
+    if (trace_it) {
+        VirtIOSCSIReq *old = old_buf ? old_buf : old_head;
+
+        trace_virtio_scsi_req_overlap(virtio_scsi_bus_name(s),
+                                      old_buf ? (old_head ? "buffer+head"
+                                                          : "buffer")
+                                              : "head",
+                                      queue, req->elem.index, req->diag_tag,
+                                      old->diag_head >> 16,
+                                      old->diag_head & 0xffff, old->diag_tag,
+                                      req->diag_pop_us - old->diag_pop_us,
+                                      count);
+    }
+}
+
+/* Before the element goes back to the guest, which may reuse it at once */
+static void virtio_scsi_diag_untrack(VirtIOSCSIReq *req)
+{
+    VirtIOSCSI *s = req->dev;
+
+    if (!req->diag_tracked) {
+        return;
+    }
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        if (req->diag_buf &&
+            g_hash_table_lookup(s->inflight_buf, &req->diag_buf) == req) {
+            g_hash_table_remove(s->inflight_buf, &req->diag_buf);
+        }
+        if (g_hash_table_lookup(s->inflight_head,
+                                GUINT_TO_POINTER(req->diag_head)) == req) {
+            g_hash_table_remove(s->inflight_head,
+                                GUINT_TO_POINTER(req->diag_head));
+        }
+    }
+    req->diag_tracked = false;
+}
+
+static const char *virtio_scsi_diag_verdict(const VirtIOSCSISnapshot *snap,
+                                            const VirtQueueChainPeek *now)
+{
+    const VirtQueueChainPeek *before = &snap->peek;
+    bool same_desc;
+
+    if (!snap->valid || before->pos != now->pos || !before->head_ok) {
+        return "no-snapshot";
+    }
+    if (before->head != now->head) {
+        return "head-changed";
+    }
+    /*
+     * A head descriptor that changed is a rewrite, whatever it points at
+     * now or did then. Only behind an unchanged one does a chain that
+     * couldn't be read leave nothing to compare.
+     */
+    same_desc = now->head_ok && before->desc.addr == now->desc.addr &&
+                before->desc.len == now->desc.len &&
+                before->desc.flags == now->desc.flags;
+    if (!now->head_ok ||
+        (same_desc && (before->read_failed || now->read_failed))) {
+        return "unreadable";
+    }
+    if (same_desc && before->hash == now->hash) {
+        return "unchanged";
+    }
+    if (now->indirect && now->all_zero && !before->all_zero &&
+        !before->read_failed) {
+        return "zeroed";
+    }
+    return "rewritten";
+}
+
+static void virtio_scsi_diag_trace_before(VirtIOSCSI *s, uint32_t queue,
+                                          const VirtIOSCSISnapshot *snap,
+                                          int64_t now_us)
+{
+    const VirtQueueChainPeek *p = &snap->peek;
+    const char *bus = virtio_scsi_bus_name(s);
+
+    trace_virtio_scsi_broken_before(bus, queue, p->pos, snap->source,
+                                    snap->tmf_seq, now_us - snap->time_us,
+                                    p->head, p->desc.len, p->entries,
+                                    p->zero_len);
+    trace_virtio_scsi_broken_before_detail(bus, queue, p->indirect,
+                                           p->all_zero, p->first_zero,
+                                           p->hash, virtio_scsi_peek_tag(p),
+                                           p->read_failed);
+    for (uint32_t i = 0; i < p->saved; i++) {
+        trace_virtio_scsi_broken_before_entry(bus, queue, i, p->entry[i].addr,
+                                              p->entry[i].len,
+                                              p->entry[i].flags,
+                                              p->entry[i].next);
+    }
+}
+
+/*
+ * @vq just broke the device. Say what the failing entry looked like when
+ * it was published, compared to now.
+ */
+static void virtio_scsi_diag_broken(VirtIOSCSI *s, VirtQueue *vq)
+{
+    const char *bus = virtio_scsi_bus_name(s);
+    uint32_t queue = virtio_get_queue_index(vq);
+    VirtIOSCSISnapshot snap = { .valid = false };
+    VirtQueueChainPeek now;
+    bool have_chain;
+    bool head_inflight = false;
+    uint32_t tmf_seq;
+    uint64_t overlaps;
+
+    have_chain = virtqueue_get_chain_error(vq, &now);
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        tmf_seq = s->tmf_seq;
+        overlaps = s->overlaps;
+        if (have_chain && queue >= VIRTIO_SCSI_VQ_NUM_FIXED) {
+            VirtIOSCSIDiagQueue *dq =
+                &s->diag_queues[queue - VIRTIO_SCSI_VQ_NUM_FIXED];
+
+            /* now.pos is the entry just popped, just behind last_avail_idx */
+            uint16_t last = virtio_queue_get_last_avail_idx(VIRTIO_DEVICE(s),
+                                                            queue);
+            uint64_t ext_fail = virtio_scsi_diag_extend(dq, last) -
+                                (uint16_t)(last - now.pos);
+
+            if (dq->num && dq->snap[now.pos % dq->num].ext_pos == ext_fail) {
+                snap = dq->snap[now.pos % dq->num];
+            }
+            head_inflight = g_hash_table_contains(
+                s->inflight_head, GUINT_TO_POINTER(queue << 16 | now.head));
+        }
+    }
+
+    if (!have_chain) {
+        /* Broken over something other than the chain, e.g. bad headers */
+        trace_virtio_scsi_broken_verdict(bus, queue, 0, "no-chain", false,
+                                         tmf_seq, overlaps);
+        return;
+    }
+    if (queue < VIRTIO_SCSI_VQ_NUM_FIXED) {
+        trace_virtio_scsi_broken_verdict(bus, queue, now.pos, "not-request",
+                                         false, tmf_seq, overlaps);
+        return;
+    }
+
+    if (snap.valid && snap.peek.pos == now.pos) {
+        virtio_scsi_diag_trace_before(s, queue, &snap, g_get_monotonic_time());
+    }
+    trace_virtio_scsi_broken_verdict(bus, queue, now.pos,
+                                     virtio_scsi_diag_verdict(&snap, &now),
+                                     head_inflight, tmf_seq, overlaps);
+}
+
+static void virtio_scsi_diag_reset(VirtIOSCSI *s)
+{
+    QEMU_LOCK_GUARD(&s->diag_lock);
+    for (uint32_t n = 0; n < s->parent_obj.conf.num_queues; n++) {
+        VirtIOSCSIDiagQueue *dq = &s->diag_queues[n];
+
+        if (dq->snap) {
+            memset(dq->snap, 0, dq->num * sizeof(*dq->snap));
+        }
+        dq->popped_valid = false;
+    }
+}
+
 static void virtio_scsi_bad_req(VirtIOSCSIReq *req, QemuMutex *vq_lock)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(req->dev);
@@ -148,6 +543,7 @@ static void virtio_scsi_bad_req(VirtIOSCSIReq *req, QemuMutex *vq_lock)
     if (!was_broken) {
         trace_virtio_scsi_broken(virtio_scsi_bus_name(req->dev),
                                  virtio_get_queue_index(req->vq));
+        virtio_scsi_diag_broken(req->dev, req->vq);
     }
 
     if (vq_lock) {
@@ -271,6 +667,7 @@ static VirtIOSCSIReq *virtio_scsi_pop_req(VirtIOSCSI *s, VirtQueue *vq, size_t e
         if (!was_broken && vdev->broken) {
             trace_virtio_scsi_broken(virtio_scsi_bus_name(s),
                                      virtio_get_queue_index(vq));
+            virtio_scsi_diag_broken(s, vq);
         }
         return NULL;
     }
@@ -515,6 +912,7 @@ static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
                               virtio_scsi_get_lun(req->req.tmf.lun),
                               req->req.tmf.tag, req->req.tmf.subtype,
                               virtio_scsi_bus_name(s));
+    virtio_scsi_diag_tmf(s);
 
     switch (req->req.tmf.subtype) {
     case VIRTIO_SCSI_T_TMF_ABORT_TASK: {
@@ -953,6 +1351,7 @@ static int virtio_scsi_handle_cmd_req_prepare(VirtIOSCSI *s, VirtIOSCSIReq *req,
     }
     trace_virtio_scsi_cmd_req(virtio_scsi_get_lun(req->req.cmd.lun),
                               req->req.cmd.tag, req->req.cmd.cdb[0]);
+    virtio_scsi_diag_track(req);
 
     d = virtio_scsi_device_get(s, req->req.cmd.lun);
     if (!d) {
@@ -1108,6 +1507,7 @@ static void virtio_scsi_reset(VirtIODevice *vdev)
 
     vs->sense_size = VIRTIO_SCSI_SENSE_DEFAULT_SIZE;
     vs->cdb_size = VIRTIO_SCSI_CDB_DEFAULT_SIZE;
+    virtio_scsi_diag_reset(s);
 
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
         s->events_dropped = false;
@@ -1316,6 +1716,25 @@ static void virtio_scsi_drained_begin(SCSIBus *bus)
         VirtQueue *vq = virtio_get_queue(vdev, i);
         virtio_queue_aio_detach_host_notifier(vq, s->vq_aio_context[i]);
     }
+
+    /*
+     * Nothing pops the request queues until drained_end, so whatever the
+     * guest publishes meanwhile sits there. Record it as it arrives; see
+     * virtio_scsi_diag_broken().
+     */
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        unsigned pending = 0;
+
+        s->drain_kicks = 0;
+        s->drain_new = virtio_scsi_diag_snapshot_all(s, "drain", &pending);
+        trace_virtio_scsi_drain_begin(virtio_scsi_bus_name(s), s->tmf_seq,
+                                      pending, s->drain_new);
+    }
+    for (uint32_t i = VIRTIO_SCSI_VQ_NUM_FIXED; i < total_queues; i++) {
+        virtio_queue_aio_attach_host_notifier_watch(virtio_get_queue(vdev, i),
+                                                    s->vq_aio_context[i],
+                                                    virtio_scsi_diag_watch);
+    }
 }
 
 /* Resume virtqueue ioeventfd processing after drain */
@@ -1338,6 +1757,12 @@ static void virtio_scsi_drained_end(SCSIBus *bus)
         return;
     }
 
+    WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
+        trace_virtio_scsi_drain_snapshot(virtio_scsi_bus_name(s), s->tmf_seq,
+                                         s->drain_kicks, s->drain_new);
+    }
+
+    /* This replaces the diagnostic watch drained_begin attached */
     for (uint32_t i = 0; i < total_queues; i++) {
         VirtQueue *vq = virtio_get_queue(vdev, i);
         AioContext *ctx = s->vq_aio_context[i];
@@ -1416,6 +1841,9 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
 
     qemu_mutex_init(&s->ctrl_lock);
     qemu_mutex_init(&s->event_lock);
+    qemu_mutex_init(&s->diag_lock);
+    s->inflight_buf = g_hash_table_new(g_int64_hash, g_int64_equal);
+    s->inflight_head = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     virtio_scsi_common_realize(dev,
                                virtio_scsi_handle_ctrl,
@@ -1426,6 +1854,8 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
         error_propagate(errp, err);
         return;
     }
+    s->diag_queues = g_new0(VirtIOSCSIDiagQueue,
+                            s->parent_obj.conf.num_queues);
 
     scsi_bus_init_named(&s->bus, sizeof(s->bus), dev,
                        &virtio_scsi_scsi_info, vdev->bus_name);
@@ -1457,7 +1887,15 @@ static void virtio_scsi_device_unrealize(DeviceState *dev)
 
     virtio_scsi_dataplane_cleanup(s);
     qbus_set_hotplug_handler(BUS(&s->bus), NULL);
+    for (uint32_t n = 0; s->diag_queues && n < s->parent_obj.conf.num_queues;
+         n++) {
+        g_free(s->diag_queues[n].snap);
+    }
+    g_clear_pointer(&s->diag_queues, g_free);
     virtio_scsi_common_unrealize(dev);
+    g_hash_table_destroy(s->inflight_buf);
+    g_hash_table_destroy(s->inflight_head);
+    qemu_mutex_destroy(&s->diag_lock);
     qemu_mutex_destroy(&s->event_lock);
     qemu_mutex_destroy(&s->ctrl_lock);
 }
