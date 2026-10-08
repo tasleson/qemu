@@ -171,7 +171,8 @@ static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
  *                 failed (look at zero_len in the snapshot)
  *   zeroed        the indirect table was valid and is now all zeros
  *   rewritten     the chain changed some other way
- *   unreadable    part of the chain points at memory that isn't RAM (see
+ *   unreadable    the head descriptor is unchanged but the chain behind it
+ *                 points at memory that isn't RAM (see
  *                 virtqueue_split_peek()), so there is nothing to compare
  *   diag-off      x-diag=off: none of this was collected
  *
@@ -421,6 +422,7 @@ static const char *virtio_scsi_diag_verdict(const VirtIOSCSISnapshot *snap,
                                             const VirtQueueChainPeek *now)
 {
     const VirtQueueChainPeek *before = &snap->peek;
+    bool same_desc;
 
     if (!snap->valid || before->pos != now->pos || !before->head_ok) {
         return "no-snapshot";
@@ -428,15 +430,23 @@ static const char *virtio_scsi_diag_verdict(const VirtIOSCSISnapshot *snap,
     if (before->head != now->head) {
         return "head-changed";
     }
-    if (before->read_failed || now->read_failed) {
+    /*
+     * A head descriptor that changed is a rewrite, whatever it points at
+     * now or did then. Only behind an unchanged one does a chain that
+     * couldn't be read leave nothing to compare.
+     */
+    same_desc = now->head_ok && before->desc.addr == now->desc.addr &&
+                before->desc.len == now->desc.len &&
+                before->desc.flags == now->desc.flags;
+    if (!now->head_ok ||
+        (same_desc && (before->read_failed || now->read_failed))) {
         return "unreadable";
     }
-    if (before->hash == now->hash && before->desc.addr == now->desc.addr &&
-        before->desc.len == now->desc.len &&
-        before->desc.flags == now->desc.flags) {
+    if (same_desc && before->hash == now->hash) {
         return "unchanged";
     }
-    if (now->indirect && now->all_zero && !before->all_zero) {
+    if (now->indirect && now->all_zero && !before->all_zero &&
+        !before->read_failed) {
         return "zeroed";
     }
     return "rewritten";
