@@ -82,6 +82,12 @@ DEFAULT_FIO_PATH = r"C:\Program Files\fio\fio.exe"
 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
 VIOSCSI_TELEMETRY_TIMEOUT_S = 60
 WRITER_STOP_TIMEOUT_S = 30
+# Before post-failure collection, how hard to try the guest agent. A busy
+# main loop can delay a reply by seconds, so one short ping is not enough to
+# call it dead; but a dead one makes everything after it wait out
+# GUEST_EXEC_TIMEOUT_S per writer -- hours at 75 LUNs.
+AGENT_CHECK_ATTEMPTS = 3
+AGENT_CHECK_TIMEOUT_S = 5.0
 
 DEFAULT_RAM = "8G"
 DEFAULT_CPUS = "5"
@@ -1164,8 +1170,26 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["tmf_trace"] = qemu_stderr.trace_counts
         result["broken_events"] = qemu_stderr.broken_events
 
+    def capture_postmortem() -> None:
+        result["telemetry_failure_screenshot"] = (
+            screendump_hash(qmp, screenshot) is not None)
+        result["telemetry_failure_dump"] = try_dump_guest_memory(
+            qmp, dump_path, proc.pid, err_nodes)
+
     def collect_vioscsi_telemetry() -> None:
         if not vioscsi_telemetry_script:
+            return
+        # Everything below goes through the guest agent, and with the agent
+        # gone each step waits out its own timeout: stop_writers alone is a
+        # status poll plus a taskkill per writer, about three hours at 75
+        # LUNs, for nothing. Go straight to what QMP can still capture.
+        if not any(qga_ping(qga_sock, AGENT_CHECK_TIMEOUT_S)
+                   for _ in range(AGENT_CHECK_ATTEMPTS)):
+            result["vioscsi_telemetry"] = "skipped: guest agent not responding"
+            print("    guest agent not responding -- skipping writer stop and "
+                  "telemetry; capturing a screenshot and a guest memory dump "
+                  "for postmortem", file=sys.stderr)
+            capture_postmortem()
             return
         # Stop the writers first: they're still live (see stop_writers'
         # docstring), and leaving them running races the telemetry query
@@ -1181,10 +1205,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             print(f"    telemetry collection failed ({msg}) -- capturing a "
                   "screenshot and a guest memory dump for postmortem",
                   file=sys.stderr)
-            result["telemetry_failure_screenshot"] = (
-                screendump_hash(qmp, screenshot) is not None)
-            result["telemetry_failure_dump"] = try_dump_guest_memory(
-                qmp, dump_path, proc.pid, err_nodes)
+            capture_postmortem()
 
     try:
         make_overlay(BOOT_DISK, boot_overlay)
