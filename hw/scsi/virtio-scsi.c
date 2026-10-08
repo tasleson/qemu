@@ -171,6 +171,8 @@ static const char *virtio_scsi_bus_name(VirtIOSCSI *s)
  *                 failed (look at zero_len in the snapshot)
  *   zeroed        the indirect table was valid and is now all zeros
  *   rewritten     the chain changed some other way
+ *   unreadable    part of the chain points at memory that isn't RAM (see
+ *                 virtqueue_split_peek()), so there is nothing to compare
  *
  * Independently, every request popped is checked against those still in
  * flight on the adapter: one with the same command header address or the
@@ -418,6 +420,9 @@ static const char *virtio_scsi_diag_verdict(const VirtIOSCSISnapshot *snap,
     if (before->head != now->head) {
         return "head-changed";
     }
+    if (before->read_failed || now->read_failed) {
+        return "unreadable";
+    }
     if (before->hash == now->hash && before->desc.addr == now->desc.addr &&
         before->desc.len == now->desc.len &&
         before->desc.flags == now->desc.flags) {
@@ -442,7 +447,8 @@ static void virtio_scsi_diag_trace_before(VirtIOSCSI *s, uint32_t queue,
                                     p->zero_len);
     trace_virtio_scsi_broken_before_detail(bus, queue, p->indirect,
                                            p->all_zero, p->first_zero,
-                                           p->hash, virtio_scsi_peek_tag(p));
+                                           p->hash, virtio_scsi_peek_tag(p),
+                                           p->read_failed);
     for (uint32_t i = 0; i < p->saved; i++) {
         trace_virtio_scsi_broken_before_entry(bus, queue, i, p->entry[i].addr,
                                               p->entry[i].len,
