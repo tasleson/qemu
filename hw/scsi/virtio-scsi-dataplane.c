@@ -123,6 +123,21 @@ static int virtio_scsi_set_host_notifier(VirtIOSCSI *s, VirtQueue *vq, int n)
 }
 
 /* Context: BH in IOThread */
+/*
+ * The watch consumes kicks without popping, so whatever the guest published
+ * during the drain has no kick left for virtio_bus_cleanup_host_notifier()
+ * to find. Leave one, so cleanup still processes those requests, as it
+ * would have without the watch.
+ */
+static void virtio_scsi_dataplane_unwatch_vq_bh(void *opaque)
+{
+    AioContext *ctx = qemu_get_current_aio_context();
+    VirtQueue *vq = opaque;
+
+    virtio_queue_aio_detach_host_notifier(vq, ctx);
+    event_notifier_set(virtio_queue_get_host_notifier(vq));
+}
+
 static void virtio_scsi_dataplane_stop_vq_bh(void *opaque)
 {
     AioContext *ctx = qemu_get_current_aio_context();
@@ -265,12 +280,15 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
         /*
          * drained_begin detached the handlers but left a diagnostic watch on
          * the request queues, and drained_end won't replace it once we are
-         * stopping. Take it off before the notifiers are cleaned up.
+         * stopping. Take it off in the queue's own context, so it is not
+         * still running when the notifier is cleaned up.
          */
         for (i = VIRTIO_SCSI_VQ_NUM_FIXED;
              i < vs->conf.num_queues + VIRTIO_SCSI_VQ_NUM_FIXED; i++) {
-            virtio_queue_aio_detach_host_notifier(
-                virtio_get_queue(&vs->parent_obj, i), s->vq_aio_context[i]);
+            VirtQueue *vq = virtio_get_queue(&vs->parent_obj, i);
+
+            aio_wait_bh_oneshot(s->vq_aio_context[i],
+                                virtio_scsi_dataplane_unwatch_vq_bh, vq);
         }
     }
 
