@@ -1451,6 +1451,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                         err_node=f"lerr{tag}", dev_id=f"lun{tag}",
                         serial=f"TL{tag}"))
         total_luns = len(lun_specs)
+        err_nodes = [s.err_node for s in lun_specs]
 
         # See IO_PROBE_MARGIN_S above: the probe window has to span a full
         # duty cycle, not just a few seconds, or it will unpredictably land
@@ -1561,7 +1562,6 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # safety net for scheduling slop, not the main defense -- getting
         # this wrong would abort an unattended multi-hour run before it even
         # starts, so don't rely on luck here.
-        err_nodes = [s.err_node for s in lun_specs]
         total_wps = 0.0
         wps_per_lun: dict = {}
         broke_in_preflight = False
@@ -1783,6 +1783,18 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     except Exception as exc:
         result["outcome"] = "error"
         result["error"] = str(exc)
+        # A ring that breaks before the soak loop watches for it -- during
+        # writer launch, say -- pauses the VM, and what fails is the agent
+        # call stuck behind the pause. Dump it anyway: a paused guest is
+        # still exactly as the break left it.
+        if qmp is not None and proc is not None and proc.poll() is None:
+            if qemu_stderr is None:
+                qemu_stderr = QemuStderr(qemu_log_path)
+            record_trace()
+            try:
+                dump_if_stopped_on_broken()
+            except Exception as dump_exc:
+                result["break_dump_error"] = repr(dump_exc)
         result["elapsed_s"] = time.monotonic() - start
         return result
 
