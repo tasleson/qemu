@@ -161,6 +161,8 @@ struct VirtQueue
 
     /* What the chain looked like when the ring was declared broken */
     VirtQueueChainPeek *chain_error;
+    /* See virtio_queue_aio_attach_host_notifier_watch() */
+    VirtQueueWatchFn *watch;
 };
 
 const char *virtio_device_names[] = {
@@ -4413,6 +4415,34 @@ void virtio_queue_aio_detach_host_notifier(VirtQueue *vq, AioContext *ctx)
      * we potentially re-attach it.  The attach_host_notifier functions will
      * ensure that notifications are enabled again when they are needed.
      */
+}
+
+static void virtio_queue_host_notifier_watch_read(EventNotifier *n)
+{
+    VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
+
+    if (event_notifier_test_and_clear(n) && vq->watch) {
+        vq->watch(vq->vdev, vq);
+    }
+}
+
+/*
+ * Attach a notifier handler that only observes: each guest kick calls
+ * @watch, and nothing is popped. For a device that has detached its queue
+ * handlers (during a drain, say) but still wants to see what the guest
+ * publishes while they are gone. Notifications are enabled here; with
+ * VIRTIO_RING_F_EVENT_IDX, @watch has to re-arm them (by calling
+ * virtio_queue_set_notification(vq, 1)) or the guest stops kicking after the
+ * first one. Replace it with virtio_queue_aio_attach_host_notifier(), which
+ * kicks the queue so whatever was published meanwhile is processed.
+ */
+void virtio_queue_aio_attach_host_notifier_watch(VirtQueue *vq, AioContext *ctx,
+                                                 VirtQueueWatchFn *watch)
+{
+    vq->watch = watch;
+    virtio_queue_set_notification(vq, 1);
+    aio_set_event_notifier(ctx, &vq->host_notifier,
+                           virtio_queue_host_notifier_watch_read, NULL, NULL);
 }
 
 void virtio_queue_host_notifier_read(EventNotifier *n)
