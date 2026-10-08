@@ -276,7 +276,7 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
             AioContext *ctx = s->vq_aio_context[i];
             aio_wait_bh_oneshot(ctx, virtio_scsi_dataplane_stop_vq_bh, vq);
         }
-    } else {
+    } else if (s->diag) {
         /*
          * drained_begin detached the handlers but left a diagnostic watch on
          * the request queues, and drained_end won't replace it once we are

@@ -116,6 +116,14 @@ struct VirtIOSCSI {
      * failing request can be dumped before it moves on.
      */
     bool stop_on_broken;
+    /*
+     * x-diag=off turns off everything below that runs while the device is
+     * healthy -- per-request tracking, TMF and drain snapshots, and the
+     * drain watch, which changes how the guest kicks during a drain -- so
+     * its own effect on timing can be measured. The core's capture of the
+     * chain a ring broke on stays.
+     */
+    bool diag;
     QemuMutex diag_lock;            /* protects everything below */
     uint32_t tmf_seq;               /* TMFs seen, numbers each snapshot */
     struct VirtIOSCSIDiagQueue *diag_queues; /* one per request queue */
