@@ -24,6 +24,7 @@
 #include "qemu/module.h"
 #include "system/block-backend.h"
 #include "system/dma.h"
+#include "system/runstate.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"
@@ -190,6 +191,8 @@ typedef struct VirtIOSCSIDiagQueue {
     uint32_t num;
     VirtIOSCSISnapshot *snap;   /* num entries, indexed by pos % num */
 } VirtIOSCSIDiagQueue;
+
+static bool virtio_scsi_stopped_on_broken;
 
 static uint64_t virtio_scsi_peek_tag(const VirtQueueChainPeek *p)
 {
@@ -418,8 +421,8 @@ static void virtio_scsi_diag_trace_before(VirtIOSCSI *s, uint32_t queue,
 }
 
 /*
- * @vq just broke the device. Say what the failing entry looked like when
- * it was published, compared to now.
+ * @vq just broke the device. Stop the VM if asked, then say what the
+ * failing entry looked like when it was published, compared to now.
  */
 static void virtio_scsi_diag_broken(VirtIOSCSI *s, VirtQueue *vq)
 {
@@ -431,6 +434,13 @@ static void virtio_scsi_diag_broken(VirtIOSCSI *s, VirtQueue *vq)
     bool head_inflight = false;
     uint32_t tmf_seq;
     uint64_t overlaps;
+
+    if (s->stop_on_broken && !qatomic_xchg(&virtio_scsi_stopped_on_broken,
+                                           true)) {
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(RUN_STATE_PAUSED);
+        trace_virtio_scsi_stop_on_broken(bus, queue);
+    }
 
     have_chain = virtqueue_get_chain_error(vq, &now);
     WITH_QEMU_LOCK_GUARD(&s->diag_lock) {
@@ -1867,6 +1877,7 @@ static const Property virtio_scsi_properties[] = {
             parent_obj.conf.iothread_vq_mapping_list),
     DEFINE_PROP_UINT32("x-tmf-delay-ms", VirtIOSCSI, tmf_delay_ms, 0),
     DEFINE_PROP_UINT32("x-tmf-delay-count", VirtIOSCSI, tmf_delay_count, 0),
+    DEFINE_PROP_BOOL("x-stop-on-broken", VirtIOSCSI, stop_on_broken, false),
 };
 
 static const VMStateDescription vmstate_virtio_scsi = {
