@@ -122,7 +122,8 @@ struct VirtIOSCSI {
     GHashTable *inflight_buf;       /* command header GPA -> VirtIOSCSIReq */
     GHashTable *inflight_head;      /* queue << 16 | head -> VirtIOSCSIReq */
     uint64_t overlaps;              /* see virtio_scsi_diag_track() */
-    uint32_t drain_kicks;           /* guest kicks seen during this drain */
+    uint32_t drain_kicks;           /* kicks seen during this drain; may
+                                       include drained_begin's own */
     uint32_t drain_new;             /* positions first seen during it */
 };
 
