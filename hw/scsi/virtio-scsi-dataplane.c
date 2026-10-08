@@ -261,6 +261,17 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
             AioContext *ctx = s->vq_aio_context[i];
             aio_wait_bh_oneshot(ctx, virtio_scsi_dataplane_stop_vq_bh, vq);
         }
+    } else {
+        /*
+         * drained_begin detached the handlers but left a diagnostic watch on
+         * the request queues, and drained_end won't replace it once we are
+         * stopping. Take it off before the notifiers are cleaned up.
+         */
+        for (i = VIRTIO_SCSI_VQ_NUM_FIXED;
+             i < vs->conf.num_queues + VIRTIO_SCSI_VQ_NUM_FIXED; i++) {
+            virtio_queue_aio_detach_host_notifier(
+                virtio_get_queue(&vs->parent_obj, i), s->vq_aio_context[i]);
+        }
     }
 
     blk_drain_all(); /* ensure there are no in-flight requests */
