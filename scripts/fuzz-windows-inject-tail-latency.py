@@ -1385,7 +1385,8 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
                             qemu_pid: int, run_dir: Path, lun_specs: list,
                             err_nodes: list, launched: int, probe_s: float,
                             writer_exe: Optional[str], screenshot: Path,
-                            dump_path: Path) -> str:
+                            dump_path: Path, dump_at_failure: bool = False
+                            ) -> str:
     """Record why the guest agent stopped answering a writer launch, into
     diag, calling persist() after each step. Returns a one-line summary.
 
@@ -1399,6 +1400,13 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
     completing writes is stuck. A dump is only worth its cost in that
     last case.
 
+    dump_at_failure dumps before the probe instead, while the agent is
+    still silent: a recovering agent otherwise never gets dumped at all,
+    and what it was blocked on is gone by the time it answers. The probe
+    then follows a VM stop with the delay rules removed, so it no longer
+    watches the same workload. There is no second dump unless that one
+    failed and the agent then stays silent.
+
     Stops early if the VM pauses (x-stop-on-broken at a ring break) and
     sets diag["vm_paused"]; the caller owns that dump."""
     t0 = time.monotonic()
@@ -1411,6 +1419,42 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
     diag["writers_launched"] = launched
     diag["probe_s"] = probe_s
     persist()
+    dump_phrase = ""
+    if dump_at_failure:
+        # Set first: the dump removes the rules before it can fail.
+        diag["delay_rules_removed"] = True
+        diag["dump_at"] = "failure"
+        persist()
+        # So that a file found afterwards is this dump's (it would replace
+        # it anyway, but only once past removing the rules).
+        dump_path.unlink(missing_ok=True)
+        try:
+            diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid,
+                                                 err_nodes)
+        except Exception as exc:
+            # A QMP timeout gets through try_dump_guest_memory. The probe's
+            # pings don't need QMP, so don't lose them to it.
+            diag["dump"] = False
+            diag["dump_error"] = repr(exc)
+        # QEMU creates the file as the dump starts, and stops the VM for
+        # it, so a file left behind means the probe follows a stop even
+        # if the dump then failed.
+        stopped = diag["dump"] or dump_path.exists()
+        diag["probe_after_dump"] = stopped
+        persist()
+        if diag["dump"]:
+            dump_phrase = (f"; guest memory dump at the failure saved to "
+                           f"{dump_path}, so the probe followed a VM stop "
+                           f"without the delay rules")
+        elif stopped:
+            dump_phrase = ("; guest memory dump at the failure started but "
+                           "failed, so the probe followed a VM stop without "
+                           "the delay rules")
+        else:
+            why = diag.get("dump_error", "refused or never started")
+            dump_phrase = (f"; guest memory dump at the failure failed "
+                           f"({why}); the delay rules may still have been "
+                           f"removed")
 
     adapters = sorted({f"scsi{s.adapter}" for s in lun_specs})
     writes = dict.fromkeys(adapters, 0)
@@ -1468,7 +1512,8 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
             agent_back_s = sample["t_s"]
         if sample["vm"] == "paused":
             diag["vm_paused"] = True
-            return f"VM paused {sample['t_s']:.0f}s after the failed launch"
+            return (f"VM paused {sample['t_s']:.0f}s after the failed "
+                    f"launch{dump_phrase}")
     diag["agent_answered_after_s"] = agent_back_s
     diag["lun_writes"] = writes
     diag["lun_writes_complete"] = complete
@@ -1484,7 +1529,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
             return (f"guest agent answered {agent_back_s:.0f}s after "
                     f"the failed launch; {writes_phrase}; writer processes "
                     f"not counted (PowerShell writers look like any other "
-                    f"PowerShell process)")
+                    f"PowerShell process){dump_phrase}")
         count = count_guest_processes(qga_sock, writer_exe)
         diag["writer_processes"] = count
         persist()
@@ -1493,14 +1538,21 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
                    f"{count} {name} process(es) running")
         return (f"guest agent answered {agent_back_s:.0f}s after the "
                 f"failed launch; {writes_phrase}; {counted}, {launched} "
-                f"launched")
+                f"launched{dump_phrase}")
 
     # Before the dump, which stops the VM and drains everything.
     end_stacks = run_dir / "launch-failure-stacks-end.txt"
     capture_qemu_stacks(qemu_pid, end_stacks)
     diag["stacks_end"] = str(end_stacks)
+    if diag.get("dump"):
+        persist()
+        return (f"guest agent silent for the whole {probe_s:.0f}s probe; "
+                f"{writes_phrase}{dump_phrase}")
+    # No dump yet, or the one at the failure didn't complete: an agent
+    # that never came back is the case a dump is for, so try (again) now.
     # Set first: the dump removes the rules before it can fail.
     diag["delay_rules_removed"] = True
+    diag["dump_at"] = "end"
     persist()
     diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid, err_nodes)
     persist()
@@ -1523,7 +1575,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              iothreads: Optional[int] = None,
              tmf_trace: bool = True,
              stop_on_broken: bool = True,
-             ring_diag: bool = True) -> dict:
+             ring_diag: bool = True,
+             dump_on_agent_stall: bool = False) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1678,16 +1731,21 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             diag["no_reply_stage"] = no_reply_stage
         probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
         how = f"{reason} at {no_reply_stage}" if no_reply_stage else reason
+        # Only for an agent that went quiet: a deadline that ran out on a
+        # slow but answering agent has nothing stuck to catch.
+        dump_now = dump_on_agent_stall and reason == "no-reply"
         print(f"    writer launch failed ({how}) at {failed_at}; capturing "
-              f"QEMU stacks and watching the guest agent and LUNs for "
-              f"{probe_s:.0f}s", file=sys.stderr)
+              f"QEMU stacks{', dumping guest memory' if dump_now else ''} "
+              f"and watching the guest agent and LUNs for {probe_s:.0f}s",
+              file=sys.stderr)
         writer_exe = {"diskspd": diskspd_path, "fio": fio_path}.get(io_driver)
         try:
             summary = diagnose_launch_failure(
                 diag,
                 lambda: write_status({"elapsed_s": time.monotonic() - start}),
                 qmp, qga_sock, proc.pid, run_dir, lun_specs, err_nodes,
-                len(writer_pids), probe_s, writer_exe, screenshot, dump_path)
+                len(writer_pids), probe_s, writer_exe, screenshot, dump_path,
+                dump_now)
         finally:
             # Even if the dump failed part way: it removes the rules first.
             if diag.get("delay_rules_removed"):
@@ -1736,6 +1794,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "tmf_trace": tmf_trace,
                 "stop_on_broken": stop_on_broken,
                 "ring_diag": ring_diag,
+                "dump_on_agent_stall": dump_on_agent_stall,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -2161,6 +2220,16 @@ def main() -> int:
                           "--no-ring-diag (x-diag=off) leaves only the "
                           "chain captured at a break, to A/B their effect "
                           "on timing (default: on)")
+    ap.add_argument("--dump-on-agent-stall",
+                     action=argparse.BooleanOptionalAction, default=False,
+                     help="when the guest agent never answers a writer "
+                          "launch, dump guest memory to crash.dmp right "
+                          "away, while it is still stuck, rather than only "
+                          "if it stays silent for the whole probe. The guest "
+                          "is paused for the dump (minutes, 8+ GB in the run "
+                          "dir) and the dump removes the delay rules, so the "
+                          "probe that follows no longer sees the same "
+                          "workload (default: off)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -2296,7 +2365,8 @@ def main() -> int:
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
                        args.disk_dir, args.iothreads, args.tmf_trace,
-                       args.stop_on_broken, args.ring_diag)
+                       args.stop_on_broken, args.ring_diag,
+                       args.dump_on_agent_stall)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
