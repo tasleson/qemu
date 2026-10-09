@@ -57,8 +57,8 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PureWindowsPath
 from typing import Any, Optional
 
 QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
@@ -133,6 +133,14 @@ IO_PROBE_ATTEMPTS = 2  # retries before declaring "no-io", in case the first
                        # window's timing was unlucky (e.g. a slow QMP round
                        # trip stretching it right to the edge of a cycle)
 MIN_WRITE_OPS_PER_S = 2.0
+
+# After a writer launch the agent never answered, keep watching for this many
+# I/O probe windows (each one a full hold cycle, see IO_PROBE_MARGIN_S) before
+# calling the agent gone. Shorter, and LUNs that happen to sit in a hold the
+# whole time look exactly like a main loop that has stopped servicing them.
+LAUNCH_PROBE_CYCLES = 2
+LAUNCH_PROBE_INTERVAL_S = 5.0  # between pings; each also samples the LUNs
+WRITER_COUNT_TIMEOUT_S = 60  # counting writer processes once the agent is back
 
 WRITER_WINDOW_BYTES = 32 * 1024 * 1024
 WRITER_BLOCK_BYTES = 64 * 1024
@@ -269,13 +277,17 @@ class GuestExecError(RuntimeError):
     """
 
 
+class NoReplyError(GuestExecError):
+    """The agent never answered: the second case above."""
+
+
 def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
              timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
     resp = qga_call(sock_path, "guest-exec",
                      {"path": path, "arg": args, "capture-output": capture},
                      timeout=timeout)
     if resp is None:
-        raise GuestExecError(
+        raise NoReplyError(
             f"guest-exec ({what}): no reply from the guest agent within "
             f"{timeout:.0f}s while asking it to run {path!r}. The agent's "
             f"virtio-serial channel is serviced from QEMU's main loop, so a "
@@ -1300,6 +1312,168 @@ def held_counts(qmp, err_nodes: list) -> dict:
     return out
 
 
+def count_guest_processes(qga_sock: Path, exe_path: str,
+                          timeout: float = WRITER_COUNT_TIMEOUT_S
+                          ) -> Optional[int]:
+    """How many processes the guest is running from exe_path's image name,
+    or None if the agent could not say."""
+    name = PureWindowsPath(exe_path).stem.replace("'", "''")
+    script = f"@(Get-Process -Name '{name}' -ErrorAction SilentlyContinue).Count"
+    try:
+        pid = ps_exec(qga_sock, f"count of {name} processes", script,
+                      capture=True, timeout=timeout)
+    except GuestExecError:
+        return None
+    status = qga_exec_wait(qga_sock, pid, timeout)
+    if status is None:
+        return None
+    try:
+        return int(b64_text(status.get("out-data")).strip())
+    except ValueError:
+        return None
+
+
+def _lun_writes_phrase(writes: dict, complete: bool) -> str:
+    # "With writes", not "live": an adapter that stopped popping still
+    # completes the requests it had in the inject-error hold.
+    with_writes = sum(1 for n in writes.values() if n)
+    phrase = (f"{sum(writes.values())} LUN writes completed meanwhile, with "
+              f"writes on {with_writes}/{len(writes)} adapter(s)")
+    if not complete:
+        phrase += " (some query-blockstats samples failed)"
+    return phrase
+
+
+def _covers_luns(wops: dict, lun_specs: list) -> bool:
+    """Whether a write_ops_by_node() sample can be trusted for a delta.
+
+    It swallows QMP failures per view, and only the device view carries a
+    LUN's accounting -- the node view's wr_operations is 0 -- so a sample
+    whose device-view query failed comes back non-empty and all zero.
+    That reads as "no I/O", and makes the next good sample look like
+    every write since boot."""
+    return all(s.dev_id in wops for s in lun_specs)
+
+
+def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
+                            qemu_pid: int, run_dir: Path, lun_specs: list,
+                            err_nodes: list, launched: int, probe_s: float,
+                            writer_exe: Optional[str], screenshot: Path,
+                            dump_path: Path) -> str:
+    """Record why the guest agent stopped answering a writer launch, into
+    diag, calling persist() after each step. Returns a one-line summary.
+
+    "No reply" has three causes that look identical from the host: QEMU's
+    main loop not servicing the agent's chardev -- for one, while it sits
+    in a TMF drain, which nests across adapters -- a guest too starved to
+    schedule qemu-ga for a while, or qemu-ga / virtio-serial stuck for
+    good. QEMU's stacks at the failure show the first. A ping loop that
+    also watches the LUNs separates the other two: an agent that comes
+    back was starved, one that stays silent while the LUNs keep
+    completing writes is stuck. A dump is only worth its cost in that
+    last case.
+
+    Stops early if the VM pauses (x-stop-on-broken at a ring break) and
+    sets diag["vm_paused"]; the caller owns that dump."""
+    t0 = time.monotonic()
+    stacks = run_dir / "launch-failure-stacks.txt"
+    # gdb's attach stops every QEMU thread, vCPUs included, so the first
+    # probe sample follows a brief freeze of the whole VM.
+    capture_qemu_stacks(qemu_pid, stacks)
+    diag["stacks"] = str(stacks)
+    diag["screenshot"] = screendump_hash(qmp, screenshot) is not None
+    diag["writers_launched"] = launched
+    diag["probe_s"] = probe_s
+    persist()
+
+    adapters = sorted({f"scsi{s.adapter}" for s in lun_specs})
+    writes = dict.fromkeys(adapters, 0)
+    complete = True
+    samples: list = []
+    diag["probe"] = samples
+    agent_back_s: Optional[float] = None
+    prev: Optional[dict] = write_ops_by_node(qmp)
+    if not _covers_luns(prev, lun_specs):
+        prev = None
+    # From here, not t0: the stacks alone can take minutes, and probe_s is
+    # what the summary claims was watched.
+    deadline = time.monotonic() + probe_s
+    while agent_back_s is None and time.monotonic() < deadline:
+        time.sleep(LAUNCH_PROBE_INTERVAL_S)
+        ping_t = time.monotonic()
+        agent = qga_ping(qga_sock, AGENT_CHECK_TIMEOUT_S)
+        rtt = round(time.monotonic() - ping_t, 2) if agent else None
+        cur = write_ops_by_node(qmp)
+        sample: dict = {"t_s": round(time.monotonic() - t0, 1), "agent": agent,
+                        "agent_rtt_s": rtt}
+        if not _covers_luns(cur, lun_specs):
+            complete = False
+            sample["lun_writes"] = None
+        else:
+            if prev is None:
+                complete = False  # nothing to diff against yet
+                sample["lun_writes"] = None
+            else:
+                step = dict.fromkeys(adapters, 0)
+                for spec in lun_specs:
+                    step[f"scsi{spec.adapter}"] += lun_write_delta(prev, cur, spec)
+                for a, n in step.items():
+                    writes[a] += n
+                sample["lun_writes"] = step
+            prev = cur
+        try:
+            sample["vm"] = (qmp_call(qmp, "query-status") or {}).get("status")
+        except Exception as exc:
+            sample["vm"] = f"query-status failed: {exc!r}"
+        samples.append(sample)
+        diag["lun_writes"] = writes
+        diag["lun_writes_complete"] = complete
+        persist()
+        if agent:
+            agent_back_s = sample["t_s"]
+        if sample["vm"] == "paused":
+            diag["vm_paused"] = True
+            return f"VM paused {sample['t_s']:.0f}s after the failed launch"
+    diag["agent_answered_after_s"] = agent_back_s
+    diag["lun_writes"] = writes
+    diag["lun_writes_complete"] = complete
+    writes_phrase = _lun_writes_phrase(writes, complete)
+
+    if agent_back_s is not None:
+        # One more writer running than launch_writer() returned a pid for
+        # means the unanswered guest-exec did reach the agent, and only
+        # its reply was lost.
+        if writer_exe is None:
+            diag["writer_processes"] = None
+            persist()
+            return (f"guest agent answered {agent_back_s:.0f}s after "
+                    f"the failed launch; {writes_phrase}; writer processes "
+                    f"not counted (PowerShell writers look like any other "
+                    f"PowerShell process)")
+        count = count_guest_processes(qga_sock, writer_exe)
+        diag["writer_processes"] = count
+        persist()
+        name = PureWindowsPath(writer_exe).name
+        counted = ("could not count them" if count is None else
+                   f"{count} {name} process(es) running")
+        return (f"guest agent answered {agent_back_s:.0f}s after the "
+                f"failed launch; {writes_phrase}; {counted}, {launched} "
+                f"launched")
+
+    # Before the dump, which stops the VM and drains everything.
+    end_stacks = run_dir / "launch-failure-stacks-end.txt"
+    capture_qemu_stacks(qemu_pid, end_stacks)
+    diag["stacks_end"] = str(end_stacks)
+    # Set first: the dump removes the rules before it can fail.
+    diag["delay_rules_removed"] = True
+    persist()
+    diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid, err_nodes)
+    persist()
+    return (f"guest agent silent for the whole {probe_s:.0f}s probe; "
+            f"{writes_phrase}; guest memory dump "
+            f"{'saved to ' + str(dump_path) if diag['dump'] else 'failed'}")
+
+
 # ------------------------------------------------------------------
 # Harness
 # ------------------------------------------------------------------
@@ -1435,6 +1609,54 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                   file=sys.stderr)
             capture_postmortem()
 
+    def utc_now() -> str:
+        # The format of qemu.log's trace timestamps, to line up against them.
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def diagnose_failed_launch(reason: str, drive_no: Optional[int] = None,
+                               request_sent_at: Optional[str] = None) -> None:
+        # Never let the diagnostics replace the failure they explain.
+        try:
+            diagnose_failed_launch_unguarded(reason, drive_no, request_sent_at)
+        except Exception as exc:
+            result["launch_failure_error"] = repr(exc)
+            print(f"    launch-failure diagnostics failed: {exc!r}",
+                  file=sys.stderr)
+
+    def diagnose_failed_launch_unguarded(reason: str, drive_no: Optional[int],
+                                         request_sent_at: Optional[str]) -> None:
+        failed_at = utc_now()
+        # A ring break pauses the VM, and that is the whole reason the agent
+        # went quiet; the dump taken at the break is what matters.
+        if dump_if_stopped_on_broken():
+            return
+        diag = result["launch_failure"] = {"reason": reason,
+                                           "failed_at": failed_at}
+        if reason == "no-reply":
+            # request_sent_at..failed_at is the window to hold against the
+            # TMF/drain timestamps in qemu.log.
+            diag["writer"] = f"PhysicalDrive{drive_no}"
+            diag["request_sent_at"] = request_sent_at
+        probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
+        print(f"    writer launch failed ({reason}) at {failed_at}; capturing "
+              f"QEMU stacks and watching the guest agent and LUNs for "
+              f"{probe_s:.0f}s", file=sys.stderr)
+        writer_exe = {"diskspd": diskspd_path, "fio": fio_path}.get(io_driver)
+        try:
+            summary = diagnose_launch_failure(
+                diag,
+                lambda: write_status({"elapsed_s": time.monotonic() - start}),
+                qmp, qga_sock, proc.pid, run_dir, lun_specs, err_nodes,
+                len(writer_pids), probe_s, writer_exe, screenshot, dump_path)
+        finally:
+            # Even if the dump failed part way: it removes the rules first.
+            if diag.get("delay_rules_removed"):
+                result["delay_rules_removed"] = True
+        diag["summary"] = summary
+        print(f"    {summary}", file=sys.stderr)
+        if diag.get("vm_paused"):
+            dump_if_stopped_on_broken()
+
     try:
         make_overlay(BOOT_DISK, boot_overlay)
         make_overlay(OVMF_VARS, vars_overlay)
@@ -1546,11 +1768,20 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         for spec in lun_specs:
             drive_no = drive_numbers[spec.serial]
             if time.monotonic() > launch_deadline:
+                diagnose_failed_launch("deadline")
                 raise RuntimeError(
                     f"only got {len(writer_pids)} of {total_luns} writer(s) "
                     f"started within {WRITER_LAUNCH_TIMEOUT_S}s")
-            writer_pids.append(launch_writer(qga_sock, drive_no, writer_duration,
-                                              io_driver, diskspd_path, fio_path))
+            # A refused guest-exec answered, so it fails as before: the
+            # diagnostics are for an agent that went quiet.
+            request_sent_at = utc_now()
+            try:
+                writer_pids.append(launch_writer(qga_sock, drive_no,
+                                                  writer_duration, io_driver,
+                                                  diskspd_path, fio_path))
+            except NoReplyError:
+                diagnose_failed_launch("no-reply", drive_no, request_sent_at)
+                raise
 
         time.sleep(WARMUP_S)
 
