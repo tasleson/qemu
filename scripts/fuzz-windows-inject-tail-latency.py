@@ -98,7 +98,8 @@ BOOT_TIMEOUT_S = 180
 # Generous on purpose: at high LUN counts the agent can take a long while to
 # answer -- 30s was enough to abort a 75-LUN run during writer ramp-up --
 # and a timeout here ends the run. Why it goes quiet is not settled; see
-# NoReplyError and the launch-failure diagnostics. WRITER_LAUNCH_
+# NoReplyError and the launch-failure diagnostics. A sync that goes
+# unechoed is resent within this (QGA_SYNC_RESEND_S). WRITER_LAUNCH_
 # TIMEOUT_S, not this, is what bounds an unattended run: a genuinely dead
 # guest must not cost 75 x this before the harness gives up.
 GUEST_EXEC_TIMEOUT_S = 120
@@ -200,39 +201,86 @@ def _qga_request(execute: str, arguments: Optional[dict] = None) -> bytes:
     return (json.dumps(msg) + "\n").encode()
 
 
-def _qga_replies(s: socket.socket, deadline: float):
-    """Yield each reply the agent sends on the socket until the deadline."""
-    buf = b""
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        s.settimeout(remaining)
-        try:
-            chunk = s.recv(65536)
-        except socket.timeout:
-            return
-        if not chunk:
-            return
-        # The sentinel only marks where a reply starts, so treating it as
-        # a line break also throws away any half-written stale reply.
-        buf += chunk.replace(QGA_SENTINEL, b"\n")
-        *lines, buf = buf.split(b"\n")
-        for line in lines:
+# A sync the agent never saw -- run-1791557706 lost one about 10s after the
+# boot ping had answered, with no load on the guest at all -- would
+# otherwise cost the call its whole timeout. After this long without an
+# echo, send another. Only ever the sync: the command that follows it may
+# not be idempotent (guest-exec isn't).
+QGA_SYNC_RESEND_S = 5.0
+
+
+def utc_now() -> str:
+    # The format of qemu.log's trace timestamps, to line up against them.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+@dataclasses.dataclass
+class QgaSync:
+    """How the guest-sync-delimited ahead of one agent command went."""
+    syncs_sent: int = 0
+    # From the first sync sent to the first echo of any of ours, or None.
+    first_echo_s: Optional[float] = None
+    # The first echo was for a sync we had already resent: that one was
+    # slow, not lost.
+    first_echo_stale: bool = False
+
+    def slow(self) -> bool:
+        return (self.syncs_sent > 1 or (self.first_echo_s is not None and
+                                        self.first_echo_s > QGA_SYNC_RESEND_S))
+
+    def describe(self) -> str:
+        echo = ("no echo" if self.first_echo_s is None else
+                f"first echo after {self.first_echo_s:.1f}s"
+                + (" (for an earlier sync)" if self.first_echo_stale else ""))
+        return f"{self.syncs_sent} sync(s) sent, {echo}"
+
+
+class _QgaReplies:
+    """The agent's replies on one connection, read up to a caller-chosen
+    point in time, so the sync can give up waiting and resend."""
+
+    def __init__(self, s: socket.socket):
+        self.s = s
+        self.buf = b""
+        self.pending: collections.deque = collections.deque()
+        self.eof = False
+
+    def next(self, until: float) -> Optional[dict]:
+        while not self.pending:
+            remaining = until - time.monotonic()
+            if self.eof or remaining <= 0:
+                return None
+            self.s.settimeout(remaining)
             try:
-                resp = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(resp, dict) and ("return" in resp or "error" in resp):
-                yield resp
+                chunk = self.s.recv(65536)
+            except socket.timeout:
+                return None
+            if not chunk:
+                self.eof = True
+                return None
+            # The sentinel only marks where a reply starts, so treating it
+            # as a line break also throws away any half-written stale reply.
+            self.buf += chunk.replace(QGA_SENTINEL, b"\n")
+            *lines, self.buf = self.buf.split(b"\n")
+            for line in lines:
+                try:
+                    resp = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(resp, dict) and ("return" in resp or
+                                               "error" in resp):
+                    self.pending.append(resp)
+        return self.pending.popleft()
 
 
 def _qga_call(sock_path: Path, execute: str, arguments: Optional[dict],
-              timeout: float) -> tuple[Optional[dict], Optional[str]]:
-    """Run one guest agent command: (reply, None), or (None, stage) where
-    stage is how far it got -- "connect" (the socket could not be reached),
-    "sync" (no echo of our guest-sync-delimited, so the command was never
-    sent) or "command" (synced, but the command itself got no reply).
+              timeout: float
+              ) -> tuple[Optional[dict], Optional[str], QgaSync]:
+    """Run one guest agent command: (reply, None, sync), or (None, stage,
+    sync) where stage is how far it got -- "connect" (the socket could not
+    be reached), "sync" (no echo of any guest-sync-delimited we sent, so
+    the command was never sent) or "command" (synced, but the command
+    itself got no reply). sync says how the synchronization went.
 
     The agent's virtio-serial channel outlives our connection: a reply to
     a request whose client gave up -- timed out, or asked while the VM was
@@ -241,29 +289,65 @@ def _qga_call(sock_path: Path, execute: str, arguments: Optional[dict],
     guest-sync-delimited, as the agent's protocol asks, and drop
     everything up to the echo of our own token. The agent answers in
     order, so the next reply after that is ours.
+
+    A sync with no echo after QGA_SYNC_RESEND_S is resent with a fresh
+    token, while the timeout leaves a resend the time to be answered. Only
+    the echo of the latest token counts as synced: each earlier sync, and
+    the parse error each sentinel draws, gets its own reply first, and any
+    of those would be taken for the command's. Once an echo of ours shows
+    how long the agent takes to answer, the latest sync is given that long
+    on top before it counts as lost -- so an agent that is merely slow is
+    waited on, not chased with ever more syncs, while one that dropped the
+    latest sync after answering an earlier one still gets another.
     """
     deadline = time.monotonic() + timeout
-    token = random.getrandbits(63)
+    sync = QgaSync()
+    tokens: list = []
     stage = "connect"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(str(sock_path))
             stage = "sync"
-            replies = _qga_replies(s, deadline)
-            s.sendall(QGA_SENTINEL +
-                      _qga_request("guest-sync-delimited", {"id": token}))
-            for resp in replies:
-                if resp.get("return") == token:
-                    break
-            else:
-                return None, stage
+            replies = _QgaReplies(s)
+
+            sent_at: dict = {}  # token -> when it was sent
+
+            def send_sync() -> float:
+                tokens.append(random.getrandbits(63))
+                s.sendall(QGA_SENTINEL + _qga_request(
+                    "guest-sync-delimited", {"id": tokens[-1]}))
+                sync.syncs_sent += 1
+                sent_at[tokens[-1]] = time.monotonic()
+                return sent_at[tokens[-1]]
+
+            first_sent = last_sent = send_sync()
+            latency = 0.0  # of the most recent echo of ours, once there is one
+            while True:
+                resend_at = last_sent + latency + QGA_SYNC_RESEND_S
+                resending = resend_at + QGA_SYNC_RESEND_S <= deadline
+                resp = replies.next(resend_at if resending else deadline)
+                if resp is None:
+                    if replies.eof or time.monotonic() >= deadline:
+                        return None, stage, sync
+                    if resending:
+                        last_sent = send_sync()
+                    continue
+                ret = resp.get("return")
+                if isinstance(ret, int) and ret in sent_at:
+                    now = time.monotonic()
+                    latency = now - sent_at[ret]
+                    if sync.first_echo_s is None:
+                        sync.first_echo_s = round(now - first_sent, 1)
+                        sync.first_echo_stale = ret != tokens[-1]
+                    if ret == tokens[-1]:
+                        break
             stage = "command"
             s.sendall(_qga_request(execute, arguments))
-            resp = next(replies, None)
-            return resp, (None if resp is not None else stage)
+            resp = replies.next(deadline)
+            return resp, (None if resp is not None else stage), sync
     except (OSError, ConnectionError):
-        return None, stage
+        return None, stage, sync
 
 
 def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
@@ -292,34 +376,47 @@ class GuestExecError(RuntimeError):
 
 class NoReplyError(GuestExecError):
     """The agent never answered: the second case above. stage says how far
-    the request got (see _qga_call): at "sync" nothing at all came back
-    over the channel and the command never went out; at "command" the
-    channel worked both ways and only the command went unanswered."""
+    the request got (see _qga_call): at "sync" none of the syncs we sent
+    was echoed, so nothing came back over the channel and the command
+    never went out; at "command" the channel worked both ways and only
+    the command went unanswered. sync is how the synchronization went."""
 
-    def __init__(self, message: str, stage: str):
+    def __init__(self, message: str, stage: str, sync: QgaSync):
         super().__init__(message)
         self.stage = stage
+        self.sync = sync
 
 
 def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
-             timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
-    resp, stage = _qga_call(sock_path, "guest-exec",
-                            {"path": path, "arg": args,
-                             "capture-output": capture}, timeout)
+             timeout: float = GUEST_EXEC_TIMEOUT_S,
+             resyncs: Optional[list] = None) -> int:
+    """Run path in the guest and return its pid. A sync that needed
+    resending, or was slow to come back, is reported on stderr and
+    appended to resyncs if given -- the call still worked, but that is
+    the stall the resend exists for, and how long it lasted."""
+    resp, stage, sync = _qga_call(sock_path, "guest-exec",
+                                  {"path": path, "arg": args,
+                                   "capture-output": capture}, timeout)
     if resp is None:
         if stage == "connect":
             why = (f"could not reach the guest agent's socket {sock_path}, "
                    f"so the request to run {path!r} was never sent")
         elif stage == "sync":
-            why = (f"the guest agent never answered the guest-sync-delimited "
-                   f"sent ahead of it within {timeout:.0f}s, so the request "
-                   f"to run {path!r} was never sent")
+            why = (f"the guest agent never answered any of the "
+                   f"{sync.syncs_sent} guest-sync-delimited sent ahead of it "
+                   f"over {timeout:.0f}s, so the request to run {path!r} was "
+                   f"never sent")
         else:
-            why = (f"the guest agent answered the sync but not the request "
-                   f"to run {path!r} within {timeout:.0f}s; it was sent, so "
-                   f"the process may have started and only the reply been "
-                   f"lost")
-        raise NoReplyError(f"guest-exec ({what}): {why}", stage)
+            why = (f"the guest agent answered the sync ({sync.describe()}) "
+                   f"but not the request to run {path!r} within "
+                   f"{timeout:.0f}s; it was sent, so the process may have "
+                   f"started and only the reply been lost")
+        raise NoReplyError(f"guest-exec ({what}): {why}", stage, sync)
+    if sync.slow():
+        print(f"    guest agent: {sync.describe()} ({what})", file=sys.stderr)
+        if resyncs is not None:
+            resyncs.append({"at": utc_now(), "request": what,
+                            **dataclasses.asdict(sync)})
     if "error" in resp:
         err = resp["error"] if isinstance(resp["error"], dict) else {}
         raise GuestExecError(
@@ -354,10 +451,11 @@ def encode_ps(script: str) -> str:
 
 
 def ps_exec(sock_path: Path, what: str, script: str, capture: bool,
-            timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
+            timeout: float = GUEST_EXEC_TIMEOUT_S,
+            resyncs: Optional[list] = None) -> int:
     args = ["-NoProfile", "-NonInteractive", "-EncodedCommand", encode_ps(script)]
     return qga_exec(sock_path, what, PS_EXE, args, capture=capture,
-                     timeout=timeout)
+                     timeout=timeout, resyncs=resyncs)
 
 
 # ------------------------------------------------------------------
@@ -456,9 +554,11 @@ def build_fio_args(drive_number: int, duration_s: float) -> list:
     ]
 
 
-def resolve_drive_numbers(qga_sock: Path, serials: list) -> dict:
+def resolve_drive_numbers(qga_sock: Path, serials: list,
+                          resyncs: Optional[list] = None) -> dict:
     pid = ps_exec(qga_sock, "resolve disk numbers",
-                   build_resolve_script(serials), capture=True)
+                   build_resolve_script(serials), capture=True,
+                   resyncs=resyncs)
     status = qga_exec_wait(qga_sock, pid, timeout=GUEST_EXEC_TIMEOUT_S)
     if status is None:
         raise RuntimeError("guest-exec (resolve disk numbers) timed out")
@@ -478,19 +578,20 @@ def resolve_drive_numbers(qga_sock: Path, serials: list) -> dict:
 def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                    io_driver: str = "powershell",
                    diskspd_path: str = DEFAULT_DISKSPD_PATH,
-                   fio_path: str = DEFAULT_FIO_PATH) -> int:
+                   fio_path: str = DEFAULT_FIO_PATH,
+                   resyncs: Optional[list] = None) -> int:
     what = f"writer for PhysicalDrive{drive_number}"
     if io_driver == "diskspd":
         return qga_exec(qga_sock, what, diskspd_path,
                          build_diskspd_args(drive_number, duration_s),
-                         capture=False)
+                         capture=False, resyncs=resyncs)
     if io_driver == "fio":
         return qga_exec(qga_sock, what, fio_path,
                          build_fio_args(drive_number, duration_s),
-                         capture=False)
+                         capture=False, resyncs=resyncs)
     return ps_exec(qga_sock, what,
                     build_writer_script(drive_number, duration_s),
-                    capture=False)
+                    capture=False, resyncs=resyncs)
 
 
 def diskspd_diagnostic(qga_sock: Path, diskspd_path: str, drive_number: int,
@@ -1476,8 +1577,8 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
         # and then sat on the ping ("command"). Any reply, even an error,
         # means both the channel and the agent work, so it counts as an
         # answer, and agent_stage None always means "answered".
-        resp, stage = _qga_call(qga_sock, "guest-ping", None,
-                                AGENT_CHECK_TIMEOUT_S)
+        resp, stage, _ = _qga_call(qga_sock, "guest-ping", None,
+                                   AGENT_CHECK_TIMEOUT_S)
         agent = resp is not None
         rtt = round(time.monotonic() - ping_t, 2) if agent else None
         cur = write_ops_by_node(qmp)
@@ -1697,17 +1798,13 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                   file=sys.stderr)
             capture_postmortem()
 
-    def utc_now() -> str:
-        # The format of qemu.log's trace timestamps, to line up against them.
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
     def diagnose_failed_launch(reason: str, drive_no: Optional[int] = None,
                                request_sent_at: Optional[str] = None,
-                               no_reply_stage: Optional[str] = None) -> None:
+                               no_reply: Optional[NoReplyError] = None) -> None:
         # Never let the diagnostics replace the failure they explain.
         try:
             diagnose_failed_launch_unguarded(reason, drive_no, request_sent_at,
-                                             no_reply_stage)
+                                             no_reply)
         except Exception as exc:
             result["launch_failure_error"] = repr(exc)
             print(f"    launch-failure diagnostics failed: {exc!r}",
@@ -1715,7 +1812,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
     def diagnose_failed_launch_unguarded(reason: str, drive_no: Optional[int],
                                          request_sent_at: Optional[str],
-                                         no_reply_stage: Optional[str]) -> None:
+                                         no_reply: Optional[NoReplyError]
+                                         ) -> None:
         failed_at = utc_now()
         # A ring break pauses the VM, and that is the whole reason the agent
         # went quiet; the dump taken at the break is what matters.
@@ -1728,9 +1826,10 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             # TMF/drain timestamps in qemu.log.
             diag["writer"] = f"PhysicalDrive{drive_no}"
             diag["request_sent_at"] = request_sent_at
-            diag["no_reply_stage"] = no_reply_stage
+            diag["no_reply_stage"] = no_reply.stage
+            diag["sync"] = dataclasses.asdict(no_reply.sync)
         probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
-        how = f"{reason} at {no_reply_stage}" if no_reply_stage else reason
+        how = f"{reason} at {no_reply.stage}" if no_reply else reason
         # Only for an agent that went quiet: a deadline that ran out on a
         # slow but answering agent has nothing stuck to catch.
         dump_now = dump_on_agent_stall and reason == "no-reply"
@@ -1854,8 +1953,13 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             result["elapsed_s"] = time.monotonic() - start
             return result
 
+        # Agent calls before the soak whose sync had to be resent, or was
+        # slow: each one is a stall the run survived. Published by
+        # reference, like writer_pids, so a later failure keeps them.
+        qga_resyncs: list = []
+        result["qga_resyncs"] = qga_resyncs
         serials = [s.serial for s in lun_specs]
-        drive_numbers = resolve_drive_numbers(qga_sock, serials)
+        drive_numbers = resolve_drive_numbers(qga_sock, serials, qga_resyncs)
         result["drive_numbers"] = drive_numbers
 
         writer_pids = []
@@ -1877,10 +1981,11 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             try:
                 writer_pids.append(launch_writer(qga_sock, drive_no,
                                                   writer_duration, io_driver,
-                                                  diskspd_path, fio_path))
+                                                  diskspd_path, fio_path,
+                                                  qga_resyncs))
             except NoReplyError as exc:
                 diagnose_failed_launch("no-reply", drive_no, request_sent_at,
-                                       exc.stage)
+                                       exc)
                 raise
 
         time.sleep(WARMUP_S)
