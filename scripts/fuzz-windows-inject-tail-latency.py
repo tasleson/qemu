@@ -135,10 +135,11 @@ IO_PROBE_ATTEMPTS = 2  # retries before declaring "no-io", in case the first
                        # trip stretching it right to the edge of a cycle)
 MIN_WRITE_OPS_PER_S = 2.0
 
-# After a writer launch the agent never answered, keep watching for this many
-# I/O probe windows (each one a full hold cycle, see IO_PROBE_MARGIN_S) before
-# calling the agent gone. Shorter, and LUNs that happen to sit in a hold the
-# whole time look exactly like a main loop that has stopped servicing them.
+# After an agent request before the soak (resolving drives, launching a
+# writer) went unanswered, keep watching for this many I/O probe windows
+# (each one a full hold cycle, see IO_PROBE_MARGIN_S) before calling the
+# agent gone. Shorter, and LUNs that happen to sit in a hold the whole time
+# look exactly like a main loop that has stopped servicing them.
 LAUNCH_PROBE_CYCLES = 2
 LAUNCH_PROBE_INTERVAL_S = 5.0  # between pings; each also samples the LUNs
 WRITER_COUNT_TIMEOUT_S = 60  # counting writer processes once the agent is back
@@ -379,12 +380,16 @@ class NoReplyError(GuestExecError):
     the request got (see _qga_call): at "sync" none of the syncs we sent
     was echoed, so nothing came back over the channel and the command
     never went out; at "command" the channel worked both ways and only
-    the command went unanswered. sync is how the synchronization went."""
+    the command went unanswered. sync is how the synchronization went, and
+    command the agent command that went unanswered: the guest-exec itself,
+    or a guest-exec-status poll while waiting for it."""
 
-    def __init__(self, message: str, stage: str, sync: QgaSync):
+    def __init__(self, message: str, stage: str, sync: QgaSync,
+                 command: str = "guest-exec"):
         super().__init__(message)
         self.stage = stage
         self.sync = sync
+        self.command = command
 
 
 def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
@@ -430,13 +435,38 @@ def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
     return pid
 
 
-def qga_exec_wait(sock_path: Path, pid: int, timeout: float) -> Optional[dict]:
-    deadline = time.monotonic() + timeout
+def qga_exec_wait(sock_path: Path, pid: int, timeout: float,
+                  silent_raises: Optional[str] = None) -> Optional[dict]:
+    """Poll guest-exec-status until pid exits; its status, or None.
+
+    None folds together a process still running and an agent that stopped
+    answering the polls. With silent_raises -- the request's name, for the
+    message -- a wait that ends on the second, the last poll unanswered and
+    none answered for AGENT_SILENCE_THRESHOLD_S, raises NoReplyError
+    instead, so it can be diagnosed like an unanswered guest-exec. An agent
+    that kept saying "not exited" still gets None."""
+    start = time.monotonic()
+    deadline = start + timeout
+    last_answer = start  # the guest-exec that started pid was answered
+    stage: Optional[str] = None
+    sync = QgaSync()
     while time.monotonic() < deadline:
-        resp = qga_call(sock_path, "guest-exec-status", {"pid": pid}, timeout=5.0)
-        if resp and "return" in resp and resp["return"].get("exited"):
-            return resp["return"]
+        resp, stage, sync = _qga_call(sock_path, "guest-exec-status",
+                                      {"pid": pid}, 5.0)
+        if resp is not None:
+            last_answer = time.monotonic()
+            if "return" in resp and resp["return"].get("exited"):
+                return resp["return"]
         time.sleep(0.3)
+    silent_s = time.monotonic() - last_answer
+    if (silent_raises is not None and stage is not None
+            and silent_s >= AGENT_SILENCE_THRESHOLD_S):
+        raise NoReplyError(
+            f"guest-exec-status ({silent_raises}): the guest agent stopped "
+            f"answering the status polls for pid {pid}: none answered in the "
+            f"last {silent_s:.0f}s of the {timeout:.0f}s wait (last poll: no "
+            f"reply at {stage}, {sync.describe()})", stage, sync,
+            "guest-exec-status")
     return None
 
 
@@ -554,14 +584,18 @@ def build_fio_args(drive_number: int, duration_s: float) -> list:
     ]
 
 
+RESOLVE_REQUEST = "resolve disk numbers"
+
+
 def resolve_drive_numbers(qga_sock: Path, serials: list,
                           resyncs: Optional[list] = None) -> dict:
-    pid = ps_exec(qga_sock, "resolve disk numbers",
+    pid = ps_exec(qga_sock, RESOLVE_REQUEST,
                    build_resolve_script(serials), capture=True,
                    resyncs=resyncs)
-    status = qga_exec_wait(qga_sock, pid, timeout=GUEST_EXEC_TIMEOUT_S)
+    status = qga_exec_wait(qga_sock, pid, timeout=GUEST_EXEC_TIMEOUT_S,
+                           silent_raises=RESOLVE_REQUEST)
     if status is None:
-        raise RuntimeError("guest-exec (resolve disk numbers) timed out")
+        raise RuntimeError(f"guest-exec ({RESOLVE_REQUEST}) timed out")
     out = b64_text(status.get("out-data"))
     mapping: dict = {}
     for line in out.splitlines():
@@ -1488,8 +1522,9 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
                             writer_exe: Optional[str], screenshot: Path,
                             dump_path: Path, dump_at_failure: bool = False
                             ) -> str:
-    """Record why the guest agent stopped answering a writer launch, into
-    diag, calling persist() after each step. Returns a one-line summary.
+    """Record why the guest agent stopped answering a request before the
+    soak -- resolving drives or launching a writer -- into diag, calling
+    persist() after each step. Returns a one-line summary.
 
     "No reply" has three causes that look identical from the host: QEMU's
     main loop not servicing the agent's chardev -- for one, while it sits
@@ -1614,11 +1649,15 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
         if sample["vm"] == "paused":
             diag["vm_paused"] = True
             return (f"VM paused {sample['t_s']:.0f}s after the failed "
-                    f"launch{dump_phrase}")
+                    f"request{dump_phrase}")
     diag["agent_answered_after_s"] = agent_back_s
     diag["lun_writes"] = writes
     diag["lun_writes_complete"] = complete
     writes_phrase = _lun_writes_phrase(writes, complete)
+    if launched == 0:
+        # A request before any writer (resolving drives): the LUN writes
+        # are Windows' own, not a workload, and say little either way.
+        writes_phrase += " (no writers were running yet)"
 
     if agent_back_s is not None:
         # One more writer running than launch_writer() returned a pid for
@@ -1628,7 +1667,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
             diag["writer_processes"] = None
             persist()
             return (f"guest agent answered {agent_back_s:.0f}s after "
-                    f"the failed launch; {writes_phrase}; writer processes "
+                    f"the failed request; {writes_phrase}; writer processes "
                     f"not counted (PowerShell writers look like any other "
                     f"PowerShell process){dump_phrase}")
         count = count_guest_processes(qga_sock, writer_exe)
@@ -1638,7 +1677,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
         counted = ("could not count them" if count is None else
                    f"{count} {name} process(es) running")
         return (f"guest agent answered {agent_back_s:.0f}s after the "
-                f"failed launch; {writes_phrase}; {counted}, {launched} "
+                f"failed request; {writes_phrase}; {counted}, {launched} "
                 f"launched{dump_phrase}")
 
     # Before the dump, which stops the VM and drains everything.
@@ -1798,22 +1837,23 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                   file=sys.stderr)
             capture_postmortem()
 
-    def diagnose_failed_launch(reason: str, drive_no: Optional[int] = None,
+    def diagnose_failed_launch(reason: str, request: Optional[str] = None,
                                request_sent_at: Optional[str] = None,
-                               no_reply: Optional[NoReplyError] = None) -> None:
+                               no_reply: Optional[NoReplyError] = None,
+                               drive_no: Optional[int] = None) -> None:
         # Never let the diagnostics replace the failure they explain.
         try:
-            diagnose_failed_launch_unguarded(reason, drive_no, request_sent_at,
-                                             no_reply)
+            diagnose_failed_launch_unguarded(reason, request, request_sent_at,
+                                             no_reply, drive_no)
         except Exception as exc:
             result["launch_failure_error"] = repr(exc)
             print(f"    launch-failure diagnostics failed: {exc!r}",
                   file=sys.stderr)
 
-    def diagnose_failed_launch_unguarded(reason: str, drive_no: Optional[int],
+    def diagnose_failed_launch_unguarded(reason: str, request: Optional[str],
                                          request_sent_at: Optional[str],
-                                         no_reply: Optional[NoReplyError]
-                                         ) -> None:
+                                         no_reply: Optional[NoReplyError],
+                                         drive_no: Optional[int]) -> None:
         failed_at = utc_now()
         # A ring break pauses the VM, and that is the whole reason the agent
         # went quiet; the dump taken at the break is what matters.
@@ -1824,16 +1864,20 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         if reason == "no-reply":
             # request_sent_at..failed_at is the window to hold against the
             # TMF/drain timestamps in qemu.log.
-            diag["writer"] = f"PhysicalDrive{drive_no}"
+            diag["request"] = request
+            if drive_no is not None:
+                diag["writer"] = f"PhysicalDrive{drive_no}"
             diag["request_sent_at"] = request_sent_at
             diag["no_reply_stage"] = no_reply.stage
+            diag["no_reply_to"] = no_reply.command
             diag["sync"] = dataclasses.asdict(no_reply.sync)
         probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
         how = f"{reason} at {no_reply.stage}" if no_reply else reason
         # Only for an agent that went quiet: a deadline that ran out on a
         # slow but answering agent has nothing stuck to catch.
         dump_now = dump_on_agent_stall and reason == "no-reply"
-        print(f"    writer launch failed ({how}) at {failed_at}; capturing "
+        print(f"    {request or 'writer launch'} failed ({how}) at "
+              f"{failed_at}; capturing "
               f"QEMU stacks{', dumping guest memory' if dump_now else ''} "
               f"and watching the guest agent and LUNs for {probe_s:.0f}s",
               file=sys.stderr)
@@ -1958,15 +2002,24 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # reference, like writer_pids, so a later failure keeps them.
         qga_resyncs: list = []
         result["qga_resyncs"] = qga_resyncs
-        serials = [s.serial for s in lun_specs]
-        drive_numbers = resolve_drive_numbers(qga_sock, serials, qga_resyncs)
-        result["drive_numbers"] = drive_numbers
-
         writer_pids = []
-        # Published by reference, before the loop, so a launch that fails
+        # Published by reference, before any launch, so a launch that fails
         # part way through still records how many writers did come up --
         # "32 of 75 started" is the whole diagnosis in that case.
         result["writer_pids"] = writer_pids
+
+        serials = [s.serial for s in lun_specs]
+        request_sent_at = utc_now()
+        try:
+            drive_numbers = resolve_drive_numbers(qga_sock, serials,
+                                                  qga_resyncs)
+        except NoReplyError as exc:
+            # The first guest-exec after the boot ping, with nothing else
+            # running yet: run-1791557706 lost the agent right here.
+            diagnose_failed_launch("no-reply", RESOLVE_REQUEST,
+                                   request_sent_at, exc)
+            raise
+        result["drive_numbers"] = drive_numbers
         launch_deadline = time.monotonic() + WRITER_LAUNCH_TIMEOUT_S
         for spec in lun_specs:
             drive_no = drive_numbers[spec.serial]
@@ -1984,8 +2037,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                                   diskspd_path, fio_path,
                                                   qga_resyncs))
             except NoReplyError as exc:
-                diagnose_failed_launch("no-reply", drive_no, request_sent_at,
-                                       exc)
+                diagnose_failed_launch("no-reply",
+                                       f"writer for PhysicalDrive{drive_no}",
+                                       request_sent_at, exc, drive_no)
                 raise
 
         time.sleep(WARMUP_S)
@@ -2327,8 +2381,9 @@ def main() -> int:
                           "on timing (default: on)")
     ap.add_argument("--dump-on-agent-stall",
                      action=argparse.BooleanOptionalAction, default=False,
-                     help="when the guest agent never answers a writer "
-                          "launch, dump guest memory to crash.dmp right "
+                     help="when the guest agent never answers a request "
+                          "before the soak (resolving drives, launching a "
+                          "writer), dump guest memory to crash.dmp right "
                           "away, while it is still stuck, rather than only "
                           "if it stays silent for the whole probe. The guest "
                           "is paused for the dump (minutes, 8+ GB in the run "
