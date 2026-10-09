@@ -95,10 +95,10 @@ DEFAULT_CPUS = "5"
 LUN_IMAGE_SIZE = "4G"
 
 BOOT_TIMEOUT_S = 180
-# Generous on purpose. The guest agent's virtio-serial channel competes with
-# every LUN's I/O for QEMU's attention, so at high LUN counts a reply can be
-# queued behind a lot of work without anything actually being wrong -- 30s
-# was enough to abort a 75-LUN run during writer ramp-up. WRITER_LAUNCH_
+# Generous on purpose: at high LUN counts the agent can take a long while to
+# answer -- 30s was enough to abort a 75-LUN run during writer ramp-up --
+# and a timeout here ends the run. Why it goes quiet is not settled; see
+# NoReplyError and the launch-failure diagnostics. WRITER_LAUNCH_
 # TIMEOUT_S, not this, is what bounds an unattended run: a genuinely dead
 # guest must not cost 75 x this before the harness gives up.
 GUEST_EXEC_TIMEOUT_S = 120
@@ -227,9 +227,12 @@ def _qga_replies(s: socket.socket, deadline: float):
                 yield resp
 
 
-def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
-             timeout: float = 5.0) -> Optional[dict]:
-    """Run one guest agent command and return its reply, or None.
+def _qga_call(sock_path: Path, execute: str, arguments: Optional[dict],
+              timeout: float) -> tuple[Optional[dict], Optional[str]]:
+    """Run one guest agent command: (reply, None), or (None, stage) where
+    stage is how far it got -- "connect" (the socket could not be reached),
+    "sync" (no echo of our guest-sync-delimited, so the command was never
+    sent) or "command" (synced, but the command itself got no reply).
 
     The agent's virtio-serial channel outlives our connection: a reply to
     a request whose client gave up -- timed out, or asked while the VM was
@@ -241,10 +244,12 @@ def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
     """
     deadline = time.monotonic() + timeout
     token = random.getrandbits(63)
+    stage = "connect"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(str(sock_path))
+            stage = "sync"
             replies = _qga_replies(s, deadline)
             s.sendall(QGA_SENTINEL +
                       _qga_request("guest-sync-delimited", {"id": token}))
@@ -252,11 +257,20 @@ def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
                 if resp.get("return") == token:
                     break
             else:
-                return None
+                return None, stage
+            stage = "command"
             s.sendall(_qga_request(execute, arguments))
-            return next(replies, None)
+            resp = next(replies, None)
+            return resp, (None if resp is not None else stage)
     except (OSError, ConnectionError):
-        return None
+        return None, stage
+
+
+def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
+             timeout: float = 5.0) -> Optional[dict]:
+    """Run one guest agent command and return its reply, or None. See
+    _qga_call for the protocol, and for which stage went unanswered."""
+    return _qga_call(sock_path, execute, arguments, timeout)[0]
 
 
 def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
@@ -270,30 +284,42 @@ class GuestExecError(RuntimeError):
     The message distinguishes which of two very different failures
     happened, because they call for opposite responses. If the agent
     refused the request, the command or the guest is wrong. If the agent
-    never answered, QEMU's main loop is most likely too backed up to
-    service the agent's virtio-serial channel -- and the process may well
-    be running, with only the reply lost. Collapsing both into "failed to
-    launch" sends you looking for a guest-side bug that isn't there.
+    never answered, the command may be fine and the process may even be
+    running, with only the reply lost. Collapsing both into "failed to
+    launch" sends you looking for a bug in the wrong place.
     """
 
 
 class NoReplyError(GuestExecError):
-    """The agent never answered: the second case above."""
+    """The agent never answered: the second case above. stage says how far
+    the request got (see _qga_call): at "sync" nothing at all came back
+    over the channel and the command never went out; at "command" the
+    channel worked both ways and only the command went unanswered."""
+
+    def __init__(self, message: str, stage: str):
+        super().__init__(message)
+        self.stage = stage
 
 
 def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
              timeout: float = GUEST_EXEC_TIMEOUT_S) -> int:
-    resp = qga_call(sock_path, "guest-exec",
-                     {"path": path, "arg": args, "capture-output": capture},
-                     timeout=timeout)
+    resp, stage = _qga_call(sock_path, "guest-exec",
+                            {"path": path, "arg": args,
+                             "capture-output": capture}, timeout)
     if resp is None:
-        raise NoReplyError(
-            f"guest-exec ({what}): no reply from the guest agent within "
-            f"{timeout:.0f}s while asking it to run {path!r}. The agent's "
-            f"virtio-serial channel is serviced from QEMU's main loop, so a "
-            f"main loop saturated with LUN I/O stalls it -- the request may "
-            f"never have reached the agent, or the process may have started "
-            f"and only the reply was lost")
+        if stage == "connect":
+            why = (f"could not reach the guest agent's socket {sock_path}, "
+                   f"so the request to run {path!r} was never sent")
+        elif stage == "sync":
+            why = (f"the guest agent never answered the guest-sync-delimited "
+                   f"sent ahead of it within {timeout:.0f}s, so the request "
+                   f"to run {path!r} was never sent")
+        else:
+            why = (f"the guest agent answered the sync but not the request "
+                   f"to run {path!r} within {timeout:.0f}s; it was sent, so "
+                   f"the process may have started and only the reply been "
+                   f"lost")
+        raise NoReplyError(f"guest-exec ({what}): {why}", stage)
     if "error" in resp:
         err = resp["error"] if isinstance(resp["error"], dict) else {}
         raise GuestExecError(
@@ -1401,11 +1427,20 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
     while agent_back_s is None and time.monotonic() < deadline:
         time.sleep(LAUNCH_PROBE_INTERVAL_S)
         ping_t = time.monotonic()
-        agent = qga_ping(qga_sock, AGENT_CHECK_TIMEOUT_S)
+        # For a silent agent, the stage says whether anything comes back
+        # over the channel at all ("sync") or the agent echoed the sync
+        # and then sat on the ping ("command"). Any reply, even an error,
+        # means both the channel and the agent work, so it counts as an
+        # answer, and agent_stage None always means "answered".
+        resp, stage = _qga_call(qga_sock, "guest-ping", None,
+                                AGENT_CHECK_TIMEOUT_S)
+        agent = resp is not None
         rtt = round(time.monotonic() - ping_t, 2) if agent else None
         cur = write_ops_by_node(qmp)
         sample: dict = {"t_s": round(time.monotonic() - t0, 1), "agent": agent,
-                        "agent_rtt_s": rtt}
+                        "agent_rtt_s": rtt, "agent_stage": stage}
+        if resp is not None and "error" in resp:
+            sample["agent_error"] = resp["error"]
         if not _covers_luns(cur, lun_specs):
             complete = False
             sample["lun_writes"] = None
@@ -1614,17 +1649,20 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     def diagnose_failed_launch(reason: str, drive_no: Optional[int] = None,
-                               request_sent_at: Optional[str] = None) -> None:
+                               request_sent_at: Optional[str] = None,
+                               no_reply_stage: Optional[str] = None) -> None:
         # Never let the diagnostics replace the failure they explain.
         try:
-            diagnose_failed_launch_unguarded(reason, drive_no, request_sent_at)
+            diagnose_failed_launch_unguarded(reason, drive_no, request_sent_at,
+                                             no_reply_stage)
         except Exception as exc:
             result["launch_failure_error"] = repr(exc)
             print(f"    launch-failure diagnostics failed: {exc!r}",
                   file=sys.stderr)
 
     def diagnose_failed_launch_unguarded(reason: str, drive_no: Optional[int],
-                                         request_sent_at: Optional[str]) -> None:
+                                         request_sent_at: Optional[str],
+                                         no_reply_stage: Optional[str]) -> None:
         failed_at = utc_now()
         # A ring break pauses the VM, and that is the whole reason the agent
         # went quiet; the dump taken at the break is what matters.
@@ -1637,8 +1675,10 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             # TMF/drain timestamps in qemu.log.
             diag["writer"] = f"PhysicalDrive{drive_no}"
             diag["request_sent_at"] = request_sent_at
+            diag["no_reply_stage"] = no_reply_stage
         probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
-        print(f"    writer launch failed ({reason}) at {failed_at}; capturing "
+        how = f"{reason} at {no_reply_stage}" if no_reply_stage else reason
+        print(f"    writer launch failed ({how}) at {failed_at}; capturing "
               f"QEMU stacks and watching the guest agent and LUNs for "
               f"{probe_s:.0f}s", file=sys.stderr)
         writer_exe = {"diskspd": diskspd_path, "fio": fio_path}.get(io_driver)
@@ -1779,8 +1819,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 writer_pids.append(launch_writer(qga_sock, drive_no,
                                                   writer_duration, io_driver,
                                                   diskspd_path, fio_path))
-            except NoReplyError:
-                diagnose_failed_launch("no-reply", drive_no, request_sent_at)
+            except NoReplyError as exc:
+                diagnose_failed_launch("no-reply", drive_no, request_sent_at,
+                                       exc.stage)
                 raise
 
         time.sleep(WARMUP_S)
