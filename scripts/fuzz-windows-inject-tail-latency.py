@@ -118,6 +118,10 @@ STACK_CAPTURE_TIMEOUT_S = 120
 STOP_ON_BROKEN_SETTLE_S = 2.0
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15
+# How many agent silences in the soak loop get an info qtree capture of
+# the agent's port (see capture_qga_port); later ones get none, unless
+# the guest is declared dark.
+QGA_PORT_SILENCE_CAPTURES = 5
 STATIC_SCREEN_THRESHOLD_S = 20
 # Slack on top of the longest injected hold before "no block I/O completing"
 # counts as a stall rather than every writer waiting on a held request.
@@ -210,9 +214,19 @@ def _qga_request(execute: str, arguments: Optional[dict] = None) -> bytes:
 QGA_SYNC_RESEND_S = 5.0
 
 
+# The format of qemu.log's trace timestamps, to line up against them.
+UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
 def utc_now() -> str:
-    # The format of qemu.log's trace timestamps, to line up against them.
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(timezone.utc).strftime(UTC_FORMAT)
+
+
+def wall_time(mono: float) -> str:
+    """A time.monotonic() reading from the past, as utc_now() would have
+    put it then."""
+    then = time.time() - (time.monotonic() - mono)
+    return datetime.fromtimestamp(then, timezone.utc).strftime(UTC_FORMAT)
 
 
 @dataclasses.dataclass
@@ -872,7 +886,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      iothreads: Optional[int] = None,
                      tmf_trace: bool = True,
                      stop_on_broken: bool = True,
-                     ring_diag: bool = True) -> list:
+                     ring_diag: bool = True,
+                     qga_trace: bool = True) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -911,6 +926,13 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-device", "ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0",
     ]
 
+    if tmf_trace:
+        for event in TMF_TRACE_EVENTS:
+            argv += ["-trace", f"enable={event}"]
+    if qga_trace:
+        for event in QGA_TRACE_EVENTS:
+            argv += ["-trace", f"enable={event}"]
+
     # Give each adapter its own iothread so LUN I/O stops sharing a thread
     # with the guest agent's virtio-serial channel and the QMP socket the
     # harness polls -- otherwise the harness's own control plane queues
@@ -918,10 +940,6 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
     # workload harsher where it matters: completions arrive on several
     # threads at once, which is far better at finding races in vioscsi's
     # per-adapter locking than one thread serializing everything.
-    if tmf_trace:
-        for event in TMF_TRACE_EVENTS:
-            argv += ["-trace", f"enable={event}"]
-
     n_iothreads = adapters if iothreads is None else iothreads
     for i in range(n_iothreads):
         argv += ["-object", f"iothread,id=iothread{i}"]
@@ -972,6 +990,41 @@ def screendump_hash(qmp, path: Path) -> Optional[str]:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except Exception:
         return None
+
+
+# What HMP "info qtree" prints for each virtio-serial port
+# (virtser_bus_dev_print) -- the only place QEMU reports a port throttled.
+QTREE_PORT_RE = re.compile(r"port (\d+), guest (on|off), host (on|off), "
+                           r"throttle (on|off)")
+QTREE_NAME_RE = re.compile(r'^\s*name = "(.*)"$')
+
+
+def virtio_serial_ports(qmp) -> list:
+    """Each virtio-serial port as info qtree reports it: whether the guest
+    has it open, whether a host client is connected, and whether QEMU is
+    holding a guest write it could not pass on (throttled). Asked between
+    agent calls, host_connected=False is normal: the harness connects only
+    for the length of a call. So is throttled=False, even if a write was
+    lost: the close that ends each call unthrottles the port and discards
+    what it held, leaving nothing here to see. Throttled with no host
+    connected only follows a write that disconnected the socket itself
+    (see QGA_TRACE_EVENTS), and then QEMU holds nothing."""
+    text = qmp_call(qmp, "human-monitor-command", command_line="info qtree")
+    ports, name = [], None
+    for line in text.splitlines():
+        if line.lstrip().startswith("dev:"):
+            name = None
+        m = QTREE_NAME_RE.match(line)
+        if m:
+            name = m.group(1)
+            continue
+        m = QTREE_PORT_RE.search(line)
+        if m:
+            ports.append({"port": int(m.group(1)), "name": name,
+                          "guest_open": m.group(2) == "on",
+                          "host_connected": m.group(3) == "on",
+                          "throttled": m.group(4) == "on"})
+    return ports
 
 
 def capture_qemu_stacks(pid: int, out: Path) -> None:
@@ -1129,6 +1182,33 @@ DIAG_EVENTS = ("broken_verdict", "broken_before", "broken_before_detail",
                "broken_before_entry", "req_overlap", "tmf_snapshot",
                "drain_begin", "drain_snapshot", "stop_on_broken")
 
+# Tracepoints enabled with --qga-trace (the default): the guest agent's
+# virtio-serial port, seen from QEMU. In run-1791602155 qemu-ga sat 56
+# minutes in one 81-byte write to that port, and vioser completes a write
+# only once QEMU hands the buffer back. These say whether QEMU ever got it
+# and what became of it: each guest write as it reaches the chardev
+# (flush_buf; out_len < in_len means the socket refused some and the port
+# is now throttled, holding the buffer), the port being throttled and
+# released, and our client connecting and leaving (chr_event). A few lines
+# per agent call, on the same clock as the TMFs.
+#
+# A client leaving releases a throttled port without a throttle line:
+# virtio_serial_close() clears the flag itself and throws the held buffer
+# away (discard_throttle_data detaches it, so the guest never gets it
+# back). Hence QemuStderr's closed_while_throttled. chr_socket_poll_err
+# marks the rarer order, where the write itself finds the socket dead with
+# no read pending and disconnects inside flush_buf -- the close, and the
+# discard, come before that write's own flush_buf line.
+QGA_TRACE_EVENTS = ("virtio_console_flush_buf", "virtio_serial_throttle_port",
+                    "virtio_console_chr_event", "chr_socket_poll_err")
+QGA_TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?(" + "|".join(QGA_TRACE_EVENTS)
+                               + r") ")
+QGA_TRACE_FIELD_RE = re.compile(r"(\w+) (-?\d+)")
+CHR_SOCKET_LABEL_RE = re.compile(r"\((\S+)\)$")
+# include/chardev/char.h, QEMUChrEvent
+CHR_EVENTS = {0: "break", 1: "opened", 2: "mux_in", 3: "mux_out",
+              4: "closed"}
+
 # What virtio_scsi_broken_verdict says happened to the request the ring
 # broke on, comparing its first sighting while pending (at a TMF or during a
 # drain) with what the device read. See virtio_scsi_diag_broken() in
@@ -1227,12 +1307,21 @@ class QemuStderr:
     adapter's virtio_scsi_broken line arrives, the last few trace lines
     for that same adapter are attached to it: that is the question this
     exists to answer -- what was this adapter being asked to do right
-    before its ring went bad?"""
+    before its ring went bad?
+
+    The guest agent port's trace lines (QGA_TRACE_EVENTS) are tallied in
+    qga, along with whether the port is throttled now and the last line of
+    each kind that matters when the agent goes quiet. closed_while_throttled
+    and short_writes_with_no_client count the two orders in which a client
+    leaving can throw away a guest write QEMU was holding -- the leak the
+    56-minute hang in run-1791602155 is suspected of."""
 
     def __init__(self, path: Path):
         self.path = path
         self.pos = 0
         self.lines: list = []
+        self.qga: dict = {"counts": {}, "throttled": None,
+                          "client_open": None}
         self.trace_counts: dict = {}
         self.broken_events: list = []
         self.overlaps: dict = {}
@@ -1258,6 +1347,10 @@ class QemuStderr:
                     self._chain_line(m.group(3), line)
                 else:
                     self._trace(m.group(3), line)
+                continue
+            m = QGA_TRACE_LINE_RE.match(line)
+            if m:
+                self._qga_trace(m.group(2), line)
                 continue
             self.lines.append(line)
             if any(pat.search(line) for pat in VIRTIO_BROKEN_PATTERNS):
@@ -1301,6 +1394,44 @@ class QemuStderr:
             chain.update(fields)
         elif event == "entry":
             chain["descs"].append(fields)
+
+    def _qga_trace(self, event: str, line: str) -> None:
+        fields = {k: int(v) for k, v in QGA_TRACE_FIELD_RE.findall(line)}
+        if event == "virtio_console_flush_buf":
+            key = "writes"
+            self.qga["last_write"] = line
+            if fields.get("out_len", 0) < fields.get("in_len", 0):
+                self._qga_count("short_writes")
+                self.qga["last_short_write"] = line
+                if self.qga["client_open"] is False:
+                    self._qga_count("short_writes_with_no_client")
+                    self.qga["last_short_write_with_no_client"] = line
+        elif event == "virtio_serial_throttle_port":
+            throttled = bool(fields.get("throttle"))
+            key = "throttle_on" if throttled else "throttle_off"
+            self.qga["throttled"] = throttled
+            self.qga["last_throttle"] = line
+        elif event == "virtio_console_chr_event":
+            n = fields.get("event", -1)
+            key = "client_" + CHR_EVENTS.get(n, str(n))
+            if n == 1:
+                self.qga["client_open"] = True
+            elif n == 4:
+                self.qga["client_open"] = False
+                if self.qga["throttled"]:
+                    # QEMU unthrottles here without a trace line.
+                    self.qga["throttled"] = False
+                    self._qga_count("closed_while_throttled")
+                    self.qga["last_closed_while_throttled"] = line
+        else:  # chr_socket_poll_err, which also covers the QMP socket
+            m = CHR_SOCKET_LABEL_RE.search(line)
+            key = "socket_write_errors:" + (m.group(1) if m else "?")
+            self.qga["last_socket_write_error"] = line
+        self._qga_count(key)
+
+    def _qga_count(self, key: str) -> None:
+        counts = self.qga["counts"]
+        counts[key] = counts.get(key, 0) + 1
 
     def _last_broken(self, bus: str) -> Optional[dict]:
         return next((ev for ev in reversed(self.broken_events)
@@ -1716,7 +1847,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              tmf_trace: bool = True,
              stop_on_broken: bool = True,
              ring_diag: bool = True,
-             dump_on_agent_stall: bool = False) -> dict:
+             dump_on_agent_stall: bool = False,
+             qga_trace: bool = True) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1760,6 +1892,44 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["tmf_trace"] = qemu_stderr.trace_counts
         result["broken_events"] = qemu_stderr.broken_events
         result["req_overlaps"] = qemu_stderr.overlaps
+        if qemu_stderr.qga["counts"]:
+            result["qga_trace"] = qemu_stderr.qga
+
+    def capture_qga_port(context: str, **extra) -> None:
+        """Record the guest agent port as QEMU sees it, for an agent that
+        has gone quiet: info qtree's view of it (see virtio_serial_ports
+        for what that can and cannot show) and the trace tallies so far,
+        including whether a client has left while QEMU held a write.
+        Appended to result["qga_port"]; never fails the run."""
+        entry: dict = {"context": context, "at": utc_now(),
+                       "elapsed_s": round(time.monotonic() - start, 1),
+                       **extra}
+        result.setdefault("qga_port", []).append(entry)
+        try:
+            entry["ports"] = virtio_serial_ports(qmp)
+            if qga_trace:
+                # Before the soak there is no reader yet; a throwaway one
+                # reads the whole log, which is still short then.
+                src = qemu_stderr or QemuStderr(qemu_log_path)
+                src.poll()
+                # Copied: the reader keeps counting after this.
+                entry["trace"] = {**src.qga, "counts": dict(src.qga["counts"])}
+            desc = "; ".join(
+                f"port {p['port']} ({p['name']}): guest "
+                f"{'open' if p['guest_open'] else 'closed'}, host "
+                f"{'connected' if p['host_connected'] else 'not connected'}"
+                f", {'THROTTLED' if p['throttled'] else 'not throttled'}"
+                for p in entry["ports"]) or "no virtio-serial ports found"
+            lost = entry.get("trace", {}).get("counts", {})
+            lost = (lost.get("closed_while_throttled", 0)
+                    + lost.get("short_writes_with_no_client", 0))
+            if lost:
+                desc += (f"; {lost} guest write(s) held when a client left "
+                         f"(qga_trace in the result)")
+        except Exception as exc:
+            entry["error"] = repr(exc)
+            desc = f"capture failed: {exc!r}"
+        print(f"    guest agent port ({context}): {desc}", file=sys.stderr)
 
     def dump_if_stopped_on_broken() -> bool:
         """If x-stop-on-broken paused the VM at a ring break, dump guest
@@ -1819,6 +1989,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             print("    guest agent not responding -- skipping writer stop and "
                   "telemetry; capturing a screenshot and a guest memory dump "
                   "for postmortem", file=sys.stderr)
+            capture_qga_port("agent silent at the end")
             capture_postmortem()
             return
         # Stop the writers first: they're still live (see stop_writers'
@@ -1871,6 +2042,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             diag["no_reply_stage"] = no_reply.stage
             diag["no_reply_to"] = no_reply.command
             diag["sync"] = dataclasses.asdict(no_reply.sync)
+            # Before the stacks, probe and dump take minutes.
+            capture_qga_port("no reply before the soak")
         probe_s = LAUNCH_PROBE_CYCLES * io_probe_window_s
         how = f"{reason} at {no_reply.stage}" if no_reply else reason
         # Only for an agent that went quiet: a deadline that ran out on a
@@ -1926,7 +2099,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
                                 delay_max_ms, ops, iothreads, tmf_trace,
-                                stop_on_broken, ring_diag)
+                                stop_on_broken, ring_diag, qga_trace)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -1938,6 +2111,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "stop_on_broken": stop_on_broken,
                 "ring_diag": ring_diag,
                 "dump_on_agent_stall": dump_on_agent_stall,
+                "qga_trace": qga_trace,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -2119,6 +2293,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
         agent_alive = True
         agent_lost_t: Optional[float] = None
+        # One port capture per silence, for the first few: a missed 2s
+        # ping that answers next time is routine under this load, while
+        # the hang in run-1791602155 never recovered, so a silence that
+        # lasts is worth catching within seconds rather than at the end.
+        # The last answered ping bounds when it began.
+        agent_answered_t = test_start
+        silence_captured = False
+        silence_captures = 0
         last_hash = None
         last_change_t = test_start
         # A guest that is still completing writes is alive no matter what the
@@ -2212,10 +2394,24 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             if qga_ping(qga_sock):
                 agent_alive = True
                 agent_lost_t = None
+                agent_answered_t = time.monotonic()
+                silence_captured = False
             else:
                 if agent_alive:
                     agent_lost_t = now
                 agent_alive = False
+
+            if (not agent_alive and not silence_captured
+                    and silence_captures < QGA_PORT_SILENCE_CAPTURES
+                    and now - agent_lost_t > AGENT_SILENCE_THRESHOLD_S):
+                silence_captured = True
+                silence_captures += 1
+                capture_qga_port("agent silent during the soak",
+                                 agent_last_answered_at=wall_time(
+                                     agent_answered_t),
+                                 agent_lost_at=wall_time(agent_lost_t),
+                                 agent_silent_s=round(now - agent_lost_t, 1))
+                write_status({"elapsed_s": elapsed})
 
             h = screendump_hash(qmp, screenshot)
             if h is not None:
@@ -2237,6 +2433,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
                 print(f"    guest appears dark after {elapsed:.0f}s -- "
                       f"capturing crash dump", file=sys.stderr)
+                # Not subject to the silence cap: this one ends the run.
+                capture_qga_port("guest dark", agent_silent_s=round(
+                    now - agent_lost_t, 1))
                 result["dump_ok"] = try_dump_guest_memory(
                     qmp, dump_path, proc.pid, err_nodes)
                 write_status({"elapsed_s": elapsed})
@@ -2390,6 +2589,18 @@ def main() -> int:
                           "dir) and the dump removes the delay rules, so the "
                           "probe that follows no longer sees the same "
                           "workload (default: off)")
+    ap.add_argument("--qga-trace", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="trace the guest agent's virtio-serial port into "
+                          "qemu.log (each guest write reaching the socket, "
+                          "the port being throttled and released, the "
+                          "harness connecting and leaving) and tally it in "
+                          "the result. The port's info qtree state is "
+                          "recorded either way when the agent goes quiet: "
+                          "the first few silences of 15s+ in the soak, a "
+                          "pre-soak request it never answers, the guest "
+                          "going dark, and an agent found silent when "
+                          "telemetry is collected (default: on)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -2526,7 +2737,7 @@ def main() -> int:
                        args.vioscsi_telemetry_script,
                        args.disk_dir, args.iothreads, args.tmf_trace,
                        args.stop_on_broken, args.ring_diag,
-                       args.dump_on_agent_stall)
+                       args.dump_on_agent_stall, args.qga_trace)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
