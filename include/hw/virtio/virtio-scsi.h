@@ -111,6 +111,16 @@ struct VirtIOSCSI {
     QTAILQ_HEAD(, VirtIOSCSIHeldTMF) held_tmfs; /* main loop only */
 
     /*
+     * TMFs that SCSI target faults care about and that finished in a
+     * request AioContext, waiting for tmf_bh to answer them from the main
+     * loop.  Protected by ctrl_lock.
+     */
+    QTAILQ_HEAD(, VirtIOSCSIReq) tmf_finishing;
+    QEMUBH *tmf_bh;
+    bool tmf_recheck_pending;   /* a fault went away, see tmf_bh */
+    VMChangeStateEntry *tmf_vmstate;
+
+    /*
      * Diagnostics for a request ring the device gives up on (see
      * virtio_scsi_diag_broken()). x-stop-on-broken pauses the VM the first
      * time any virtio-scsi device breaks, so the guest's view of the
