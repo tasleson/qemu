@@ -411,6 +411,12 @@ Slow target                     ``delay-ms`` and ``delay-max-ms``, with
                                 recovery
 =============================== ===============================================
 
+``scripts/fuzz-windows-inject-target-fault.py`` runs these for hours
+against a Windows guest with the vioscsi driver: it faults one target at a
+time, in rotation, records what each cycle ended with -- which recovery
+cleared it and how long that took, or that the guest never got there --
+and watches for a bugcheck or a broken ring.  See its ``--help``.
+
 
 SCSI Response Injection
 -----------------------
