@@ -6,6 +6,7 @@
 #include "qemu/hw-version.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
+#include "hw/scsi/scsi-fault.h"
 #include "migration/qemu-file-types.h"
 #include "migration/vmstate.h"
 #include "scsi/constants.h"
@@ -564,7 +565,37 @@ static void scsi_fetch_unit_attention_sense(SCSIRequest *req)
      */
     if (ua) {
         scsi_req_build_sense(req, *ua);
+        req->fetched_ua = *ua;
+        req->fetched_ua_from_bus = ua == &req->bus->unit_attention;
         *ua = SENSE_CODE(NO_SENSE);
+    }
+}
+
+/*
+ * A command a target fault held is being cancelled without having run.  If
+ * it took a unit attention, the guest never saw it, whereas a target that
+ * never answered the command would still report it: give it back, so the
+ * next command picks it up.  It goes back the way any unit attention is
+ * raised, so if another one is pending by now, the more important of the
+ * two stays.  That includes a reset cancelling this command:
+ * scsi_device_purge_requests() raises its own once the cancelling is done,
+ * and a reset takes precedence over anything given back here.
+ *
+ * Runs in the request's AioContext, like scsi_req_new() which takes unit
+ * attentions there too.
+ */
+static void scsi_req_return_unit_attention(SCSIRequest *req)
+{
+    if (req->fetched_ua.key != UNIT_ATTENTION) {
+        return;
+    }
+    trace_scsi_req_return_ua(req->dev->id, req->lun, req->tag,
+                             req->fetched_ua.key, req->fetched_ua.asc,
+                             req->fetched_ua.ascq, req->fetched_ua_from_bus);
+    if (req->fetched_ua_from_bus) {
+        scsi_bus_set_ua(req->bus, req->fetched_ua);
+    } else {
+        scsi_device_set_ua(req->dev, req->fetched_ua);
     }
 }
 
@@ -1038,6 +1069,9 @@ int32_t scsi_req_enqueue(SCSIRequest *req)
 
     assert(!req->retry);
     scsi_req_enqueue_internal(req);
+    if (scsi_fault_armed(req->bus) && scsi_fault_hold(req)) {
+        return 0;
+    }
     scsi_req_ref(req);
     rc = req->ops->send_command(req, req->cmd.buf);
     scsi_req_unref(req);
@@ -1051,6 +1085,11 @@ static void scsi_req_dequeue(SCSIRequest *req)
     if (req->enqueued) {
         WITH_QEMU_LOCK_GUARD(&req->dev->requests_lock) {
             QTAILQ_REMOVE(&req->dev->requests, req, next);
+        }
+        if (req->fault_serial) {
+            /* Held, so it never ran: it is being cancelled */
+            scsi_req_return_unit_attention(req);
+            scsi_fault_unhold(req);
         }
         req->enqueued = false;
         scsi_req_unref(req);
@@ -2050,11 +2089,17 @@ static const TypeInfo scsi_device_type_info = {
     .instance_init = scsi_dev_instance_init,
 };
 
+static void scsi_bus_unrealize(BusState *qbus)
+{
+    scsi_fault_bus_cleanup(SCSI_BUS(qbus));
+}
+
 static void scsi_bus_class_init(ObjectClass *klass, const void *data)
 {
     BusClass *k = BUS_CLASS(klass);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
 
+    k->unrealize = scsi_bus_unrealize;
     k->get_dev_path = scsibus_get_dev_path;
     k->get_fw_dev_path = scsibus_get_fw_dev_path;
     k->check_address = scsi_bus_check_address;

@@ -104,3 +104,382 @@
             '*type': 'ScsiInjectResponseType',
             '*page': 'uint8' },
   'features': [ 'unstable' ] }
+
+##
+# @ScsiFaultHoldAt:
+#
+# Where a SCSI target fault holds a command.
+#
+# @submit: before the command runs.  The target never sees it: a held
+#     write never reaches the backend, and aborting or resetting
+#     cancels it cleanly.  This models a target that has stopped
+#     responding.
+#
+# Since: 11.2
+##
+{ 'enum': 'ScsiFaultHoldAt',
+  'data': [ 'submit' ] }
+
+##
+# @ScsiFaultRecovery:
+#
+# Error recovery a guest can perform on a SCSI target, from least to
+# most disruptive.
+#
+# @abort-task: ABORT TASK addressed to the fault's target or LUN.  It
+#     counts whichever tag it names, even one that is not outstanding,
+#     since the TMF still succeeds.
+#
+# @task-set: ABORT TASK SET or CLEAR TASK SET on the fault's LUN
+#
+# @lun-reset: LOGICAL UNIT RESET on the fault's LUN.  For a fault
+#     that covers the whole target, a reset of any of its LUNs.
+#
+# @target-reset: I_T NEXUS RESET of the fault's target
+#
+# @bus-reset: reset of the whole adapter (for virtio-scsi, a device
+#     reset)
+#
+# @manual: nothing the guest does; only x-scsi-fault-remove
+#
+# Since: 11.2
+##
+{ 'enum': 'ScsiFaultRecovery',
+  'data': [ 'abort-task', 'task-set', 'lun-reset', 'target-reset',
+            'bus-reset', 'manual' ] }
+
+##
+# @ScsiFaultBelowClear:
+#
+# What a recovery attempt does to a target whose fault it is not
+# enough to clear.
+#
+# @proceed: the attempt does its normal work, so it cancels the
+#     commands being held, but the fault stays and holds the commands
+#     the guest sends next.  Models a reset that "succeeds" on a
+#     target that is still wedged.
+#
+# @reject: the attempt fails with FUNCTION REJECTED and changes
+#     nothing.
+#
+# @hang: the attempt gets no response until the fault clears, or
+#     until @tmf-hang-ms of ScsiFaultOptions elapses; it is then
+#     carried out and answered.
+#
+# A reset of the whole adapter cannot be refused, so for @bus-reset
+# every value behaves like @proceed.
+#
+# Since: 11.2
+##
+{ 'enum': 'ScsiFaultBelowClear',
+  'data': [ 'proceed', 'reject', 'hang' ] }
+
+##
+# @ScsiFaultOptions:
+#
+# Describes a SCSI target fault: a target, or one LUN of it, that
+# holds the commands sent to it until the guest performs a given
+# kind of error recovery, and then recovers by itself.
+#
+# Times are in guest time, so they do not run while the VM is
+# stopped.
+#
+# @id: unique name of the fault on its adapter
+#
+# @target: SCSI target id (channel 0)
+#
+# @lun: LUN of @target to hold commands for.  If absent, every LUN
+#     of the target.
+#
+# @hold-at: where commands are held (default: submit)
+#
+# @delay-ms: hold each command for this many milliseconds, at most
+#     86400000 (a day), and then run it, which models a slow rather
+#     than a stuck target.  If neither @delay-ms nor @delay-max-ms is
+#     given, commands are held until the fault clears.  Such a fault
+#     still clears on @clear-on like any other; set that to manual for
+#     latency that lasts.
+#
+# @delay-max-ms: if larger than @delay-ms (default 0), the hold time
+#     is picked uniformly at random from [@delay-ms, @delay-max-ms).
+#     At most 86400000.
+#
+# @probability: fraction of matching commands to hold, between 0.0
+#     and 1.0 (default: 1.0)
+#
+# @max-hits: stop holding new commands once this many, at least 1,
+#     have been held.  The fault stays until it clears.  If absent, no
+#     limit.
+#
+# @clear-on: the least disruptive recovery that clears the fault
+#     (default: lun-reset).  Commands the recovery did not cancel are
+#     then released and run.
+#
+# @below-clear: what a less disruptive recovery does (default:
+#     proceed)
+#
+# @tmf-hang-ms: with @below-clear set to hang, carry a hung recovery
+#     out this many milliseconds, at most 86400000, after it arrived,
+#     even if the fault has not cleared.  If absent, it waits for the
+#     fault to clear.  A recovery several faults hang waits for all of
+#     them.  Its wait is fixed when it arrives.  Whenever a fault goes
+#     away it is looked at again: if no fault armed then hangs it, it
+#     goes ahead or is rejected, otherwise its wait can only get
+#     shorter.  A fault added after it arrived never makes it wait
+#     longer.
+#
+# Since: 11.2
+##
+{ 'struct': 'ScsiFaultOptions',
+  'data': { 'id': 'str',
+            'target': 'uint16',
+            '*lun': 'uint16',
+            '*hold-at': 'ScsiFaultHoldAt',
+            '*delay-ms': 'int',
+            '*delay-max-ms': 'int',
+            '*probability': 'number',
+            '*max-hits': 'int',
+            '*clear-on': 'ScsiFaultRecovery',
+            '*below-clear': 'ScsiFaultBelowClear',
+            '*tmf-hang-ms': 'int' } }
+
+##
+# @x-scsi-fault-add:
+#
+# Arm a SCSI target fault on an adapter.  The fault applies to
+# commands the guest sends from now on.
+#
+# Faults block migration while any is armed.  Commands released and
+# recovery requests answered because of a fault clearing while the VM
+# is stopped wait until it runs again.
+#
+# @device: ID or QOM path of the SCSI adapter, e.g. the id of a
+#     virtio-scsi-pci device
+#
+# @fault: the fault to arm.  Faults are evaluated in the order they
+#     were added and the first one that matches a command holds it.
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#    :title: Target 1 stops responding until it is reset
+#
+#     -> { "execute": "x-scsi-fault-add",
+#          "arguments": { "device": "scsi0",
+#                         "fault": { "id": "hang1", "target": 1,
+#                                    "clear-on": "target-reset" } } }
+#     <- { "return": {} }
+##
+{ 'command': 'x-scsi-fault-add',
+  'data': { 'device': 'str',
+            'fault': 'ScsiFaultOptions' },
+  'features': [ 'unstable' ] }
+
+##
+# @ScsiFaultCount:
+#
+# @count: number of faults the command acted on
+#
+# Since: 11.2
+##
+{ 'struct': 'ScsiFaultCount',
+  'data': { 'count': 'int' } }
+
+##
+# @x-scsi-fault-remove:
+#
+# Disarm SCSI target faults, as if the recovery they wait for had
+# happened.  The commands they hold are released and run, and a
+# SCSI_FAULT_CLEARED event with recovery "manual" is sent for each.
+#
+# @device: ID or QOM path of the SCSI adapter
+#
+# @id: the fault to remove.  If absent, all faults are removed.
+#
+# Returns: the number of faults removed
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-scsi-fault-remove",
+#          "arguments": { "device": "scsi0", "id": "hang1" } }
+#     <- { "return": { "count": 1 } }
+##
+{ 'command': 'x-scsi-fault-remove',
+  'data': { 'device': 'str',
+            '*id': 'str' },
+  'returns': 'ScsiFaultCount',
+  'features': [ 'unstable' ] }
+
+##
+# @ScsiFaultAttempts:
+#
+# Recovery attempts a SCSI target fault has seen, by kind.  An
+# attempt counts whether or not it was enough to clear the fault.
+#
+# @abort-task: ABORT TASK
+#
+# @task-set: ABORT TASK SET and CLEAR TASK SET
+#
+# @lun-reset: LOGICAL UNIT RESET
+#
+# @target-reset: I_T NEXUS RESET
+#
+# @bus-reset: adapter reset
+#
+# Since: 11.2
+##
+{ 'struct': 'ScsiFaultAttempts',
+  'data': { 'abort-task': 'int',
+            'task-set': 'int',
+            'lun-reset': 'int',
+            'target-reset': 'int',
+            'bus-reset': 'int' } }
+
+##
+# @ScsiFaultInfo:
+#
+# Information about an armed SCSI target fault.
+#
+# @id: name of the fault
+#
+# @target: SCSI target id
+#
+# @lun: LUN the fault applies to, absent if it applies to every LUN
+#     of the target
+#
+# @hold-at: where commands are held
+#
+# @stall: true if commands are held until the fault clears
+#
+# @delay-ms: lower bound of the hold time, absent if @stall
+#
+# @delay-max-ms: upper bound of the hold time, absent if @stall
+#
+# @probability: fraction of matching commands that are held
+#
+# @max-hits: limit on the number of commands held, absent if
+#     unlimited
+#
+# @clear-on: least disruptive recovery that clears the fault
+#
+# @below-clear: what a less disruptive recovery does
+#
+# @tmf-hang-ms: how long a hung recovery waits, absent if until the
+#     fault clears or if @below-clear is not hang
+#
+# @hits: number of commands held so far
+#
+# @held: number of commands being held right now
+#
+# @attempts: recovery attempts seen so far
+#
+# @last-attempt: the most recent recovery attempt, absent if none
+#
+# Since: 11.2
+##
+{ 'struct': 'ScsiFaultInfo',
+  'data': { 'id': 'str',
+            'target': 'uint16',
+            '*lun': 'uint16',
+            'hold-at': 'ScsiFaultHoldAt',
+            'stall': 'bool',
+            '*delay-ms': 'int',
+            '*delay-max-ms': 'int',
+            'probability': 'number',
+            '*max-hits': 'int',
+            'clear-on': 'ScsiFaultRecovery',
+            'below-clear': 'ScsiFaultBelowClear',
+            '*tmf-hang-ms': 'int',
+            'hits': 'int',
+            'held': 'int',
+            'attempts': 'ScsiFaultAttempts',
+            '*last-attempt': 'ScsiFaultRecovery' } }
+
+##
+# @x-scsi-fault-list:
+#
+# List the SCSI target faults armed on an adapter.
+#
+# @device: ID or QOM path of the SCSI adapter
+#
+# Returns: the armed faults, in the order they are evaluated
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "x-scsi-fault-list",
+#          "arguments": { "device": "scsi0" } }
+#     <- { "return": [ { "id": "hang1", "target": 1,
+#                        "hold-at": "submit", "stall": true,
+#                        "probability": 1.0,
+#                        "clear-on": "target-reset",
+#                        "below-clear": "proceed",
+#                        "hits": 12, "held": 4,
+#                        "attempts": { "abort-task": 0, "task-set": 0,
+#                                      "lun-reset": 2,
+#                                      "target-reset": 0,
+#                                      "bus-reset": 0 },
+#                        "last-attempt": "lun-reset" } ] }
+##
+{ 'command': 'x-scsi-fault-list',
+  'data': { 'device': 'str' },
+  'returns': ['ScsiFaultInfo'],
+  'features': [ 'unstable' ] }
+
+##
+# @SCSI_FAULT_CLEARED:
+#
+# Emitted when a SCSI target fault clears, either because the guest
+# performed the recovery it was waiting for or because it was
+# removed with x-scsi-fault-remove.
+#
+# @device: the adapter, exactly as given to x-scsi-fault-add.  Faults
+#     added under different names for the same adapter, such as its ID
+#     and its QOM path, report different strings.
+#
+# @bus: name of the adapter's SCSI bus, as used in trace output
+#
+# @id: name of the fault
+#
+# @recovery: what cleared the fault
+#
+# @held: number of commands the fault was holding when it cleared.
+#     They are released and run, unless a recovery request that some
+#     fault had left hanging is carried out first and cancels them.
+#
+# Features:
+#
+# @unstable: This event is experimental.
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     <- { "event": "SCSI_FAULT_CLEARED",
+#          "data": { "device": "scsi0", "bus": "scsi0.0",
+#                    "id": "hang1", "recovery": "target-reset",
+#                    "held": 0 },
+#          "timestamp": { "seconds": 1265044230, "microseconds": 450486 } }
+##
+{ 'event': 'SCSI_FAULT_CLEARED',
+  'data': { 'device': 'str',
+            'bus': 'str',
+            'id': 'str',
+            'recovery': 'ScsiFaultRecovery',
+            'held': 'int' },
+  'features': [ 'unstable' ] }

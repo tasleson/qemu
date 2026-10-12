@@ -53,6 +53,23 @@ struct SCSIRequest {
     BlockAIOCB        *aiocb;
     QEMUSGList        *sg;
 
+    /*
+     * The SCSI target fault holding this request (see scsi-fault.c), 0 if
+     * none, and the timer that releases it if the fault holds it for a
+     * set time.  Only touched in the request's AioContext, but read under
+     * requests_lock from the main loop.
+     */
+    uint32_t          fault_serial;     /* atomic */
+    QEMUTimer         *fault_timer;
+
+    /*
+     * The unit attention this request took when it was created, and
+     * whether it was the bus's rather than the device's, so a target
+     * fault can give it back if the request is cancelled without running.
+     */
+    SCSISense         fetched_ua;
+    bool              fetched_ua_from_bus;
+
     /* Protected by SCSIDevice->requests_lock */
     QTAILQ_ENTRY(SCSIRequest) next;
 };
@@ -162,6 +179,22 @@ struct SCSIBusInfo {
      */
     void (*drained_begin)(SCSIBus *bus);
     void (*drained_end)(SCSIBus *bus);
+
+    /*
+     * Set this to let SCSI target faults (see scsi-fault.c) hold commands
+     * on this bus.  scsi_req_enqueue() then may return 0 without running
+     * the command; when the fault lets go of it, the command is sent to
+     * the device and this is called in the request's AioContext with what
+     * scsi_req_enqueue() would have returned, so the HBA can carry on as
+     * it would have.
+     */
+    void (*fault_resume)(SCSIRequest *req, int32_t len);
+
+    /*
+     * Called from the main loop after a fault on this bus clears or is
+     * removed, for HBAs that keep recovery requests waiting on one.
+     */
+    void (*fault_removed)(SCSIBus *bus);
 };
 
 struct SCSIBus {
@@ -172,6 +205,10 @@ struct SCSIBus {
     const SCSIBusInfo *info;
 
     int drain_count; /* protected by BQL */
+
+    /* SCSI target faults, see scsi-fault.c */
+    unsigned int fault_count;           /* armed faults, atomic */
+    struct SCSIFaultTable *faults;      /* created by the first fault */
 };
 
 /**

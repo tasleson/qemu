@@ -83,6 +83,7 @@ if have_system
   stub_ss.add(files('qmp-i386-sgx.c'))
   stub_ss.add(files('qmp-i386-xen.c'))
   stub_ss.add(files('qmp-scsi-inject.c'))
+  stub_ss.add(files('qmp-scsi-fault.c'))
   stub_ss.add(files('qmp-nvme-inject.c'))
   stub_ss.add(files('qmp-ide-inject.c'))
   stub_ss.add(files('qmp-sd-inject.c'))
