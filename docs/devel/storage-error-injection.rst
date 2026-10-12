@@ -1,11 +1,13 @@
 Storage Error and Response Injection
 =====================================
 
-QEMU provides three complementary mechanisms for testing how guest software
+QEMU provides four complementary mechanisms for testing how guest software
 handles storage errors and unusual hardware responses:
 
 - **inject-error** block filter driver -- injects I/O errors (bad sectors)
   and latency (slow, stalled and timing-out requests) at the block layer
+- **SCSI target faults** -- make a SCSI target, or one LUN of it, stop
+  answering until the guest performs the error recovery that brings it back
 - **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
   at the SCSI emulation layer
 - **NVMe response injection** -- overrides Identify Controller and Identify
@@ -236,6 +238,173 @@ Out-of-order completion     ``delay-max-ms`` above ``delay-ms``
 Reset race                  a hold that straddles the guest's timeout, so
                             the completion lands during recovery
 =========================== ================================================
+
+
+SCSI Target Faults
+------------------
+
+Latency rules see the guest's recovery only as a drain of their block
+node.  They can't tell an abort from a LUN reset from an adapter reset, an
+ABORT TASK never reaches them, and the rule is still armed afterwards, so
+the commands the guest reissues stall again and recovery never appears to
+work.  A rule also covers one node, so a target with several LUNs needs a
+rule on each.
+
+A *SCSI target fault* works at the SCSI layer instead.  It is armed on an
+adapter for a target, or one LUN of it, and holds the commands sent there
+before they run.  Each fault names the least disruptive recovery that
+fixes it; when the guest performs that recovery, the fault clears by
+itself and the commands the recovery did not cancel go on to run.  This is
+what a real target that needed resetting looks like from the initiator,
+and it lets a guest driver's whole escalation path be exercised: aborts,
+then LUN resets, then target resets, then resetting the adapter.
+
+Held commands have not reached the device, so a held write never lands on
+the backend, and aborting or resetting cancels a held command at once.
+They are still listed as outstanding, so QUERY TASK finds them.
+
+Faults are only supported on virtio-scsi.  They block migration while any
+is armed.
+
+Recovery levels
+^^^^^^^^^^^^^^^
+
+From least to most disruptive:
+
+================ ===============================================================
+``abort-task``   ABORT TASK addressed to the fault's target or LUN, whatever
+                 tag it names: one that isn't outstanding still gets FUNCTION
+                 COMPLETE, so it counts too
+``task-set``     ABORT TASK SET or CLEAR TASK SET
+``lun-reset``    LOGICAL UNIT RESET.  For a fault on a whole target, a reset of
+                 any of its LUNs.
+``target-reset`` I_T NEXUS RESET
+``bus-reset``    resetting the adapter; for virtio-scsi, a device reset, which
+                 includes a system reset
+``manual``       nothing the guest does; only ``x-scsi-fault-remove``
+================ ===============================================================
+
+A recovery attempt below the fault's ``clear-on`` level does what
+``below-clear`` says:
+
+- ``proceed`` (default): the attempt does its normal work, so it cancels the
+  held commands, but the fault stays and holds the commands the guest sends
+  next -- a reset that "succeeds" on a target that is still wedged.
+- ``reject``: the TMF fails with FUNCTION REJECTED and changes nothing.
+- ``hang``: the TMF gets no answer until the fault clears, or until
+  ``tmf-hang-ms`` runs out, and is then carried out and answered.  A device
+  reset drops it like anything else outstanding on the ring.  How long it
+  waits is fixed when it arrives.  Whenever a fault goes away it is looked
+  at again against the faults still armed: if none of them hangs it any
+  more it goes ahead, or is rejected if one says so, and otherwise its wait
+  can only get shorter.  Arming another hanging fault afterwards never
+  makes it wait longer, and nothing else -- such as other TMFs finishing --
+  changes it.
+
+A device reset can't be refused, so it always behaves like ``proceed``.
+
+Fault options
+^^^^^^^^^^^^^
+
+- ``id`` (string, required): name of the fault on its adapter
+- ``target`` (required) and ``lun``: what the fault covers.  Without
+  ``lun`` it covers every LUN of the target.
+- ``delay-ms`` / ``delay-max-ms``: hold each command for that long, drawn
+  uniformly from [``delay-ms``, ``delay-max-ms``), and then run it, for a
+  target that is slow rather than stuck.  Both are at most 86400000 (a
+  day).  Without either, commands are held until the fault clears.  A
+  delay fault still clears on ``clear-on``, by default a LUN reset, so use
+  ``clear-on: manual`` for latency that should outlast the guest's
+  recovery.
+- ``probability`` (default 1.0) and ``max-hits`` (at least 1): hold only
+  that fraction of commands, or stop holding after that many.  The fault
+  stays armed until it clears either way.
+- ``clear-on`` (default ``lun-reset``), ``below-clear`` (default
+  ``proceed``) and ``tmf-hang-ms`` (at most 86400000, counted from when the
+  TMF arrived; a TMF several faults hang waits for all of them): see above.
+- ``hold-at`` (default ``submit``): where commands are held.  ``submit``,
+  before they run, is the only choice so far.
+
+Times are in guest time: they don't run while the VM is stopped.  Nor does
+anything a fault clearing would complete to the guest -- released commands
+and hung TMFs -- happen while the VM is stopped; it waits until it runs
+again.
+
+Held commands are released in the order the guest sent them, as far as
+each LUN and request queue goes; nothing orders commands to different LUNs,
+or on queues served by different iothreads, against each other.
+
+A unit attention is taken by the first command created after it is raised,
+as usual in QEMU.  If a fault holds that command, the unit attention is
+reported when the command is released, possibly after later commands.  If
+the command is aborted or reset instead, it never ran, so the unit
+attention is given back for the next command.  It goes back as if raised
+again: if another one is pending by then, the more important of the two
+stays, by the same precedence QEMU always applies.  A reset that cancels
+the command raises its own afterwards, which takes precedence over it.
+
+Unit attentions are taken and given back without a lock, from the
+iothread that runs the command, as QEMU already takes them.  With
+``iothread-vq-mapping``, two iothreads could in principle give one back to
+the same LUN at once and leave a mix of the two; this hasn't been seen.
+
+QMP commands and events
+^^^^^^^^^^^^^^^^^^^^^^^
+
+The adapter is named by its device ID or QOM path, e.g. the ID of a
+``virtio-scsi-pci`` device; a virtio proxy is looked through to the device
+on its virtio bus, but nothing further down is, so naming a bridge is an
+error rather than a way to reach the adapters behind it.  Events give the
+adapter exactly as the fault was added, so a fault added by QOM path is
+reported by QOM path.
+
+**x-scsi-fault-add** -- arm a fault::
+
+    { "execute": "x-scsi-fault-add",
+      "arguments": { "device": "scsi0",
+                     "fault": { "id": "hang1", "target": 1,
+                                "clear-on": "target-reset" } } }
+
+**x-scsi-fault-remove** -- disarm the fault named ``id``, or every fault.
+The commands it holds run, as if the recovery had happened.
+
+**x-scsi-fault-list** -- list the armed faults with how many commands each
+has held so far and is holding now, and how many recovery attempts of each
+kind it has seen.
+
+**SCSI_FAULT_CLEARED** is sent whenever a fault clears, saying what cleared
+it (``manual`` for ``x-scsi-fault-remove``) and how many commands it was
+holding at that moment.  Those are released, but a TMF some fault left
+hanging may go ahead at the same time and cancel some of them, so the count
+is an upper bound on what runs.  A harness can wait for the event rather
+than watch traces.
+
+The ``scsi_fault_*`` and ``virtio_scsi_tmf_*`` trace events show each
+command held and released and each recovery attempt with what the faults
+made of it.
+
+Scenarios
+^^^^^^^^^
+
+=============================== ===============================================
+Scenario                        Fault
+=============================== ===============================================
+LUN hangs until it is reset     ``target`` and ``lun``; the defaults do the
+                                rest
+Aborts don't help, a LUN reset  ``clear-on`` ``lun-reset``; each abort
+does                            cancels only the command it names
+Wedged target that LUN resets   ``clear-on`` ``target-reset``,
+don't fix                       ``below-clear`` ``proceed``
+Target refuses resets until     ``clear-on`` ``bus-reset``,
+the adapter is reset            ``below-clear`` ``reject``
+Reset that times out            ``below-clear`` ``hang``, with
+                                ``tmf-hang-ms`` past the guest's TMF timeout
+Dead target                     ``clear-on`` ``manual``
+Slow target                     ``delay-ms`` and ``delay-max-ms``, with
+                                ``probability`` for tail latency and
+                                ``clear-on`` ``manual`` so it outlasts
+                                recovery
+=============================== ===============================================
 
 
 SCSI Response Injection
