@@ -27,6 +27,7 @@
 #include "system/runstate.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
+#include "hw/scsi/scsi-fault.h"
 #include "scsi/constants.h"
 #include "hw/virtio/iothread-vq-mapping.h"
 #include "hw/virtio/virtio-bus.h"
@@ -62,6 +63,13 @@ typedef struct VirtIOSCSIReq {
     uint32_t diag_head;     /* queue << 16 | head */
     uint64_t diag_tag;
     int64_t diag_pop_us;
+
+    /*
+     * A TMF that is a recovery target faults are told about when it has
+     * finished, see virtio_scsi_tmf_fault_done()
+     */
+    bool fault_recovery;
+    ScsiFaultRecovery fault_level;
 
     union {
         VirtIOSCSICmdResp     cmd;
@@ -749,6 +757,16 @@ typedef struct {
 static void virtio_scsi_tmf_dec_remaining(VirtIOSCSIReq *tmf)
 {
     if (qatomic_fetch_dec(&tmf->remaining) == 1) {
+        if (tmf->fault_recovery) {
+            /* Faults change state in the main loop, so answer from there */
+            VirtIOSCSI *s = tmf->dev;
+
+            WITH_QEMU_LOCK_GUARD(&s->ctrl_lock) {
+                QTAILQ_INSERT_TAIL(&s->tmf_finishing, tmf, next);
+            }
+            qemu_bh_schedule(s->tmf_bh);
+            return;
+        }
         trace_virtio_scsi_tmf_resp(tmf->req.tmf.lun[1],
                                    virtio_scsi_get_lun(tmf->req.tmf.lun),
                                    tmf->req.tmf.tag, tmf->resp.tmf.response,
@@ -916,7 +934,7 @@ static AioContext *find_aio_context_for_tmf_tag(SCSIDevice *d,
 /* Return 0 if the request is ready to be completed and return to guest;
  * -EINPROGRESS if the request is submitted and will be completed later, in the
  *  case of async cancellation. */
-static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
+static int virtio_scsi_run_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
 {
     SCSIDevice *d = virtio_scsi_device_get(s, req->req.tmf.lun);
     SCSIRequest *r, *next;
@@ -925,19 +943,6 @@ static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
 
     /* Here VIRTIO_SCSI_S_OK means "FUNCTION COMPLETE".  */
     req->resp.tmf.response = VIRTIO_SCSI_S_OK;
-
-    /*
-     * req->req.tmf has the QEMU_PACKED attribute. Don't use virtio_tswap32s()
-     * to avoid compiler errors.
-     */
-    req->req.tmf.subtype =
-        virtio_tswap32(VIRTIO_DEVICE(s), req->req.tmf.subtype);
-
-    trace_virtio_scsi_tmf_req(req->req.tmf.lun[1],
-                              virtio_scsi_get_lun(req->req.tmf.lun),
-                              req->req.tmf.tag, req->req.tmf.subtype,
-                              virtio_scsi_bus_name(s));
-    virtio_scsi_diag_tmf(s);
 
     switch (req->req.tmf.subtype) {
     case VIRTIO_SCSI_T_TMF_ABORT_TASK: {
@@ -1082,15 +1087,118 @@ fail:
     return ret;
 }
 
+/* The kind of recovery a TMF is, for target faults */
+static bool virtio_scsi_tmf_recovery(uint32_t subtype, ScsiFaultRecovery *level)
+{
+    switch (subtype) {
+    case VIRTIO_SCSI_T_TMF_ABORT_TASK:
+        *level = SCSI_FAULT_RECOVERY_ABORT_TASK;
+        return true;
+    case VIRTIO_SCSI_T_TMF_ABORT_TASK_SET:
+    case VIRTIO_SCSI_T_TMF_CLEAR_TASK_SET:
+        *level = SCSI_FAULT_RECOVERY_TASK_SET;
+        return true;
+    case VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET:
+        *level = SCSI_FAULT_RECOVERY_LUN_RESET;
+        return true;
+    case VIRTIO_SCSI_T_TMF_I_T_NEXUS_RESET:
+        *level = SCSI_FAULT_RECOVERY_TARGET_RESET;
+        return true;
+    default:
+        return false;
+    }
+}
+
 /*
- * A TMF whose response is being held back (see VirtIOSCSI::tmf_delay_*), so
- * the guest's reset stays in flight long enough to race a second reset.
- * Held TMFs are kept on VirtIOSCSI::held_tmfs, main loop only, so a device
- * reset can drop them: the ring they came from is gone by then.
+ * A TMF has done its cancelling and is about to be answered: let the target
+ * faults it was enough for clear, unless it failed.  Main loop.
+ */
+static void virtio_scsi_tmf_fault_done(VirtIOSCSI *s, VirtIOSCSIReq *req)
+{
+    uint8_t response = req->resp.tmf.response;
+
+    if (!req->fault_recovery) {
+        return;
+    }
+    req->fault_recovery = false;
+    /* VIRTIO_SCSI_S_OK means "FUNCTION COMPLETE" */
+    if (response == VIRTIO_SCSI_S_OK ||
+        response == VIRTIO_SCSI_S_FUNCTION_SUCCEEDED) {
+        scsi_fault_recovery_done(&s->bus, req->fault_level,
+                                 req->req.tmf.lun[1],
+                                 virtio_scsi_get_lun(req->req.tmf.lun));
+    }
+}
+
+static void virtio_scsi_tmf_answer(VirtIOSCSI *s, VirtIOSCSIReq *req)
+{
+    virtio_scsi_tmf_fault_done(s, req);
+    trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
+                               virtio_scsi_get_lun(req->req.tmf.lun),
+                               req->req.tmf.tag, req->resp.tmf.response,
+                               virtio_scsi_bus_name(s));
+    virtio_scsi_complete_req(req, &s->ctrl_lock);
+}
+
+static void virtio_scsi_tmf_hang(VirtIOSCSI *s, VirtIOSCSIReq *req,
+                                 int64_t hang_ms);
+
+/*
+ * Like virtio_scsi_run_tmf(), but a target fault may also reject the TMF or
+ * hold it (-EINPROGRESS) before it is carried out.
+ */
+static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
+{
+    int64_t hang_ms;
+
+    /*
+     * req->req.tmf has the QEMU_PACKED attribute. Don't use virtio_tswap32s()
+     * to avoid compiler errors.
+     */
+    req->req.tmf.subtype =
+        virtio_tswap32(VIRTIO_DEVICE(s), req->req.tmf.subtype);
+
+    trace_virtio_scsi_tmf_req(req->req.tmf.lun[1],
+                              virtio_scsi_get_lun(req->req.tmf.lun),
+                              req->req.tmf.tag, req->req.tmf.subtype,
+                              virtio_scsi_bus_name(s));
+    virtio_scsi_diag_tmf(s);
+
+    if (scsi_fault_armed(&s->bus) &&
+        virtio_scsi_tmf_recovery(req->req.tmf.subtype, &req->fault_level)) {
+        switch (scsi_fault_recovery(&s->bus, req->fault_level,
+                                    req->req.tmf.lun[1],
+                                    virtio_scsi_get_lun(req->req.tmf.lun),
+                                    true, &hang_ms)) {
+        case SCSI_FAULT_ACTION_REJECT:
+            req->resp.tmf.response = VIRTIO_SCSI_S_FUNCTION_REJECTED;
+            return 0;
+        case SCSI_FAULT_ACTION_HANG:
+            virtio_scsi_tmf_hang(s, req, hang_ms);
+            return -EINPROGRESS;
+        case SCSI_FAULT_ACTION_PROCEED:
+            break;
+        }
+        req->fault_recovery = true;
+    }
+
+    return virtio_scsi_run_tmf(s, req);
+}
+
+/*
+ * A TMF whose response is being held back: either by x-tmf-delay (see
+ * VirtIOSCSI::tmf_delay_*), so the guest's reset stays in flight long enough
+ * to race a second reset, or because a target fault left it hanging before
+ * it was carried out.  Held TMFs are kept on VirtIOSCSI::held_tmfs, main
+ * loop only, so a device reset can drop them: the ring they came from is
+ * gone by then.
  */
 typedef struct VirtIOSCSIHeldTMF {
     VirtIOSCSIReq *req;
     QEMUTimer timer;
+    bool hung;              /* by a target fault, not yet carried out */
+    int64_t hung_since_ms;  /* QEMU_CLOCK_VIRTUAL, when hung */
+    int64_t hang_ms;        /* longest it may hang, -1 until faults clear */
     QTAILQ_ENTRY(VirtIOSCSIHeldTMF) next;
 } VirtIOSCSIHeldTMF;
 
@@ -1115,6 +1223,156 @@ static void virtio_scsi_tmf_delay_cb(void *opaque)
                                req->resp.tmf.response,
                                virtio_scsi_bus_name(s));
     virtio_scsi_complete_req(req, &s->ctrl_lock);
+}
+
+/* Carry out a TMF a target fault left hanging, or reject it, and answer */
+static void virtio_scsi_tmf_resume(VirtIOSCSI *s, VirtIOSCSIReq *req,
+                                   bool reject)
+{
+    if (reject) {
+        req->resp.tmf.response = VIRTIO_SCSI_S_FUNCTION_REJECTED;
+    } else {
+        req->fault_recovery = true;
+        if (virtio_scsi_run_tmf(s, req) == -EINPROGRESS) {
+            return;
+        }
+    }
+    virtio_scsi_tmf_answer(s, req);
+}
+
+static void virtio_scsi_tmf_hang_cb(void *opaque)
+{
+    VirtIOSCSIHeldTMF *h = opaque;
+    VirtIOSCSIReq *req = h->req;
+    VirtIOSCSI *s = req->dev;
+
+    virtio_scsi_held_tmf_free(s, h);
+    virtio_scsi_tmf_resume(s, req, false);
+}
+
+static void virtio_scsi_tmf_hang(VirtIOSCSI *s, VirtIOSCSIReq *req,
+                                 int64_t hang_ms)
+{
+    VirtIOSCSIHeldTMF *h = g_new0(VirtIOSCSIHeldTMF, 1);
+
+    trace_virtio_scsi_tmf_hang(req->req.tmf.lun[1],
+                               virtio_scsi_get_lun(req->req.tmf.lun),
+                               req->req.tmf.tag, hang_ms,
+                               virtio_scsi_bus_name(s));
+    h->req = req;
+    h->hung = true;
+    h->hung_since_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    h->hang_ms = hang_ms;
+    timer_init_ms(&h->timer, QEMU_CLOCK_VIRTUAL, virtio_scsi_tmf_hang_cb, h);
+    if (hang_ms >= 0) {
+        timer_mod(&h->timer, h->hung_since_ms + hang_ms);
+    }
+    QTAILQ_INSERT_TAIL(&s->held_tmfs, h, next);
+}
+
+/*
+ * Look again at the TMFs target faults left hanging, after a fault went
+ * away.  One that no remaining fault hangs goes ahead, or is rejected if a
+ * remaining fault says so.  One that is still hung keeps the wait it got
+ * when it came, unless what hangs it now gives up sooner: a wait can only
+ * get shorter, so a fault added since can't stretch it.
+ *
+ * Carrying one out can drain, which runs nested BHs and timers that may
+ * answer other held TMFs, so start over after each.
+ */
+static void virtio_scsi_tmf_recheck_hung(VirtIOSCSI *s)
+{
+    VirtIOSCSIHeldTMF *h;
+    bool again = true;
+
+    while (again) {
+        again = false;
+        QTAILQ_FOREACH(h, &s->held_tmfs, next) {
+            VirtIOSCSIReq *req = h->req;
+            SCSIFaultAction action;
+            int64_t hang_ms;
+
+            if (!h->hung) {
+                continue;
+            }
+            action = scsi_fault_recovery(&s->bus, req->fault_level,
+                                         req->req.tmf.lun[1],
+                                         virtio_scsi_get_lun(req->req.tmf.lun),
+                                         false, &hang_ms);
+            if (action == SCSI_FAULT_ACTION_HANG) {
+                if (hang_ms >= 0 && (h->hang_ms < 0 || hang_ms < h->hang_ms)) {
+                    h->hang_ms = hang_ms;
+                    timer_mod(&h->timer, h->hung_since_ms + hang_ms);
+                }
+                continue;
+            }
+            virtio_scsi_held_tmf_free(s, h);
+            virtio_scsi_tmf_resume(s, req,
+                                   action == SCSI_FAULT_ACTION_REJECT);
+            again = true;
+            break;
+        }
+    }
+}
+
+/*
+ * Main loop half of the TMFs target faults care about: answer the ones that
+ * finished in a request AioContext, and look again at the hung ones if a
+ * fault went away.
+ *
+ * A hung TMF that may go ahead now is carried out and answered, which must
+ * not happen while the VM is stopped.  A fault removed then only lets go
+ * once the VM runs, but the BH may have been scheduled just before it
+ * stopped, so leave the recheck pending until it runs.
+ */
+static void virtio_scsi_tmf_bh(void *opaque)
+{
+    VirtIOSCSI *s = opaque;
+    VirtIOSCSIReq *req;
+
+    do {
+        WITH_QEMU_LOCK_GUARD(&s->ctrl_lock) {
+            req = QTAILQ_FIRST(&s->tmf_finishing);
+            if (req) {
+                QTAILQ_REMOVE(&s->tmf_finishing, req, next);
+            }
+        }
+        if (req) {
+            virtio_scsi_tmf_answer(s, req);
+        }
+    } while (req);
+
+    if (!s->tmf_recheck_pending || !runstate_is_running()) {
+        return;
+    }
+    s->tmf_recheck_pending = false;
+    virtio_scsi_tmf_recheck_hung(s);
+}
+
+static void virtio_scsi_vm_state_change(void *opaque, bool running,
+                                        RunState state)
+{
+    VirtIOSCSI *s = opaque;
+
+    if (running && s->tmf_recheck_pending) {
+        qemu_bh_schedule(s->tmf_bh);
+    }
+}
+
+/* Forget the TMFs waiting for virtio_scsi_tmf_bh(), at reset or unrealize */
+static void virtio_scsi_drop_finishing_tmfs(VirtIOSCSI *s)
+{
+    VirtIOSCSIReq *req;
+
+    QEMU_LOCK_GUARD(&s->ctrl_lock);
+    while ((req = QTAILQ_FIRST(&s->tmf_finishing))) {
+        QTAILQ_REMOVE(&s->tmf_finishing, req, next);
+        trace_virtio_scsi_tmf_drop(req->req.tmf.lun[1],
+                                   virtio_scsi_get_lun(req->req.tmf.lun),
+                                   req->req.tmf.tag, virtio_scsi_bus_name(s));
+        virtqueue_detach_element(req->vq, &req->elem, 0);
+        virtio_scsi_free_req(req);
+    }
 }
 
 /* Forget the held TMFs without answering them, at reset or unrealize */
@@ -1175,6 +1433,7 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
     }
     if (r == 0) {
         if (type == VIRTIO_SCSI_T_TMF) {
+            virtio_scsi_tmf_fault_done(s, req);
             if (s->tmf_delay_count > 0 && s->tmf_delay_ms > 0) {
                 /*
                  * Hold this TMF response for tmf_delay_ms before completing it,
@@ -1379,6 +1638,26 @@ static void virtio_scsi_request_cancelled(SCSIRequest *r)
     virtio_scsi_complete_cmd_req(req);
 }
 
+/* A command a target fault held has been sent to the device */
+static void virtio_scsi_fault_resume(SCSIRequest *r, int32_t len)
+{
+    /* As virtio_scsi_handle_cmd_req_submit() would have */
+    if (len) {
+        scsi_req_continue(r);
+    }
+}
+
+static void virtio_scsi_fault_removed(SCSIBus *bus)
+{
+    VirtIOSCSI *s = container_of(bus, VirtIOSCSI, bus);
+
+    /* A TMF the fault left hanging may go ahead now */
+    if (!QTAILQ_EMPTY(&s->held_tmfs)) {
+        s->tmf_recheck_pending = true;
+        qemu_bh_schedule(s->tmf_bh);
+    }
+}
+
 static void virtio_scsi_fail_cmd_req(VirtIOSCSIReq *req)
 {
     req->resp.cmd.response = VIRTIO_SCSI_S_FAILURE;
@@ -1549,16 +1828,24 @@ static void virtio_scsi_reset(VirtIODevice *vdev)
 {
     VirtIOSCSI *s = VIRTIO_SCSI(vdev);
     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(vdev);
+    int64_t hang_ms;
 
     assert(!s->dataplane_started);
 
     trace_virtio_scsi_reset(virtio_scsi_bus_name(s));
     virtio_scsi_flush_defer_tmf_to_aio_context(s);
 
+    /* An adapter reset can't be refused, whatever the faults say */
+    scsi_fault_recovery(&s->bus, SCSI_FAULT_RECOVERY_BUS_RESET, -1, -1, true,
+                        &hang_ms);
+
     qatomic_inc(&s->resetting);
     bus_cold_reset(BUS(&s->bus));
     qatomic_dec(&s->resetting);
     virtio_scsi_drop_held_tmfs(s);
+    virtio_scsi_drop_finishing_tmfs(s);
+
+    scsi_fault_recovery_done(&s->bus, SCSI_FAULT_RECOVERY_BUS_RESET, -1, -1);
 
     vs->sense_size = VIRTIO_SCSI_SENSE_DEFAULT_SIZE;
     vs->cdb_size = VIRTIO_SCSI_CDB_DEFAULT_SIZE;
@@ -1852,6 +2139,8 @@ static struct SCSIBusInfo virtio_scsi_scsi_info = {
     .load_request = virtio_scsi_load_request,
     .drained_begin = virtio_scsi_drained_begin,
     .drained_end = virtio_scsi_drained_end,
+    .fault_resume = virtio_scsi_fault_resume,
+    .fault_removed = virtio_scsi_fault_removed,
 };
 
 void virtio_scsi_common_realize(DeviceState *dev,
@@ -1906,6 +2195,7 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
     s->inflight_buf = g_hash_table_new(g_int64_hash, g_int64_equal);
     s->inflight_head = g_hash_table_new(g_direct_hash, g_direct_equal);
     QTAILQ_INIT(&s->held_tmfs);
+    QTAILQ_INIT(&s->tmf_finishing);
 
     virtio_scsi_common_realize(dev,
                                virtio_scsi_handle_ctrl,
@@ -1924,7 +2214,17 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
     /* override default SCSI bus hotplug-handler, with virtio-scsi's one */
     qbus_set_hotplug_handler(BUS(&s->bus), OBJECT(dev));
 
-    virtio_scsi_dataplane_setup(s, errp);
+    virtio_scsi_dataplane_setup(s, &err);
+    if (err != NULL) {
+        error_propagate(errp, err);
+        return;
+    }
+
+    /* Only once realize can't fail: unrealize is what takes these down */
+    s->tmf_bh = qemu_bh_new_guarded(virtio_scsi_tmf_bh, s,
+                                    &DEVICE(s)->mem_reentrancy_guard);
+    s->tmf_vmstate = qemu_add_vm_change_state_handler(
+        virtio_scsi_vm_state_change, s);
 }
 
 void virtio_scsi_common_unrealize(DeviceState *dev)
@@ -1948,6 +2248,9 @@ static void virtio_scsi_device_unrealize(DeviceState *dev)
     VirtIOSCSI *s = VIRTIO_SCSI(dev);
 
     virtio_scsi_drop_held_tmfs(s);
+    virtio_scsi_drop_finishing_tmfs(s);
+    qemu_del_vm_change_state_handler(s->tmf_vmstate);
+    qemu_bh_delete(s->tmf_bh);
     virtio_scsi_dataplane_cleanup(s);
     qbus_set_hotplug_handler(BUS(&s->bus), NULL);
     for (uint32_t n = 0; s->diag_queues && n < s->parent_obj.conf.num_queues;
