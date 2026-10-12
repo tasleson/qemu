@@ -377,7 +377,12 @@ it (``manual`` for ``x-scsi-fault-remove``) and how many commands it was
 holding at that moment.  Those are released, but a TMF some fault left
 hanging may go ahead at the same time and cancel some of them, so the count
 is an upper bound on what runs.  A harness can wait for the event rather
-than watch traces.
+than watch traces; ``scripts/scsi-inject.py fault-wait`` does.  It keeps
+its QMP connection open while it waits, so give QEMU a second ``-qmp``
+socket for anything else the harness does meanwhile.  It exits with 0 once
+the fault clears, 4 if ``--timeout`` runs out, and 5 if the fault isn't
+armed when it starts -- already cleared, or never added; it can't tell
+which.  It exits with 1 on other errors, and 2 for a bad command line.
 
 The ``scsi_fault_*`` and ``virtio_scsi_tmf_*`` trace events show each
 command held and released and each recovery attempt with what the faults
