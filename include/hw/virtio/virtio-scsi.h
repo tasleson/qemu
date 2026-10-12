@@ -108,6 +108,7 @@ struct VirtIOSCSI {
      */
     uint32_t tmf_delay_ms;
     uint32_t tmf_delay_count;
+    QTAILQ_HEAD(, VirtIOSCSIHeldTMF) held_tmfs; /* main loop only */
 
     /*
      * Diagnostics for a request ring the device gives up on (see
