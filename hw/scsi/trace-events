@@ -15,6 +15,7 @@ scsi_req_parsed_lba(int target, int lun, int tag, int cmd, uint64_t lba) "target
 scsi_req_parse_bad(int target, int lun, int tag, int cmd) "target %d lun %d tag %d command %d"
 scsi_req_build_sense(int target, int lun, int tag, int key, int asc, int ascq) "target %d lun %d tag %d key 0x%02x asc 0x%02x ascq 0x%02x"
 scsi_device_set_ua(int target, int lun, int key, int asc, int ascq) "target %d lun %d key 0x%02x asc 0x%02x ascq 0x%02x"
+scsi_req_return_ua(int target, int lun, uint32_t tag, int key, int asc, int ascq, bool bus) "target %d lun %d tag %u key 0x%02x asc 0x%02x ascq 0x%02x bus %d"
 scsi_report_luns(int target, int lun, int tag) "target %d lun %d tag %d"
 scsi_inquiry(int target, int lun, int tag, int cdb1, int cdb2) "target %d lun %d tag %d page 0x%02x/0x%02x"
 scsi_test_unit_ready(int target, int lun, int tag) "target %d lun %d tag %d"
@@ -406,3 +407,10 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
 scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
 scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
 scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
+
+# scsi-fault.c
+scsi_fault_add(const char *bus, const char *id, uint32_t target, int lun, const char *clear_on, const char *below_clear) "scsi_fault_add bus=%s id=%s target=%u lun=%d clear_on=%s below_clear=%s"
+scsi_fault_hold(const char *bus, const char *id, int target, int lun, uint32_t tag, int cmd, int64_t delay_ms) "scsi_fault_hold bus=%s id=%s target=%d lun=%d tag=0x%x cmd=0x%02x delay_ms=%" PRId64
+scsi_fault_release(const char *bus, int target, int lun, uint32_t tag) "scsi_fault_release bus=%s target=%d lun=%d tag=0x%x"
+scsi_fault_recovery(const char *bus, const char *id, const char *recovery, int target, int lun, const char *action) "scsi_fault_recovery bus=%s id=%s recovery=%s target=%d lun=%d action=%s"
+scsi_fault_clear(const char *bus, const char *id, const char *recovery, int64_t held) "scsi_fault_clear bus=%s id=%s recovery=%s held=%" PRId64
