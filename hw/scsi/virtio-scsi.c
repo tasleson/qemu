@@ -1083,29 +1083,57 @@ fail:
 }
 
 /*
- * Pending deferred TMF response (see VirtIOSCSI::tmf_delay_*). Holds the
- * control-queue response until the timer fires so the guest's reset stays
- * in flight long enough to race a second reset.
+ * A TMF whose response is being held back (see VirtIOSCSI::tmf_delay_*), so
+ * the guest's reset stays in flight long enough to race a second reset.
+ * Held TMFs are kept on VirtIOSCSI::held_tmfs, main loop only, so a device
+ * reset can drop them: the ring they came from is gone by then.
  */
-typedef struct VirtIOSCSITMFDelay {
+typedef struct VirtIOSCSIHeldTMF {
     VirtIOSCSIReq *req;
     QEMUTimer timer;
-} VirtIOSCSITMFDelay;
+    QTAILQ_ENTRY(VirtIOSCSIHeldTMF) next;
+} VirtIOSCSIHeldTMF;
+
+static void virtio_scsi_held_tmf_free(VirtIOSCSI *s, VirtIOSCSIHeldTMF *h)
+{
+    QTAILQ_REMOVE(&s->held_tmfs, h, next);
+    timer_del(&h->timer);
+    timer_deinit(&h->timer);
+    g_free(h);
+}
 
 static void virtio_scsi_tmf_delay_cb(void *opaque)
 {
-    VirtIOSCSITMFDelay *d = opaque;
-    VirtIOSCSIReq *req = d->req;
+    VirtIOSCSIHeldTMF *h = opaque;
+    VirtIOSCSIReq *req = h->req;
     VirtIOSCSI *s = req->dev;
 
+    virtio_scsi_held_tmf_free(s, h);
     trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
                                virtio_scsi_get_lun(req->req.tmf.lun),
                                req->req.tmf.tag,
                                req->resp.tmf.response,
                                virtio_scsi_bus_name(s));
     virtio_scsi_complete_req(req, &s->ctrl_lock);
-    timer_deinit(&d->timer);
-    g_free(d);
+}
+
+/* Forget the held TMFs without answering them, at reset or unrealize */
+static void virtio_scsi_drop_held_tmfs(VirtIOSCSI *s)
+{
+    VirtIOSCSIHeldTMF *h, *next;
+
+    QTAILQ_FOREACH_SAFE(h, &s->held_tmfs, next, next) {
+        VirtIOSCSIReq *req = h->req;
+
+        virtio_scsi_held_tmf_free(s, h);
+        trace_virtio_scsi_tmf_drop(req->req.tmf.lun[1],
+                                   virtio_scsi_get_lun(req->req.tmf.lun),
+                                   req->req.tmf.tag, virtio_scsi_bus_name(s));
+        WITH_QEMU_LOCK_GUARD(&s->ctrl_lock) {
+            virtqueue_detach_element(req->vq, &req->elem, 0);
+        }
+        virtio_scsi_free_req(req);
+    }
 }
 
 static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
@@ -1154,19 +1182,20 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
                  * emitted when the response is actually released (in the timer
                  * callback) so the harness timeline reflects the real delay.
                  */
-                VirtIOSCSITMFDelay *d = g_new0(VirtIOSCSITMFDelay, 1);
+                VirtIOSCSIHeldTMF *h = g_new0(VirtIOSCSIHeldTMF, 1);
 
                 s->tmf_delay_count--;
-                d->req = req;
+                h->req = req;
                 trace_virtio_scsi_tmf_delay(req->req.tmf.lun[1],
                                             virtio_scsi_get_lun(req->req.tmf.lun),
                                             req->req.tmf.tag, s->tmf_delay_ms,
                                             virtio_scsi_bus_name(s));
-                timer_init_ms(&d->timer, QEMU_CLOCK_VIRTUAL,
-                              virtio_scsi_tmf_delay_cb, d);
-                timer_mod(&d->timer,
+                timer_init_ms(&h->timer, QEMU_CLOCK_VIRTUAL,
+                              virtio_scsi_tmf_delay_cb, h);
+                timer_mod(&h->timer,
                           qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                               s->tmf_delay_ms);
+                QTAILQ_INSERT_TAIL(&s->held_tmfs, h, next);
                 return;
             }
             trace_virtio_scsi_tmf_resp(req->req.tmf.lun[1],
@@ -1529,6 +1558,7 @@ static void virtio_scsi_reset(VirtIODevice *vdev)
     qatomic_inc(&s->resetting);
     bus_cold_reset(BUS(&s->bus));
     qatomic_dec(&s->resetting);
+    virtio_scsi_drop_held_tmfs(s);
 
     vs->sense_size = VIRTIO_SCSI_SENSE_DEFAULT_SIZE;
     vs->cdb_size = VIRTIO_SCSI_CDB_DEFAULT_SIZE;
@@ -1875,6 +1905,7 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
     qemu_mutex_init(&s->diag_lock);
     s->inflight_buf = g_hash_table_new(g_int64_hash, g_int64_equal);
     s->inflight_head = g_hash_table_new(g_direct_hash, g_direct_equal);
+    QTAILQ_INIT(&s->held_tmfs);
 
     virtio_scsi_common_realize(dev,
                                virtio_scsi_handle_ctrl,
@@ -1916,6 +1947,7 @@ static void virtio_scsi_device_unrealize(DeviceState *dev)
 {
     VirtIOSCSI *s = VIRTIO_SCSI(dev);
 
+    virtio_scsi_drop_held_tmfs(s);
     virtio_scsi_dataplane_cleanup(s);
     qbus_set_hotplug_handler(BUS(&s->bus), NULL);
     for (uint32_t n = 0; s->diag_queues && n < s->parent_obj.conf.num_queues;

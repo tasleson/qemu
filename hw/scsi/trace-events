@@ -341,6 +341,7 @@ virtio_scsi_cmd_resp(int lun, uint32_t tag, int response, uint8_t status) "virti
 virtio_scsi_tmf_req(int target, int lun, uint32_t tag, int subtype, const char *bus) "virtio_scsi_tmf_req target=%d lun=%u tag=0x%x subtype=%d bus=%s"
 virtio_scsi_tmf_resp(int target, int lun, uint32_t tag, int response, const char *bus) "virtio_scsi_tmf_resp target=%d lun=%u tag=0x%x response=%d bus=%s"
 virtio_scsi_tmf_delay(int target, int lun, uint32_t tag, uint32_t delay_ms, const char *bus) "virtio_scsi_tmf_delay target=%d lun=%u tag=0x%x delay_ms=%u bus=%s"
+virtio_scsi_tmf_drop(int target, int lun, uint32_t tag, const char *bus) "virtio_scsi_tmf_drop target=%d lun=%u tag=0x%x bus=%s"
 virtio_scsi_reset(const char *bus) "virtio_scsi_reset bus=%s"
 virtio_scsi_broken(const char *bus, int queue) "virtio_scsi_broken bus=%s queue=%d"
 virtio_scsi_broken_verdict(const char *bus, unsigned int queue, unsigned int pos, const char *verdict, bool head_inflight, uint32_t tmf_seq, uint64_t overlaps) "virtio_scsi_broken_verdict bus=%s queue=%u pos=%u verdict=%s head_inflight=%d tmf_seq=%u overlaps=%"PRIu64
