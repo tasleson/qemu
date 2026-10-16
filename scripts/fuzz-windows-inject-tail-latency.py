@@ -80,6 +80,7 @@ PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
 DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
 DEFAULT_FIO_PATH = r"C:\Program Files\fio\fio.exe"
+DEFAULT_PARANOID_PATH = r"C:\test\paranoid.exe"
 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
 VIOSCSI_TELEMETRY_TIMEOUT_S = 60
 WRITER_STOP_TIMEOUT_S = 30
@@ -153,6 +154,20 @@ WRITER_BLOCK_BYTES = 64 * 1024
 WRITER_THREADS = 4
 WRITER_QUEUE_DEPTH = 32
 
+# paranoid.exe's own '--per-request-timeout-ms' is independent of (and
+# would otherwise fight) the rule's hold: a single-queue op held past the
+# rule's 61-65s would look like a stuck device and fail the run, when
+# that hold is the whole point of the test. Set past delay-max-ms with
+# this much slop, the same margin WRITER_DURATION_SLACK_S gives the
+# writer's own lifetime.
+PARANOID_TIMEOUT_MARGIN_MS = 5000
+
+# Verify every write immediately (not some sampled fraction): this is a
+# corruption-hunting soak, not a throughput benchmark, so catching a bad
+# write the moment it happens -- rather than whenever that slot is later
+# read back -- matters more than the extra read it costs.
+PARANOID_VERIFY_EVERY = 1
+
 # Writers are budgeted to outlast the configured test duration by this much,
 # so a slow boot or heartbeat overhead can never let them exit early and
 # leave the back half of a multi-hour run with no I/O to delay.
@@ -175,10 +190,12 @@ fuzz-windows-inject-scsi-reset.py:
   6. For --io-driver=fio (optional, runs with data-integrity verification):
      copy a Windows fio.exe build into the guest at the path given by
      --fio-path (default: {DEFAULT_FIO_PATH}).
-  7. For vioscsi telemetry collection (optional, on by default): have the
+  7. For --io-driver=paranoid (optional): copy paranoid.exe into the guest
+     at the path given by --paranoid-path (default: {DEFAULT_PARANOID_PATH}).
+  8. For vioscsi telemetry collection (optional, on by default): have the
      script given by --vioscsi-telemetry-script (default:
      {DEFAULT_VIOSCSI_TELEMETRY_SCRIPT}) present in the guest.
-  8. Shut down cleanly.
+  9. Shut down cleanly.
 
 Environment overrides for running on different machines:
   QEMU_SRC, QEMU_BUILD   default to this script's own checkout
@@ -598,6 +615,58 @@ def build_fio_args(drive_number: int, duration_s: float) -> list:
     ]
 
 
+def paranoid_log_path(drive_number: int) -> str:
+    """Guest-side path to a writer's binary audit log. Unique per drive
+    number, which is itself unique within one VM, so concurrent writers
+    never share a log."""
+    return fr"C:\test\paranoid-PhysicalDrive{drive_number}.auditlog"
+
+
+def paranoid_failures_dir(log_path: str) -> str:
+    """Where paranoid.exe itself drops a verification failure's raw debug
+    data: a sibling directory of the audit log, named '<log-file>-failures'.
+    The audit log's 'verification_failure' event records the file it wrote
+    there in its error_detail, rather than embedding the dump itself."""
+    return f"{log_path}-failures"
+
+
+def build_paranoid_args(drive_number: int, duration_s: float,
+                        delay_max_ms: int) -> list:
+    # 'run' against a fixed window of the raw disk (paranoid.exe's '--disk'
+    # takes a PhysicalDriveN index, not a path), mixed read/write like
+    # diskspd/fio's 50/50 mix, and '--unbuffered' for the same reason as
+    # diskspd's '-Sh'/fio's 'direct=1' -- exercise the real I/O path, not
+    # the cache. '--i-understand-this-erases-data' is required since this
+    # writes; the LUN is a freshly-created blank image, never the boot
+    # disk, so there is nothing on it to lose.
+    #
+    # '--log-path' turns on the binary audit log (and so the sibling
+    # failure-dump directory, see paranoid_failures_dir), '--verify-every 1'
+    # catches a bad write immediately, and '--stop-on-first-error' exits the
+    # process the moment that happens -- an early exit is how the harness
+    # notices corruption, since the writer otherwise runs silently in the
+    # background for the whole soak.
+    return [
+        "run",
+        "--disk", str(drive_number),
+        "--start", "0",
+        "--length", str(WRITER_WINDOW_BYTES),
+        "--mode", "mixed",
+        "--read-percent", "50",
+        "--queue-depth", str(WRITER_THREADS * WRITER_QUEUE_DEPTH),
+        "--slot-size", str(WRITER_BLOCK_BYTES),
+        "--duration-secs", str(int(round(duration_s))),
+        "--order", "random",
+        "--unbuffered",
+        "--per-request-timeout-ms",
+        str(delay_max_ms + PARANOID_TIMEOUT_MARGIN_MS),
+        "--log-path", paranoid_log_path(drive_number),
+        "--verify-every", str(PARANOID_VERIFY_EVERY),
+        "--stop-on-first-error",
+        "--i-understand-this-erases-data",
+    ]
+
+
 RESOLVE_REQUEST = "resolve disk numbers"
 
 
@@ -627,6 +696,8 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                    io_driver: str = "powershell",
                    diskspd_path: str = DEFAULT_DISKSPD_PATH,
                    fio_path: str = DEFAULT_FIO_PATH,
+                   paranoid_path: str = DEFAULT_PARANOID_PATH,
+                   delay_max_ms: int = 0,
                    resyncs: Optional[list] = None) -> int:
     what = f"writer for PhysicalDrive{drive_number}"
     if io_driver == "diskspd":
@@ -636,6 +707,11 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
     if io_driver == "fio":
         return qga_exec(qga_sock, what, fio_path,
                          build_fio_args(drive_number, duration_s),
+                         capture=False, resyncs=resyncs)
+    if io_driver == "paranoid":
+        return qga_exec(qga_sock, what, paranoid_path,
+                         build_paranoid_args(drive_number, duration_s,
+                                             delay_max_ms),
                          capture=False, resyncs=resyncs)
     return ps_exec(qga_sock, what,
                     build_writer_script(drive_number, duration_s),
@@ -684,6 +760,144 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int,
     err = b64_text(status.get("err-data")).strip()
     return (f"fio exitcode={status.get('exitcode')}; "
             f"stdout={out[:400]!r}; stderr={err[:400]!r}")
+
+
+def paranoid_diagnostic(qga_sock: Path, paranoid_path: str, drive_number: int,
+                        delay_max_ms: int) -> str:
+    # Same rationale as diskspd_diagnostic/fio_diagnostic: a 1s run still
+    # has to wait out any op it launched into the rule's hold before it
+    # can exit and report, so give it room past delay_max_ms rather than
+    # the ordinary GUEST_EXEC_TIMEOUT_S.
+    diag_timeout = delay_max_ms / 1000.0 + GUEST_EXEC_TIMEOUT_S
+    try:
+        pid = qga_exec(qga_sock, "paranoid diagnostic", paranoid_path,
+                        build_paranoid_args(drive_number, 1, delay_max_ms),
+                        capture=True, timeout=diag_timeout)
+    except GuestExecError as exc:
+        return f"paranoid.exe failed to even launch at {paranoid_path!r}: {exc}"
+    status = qga_exec_wait(qga_sock, pid, timeout=diag_timeout)
+    if status is None:
+        return "paranoid.exe diagnostic run timed out"
+    out = b64_text(status.get("out-data")).strip()
+    err = b64_text(status.get("err-data")).strip()
+    return (f"paranoid.exe exitcode={status.get('exitcode')}; "
+            f"stdout={out[:400]!r}; stderr={err[:400]!r}")
+
+
+def list_guest_files(qga_sock: Path, dir_path: str,
+                     timeout: float = GUEST_EXEC_TIMEOUT_S) -> list:
+    """Full paths of files in a guest directory, or [] if it doesn't exist
+    or the agent can't be reached."""
+    script = (f"if (Test-Path -LiteralPath '{dir_path}') {{ "
+              f"(Get-ChildItem -LiteralPath '{dir_path}' -File).FullName }}")
+    try:
+        pid = ps_exec(qga_sock, f"list {dir_path}", script, capture=True,
+                      timeout=timeout)
+    except GuestExecError:
+        return []
+    status = qga_exec_wait(qga_sock, pid, timeout)
+    if status is None or status.get("exitcode") != 0:
+        return []
+    return [line.strip() for line in b64_text(status.get("out-data")).splitlines()
+            if line.strip()]
+
+
+def fetch_guest_text_file(qga_sock: Path, guest_path: str,
+                          timeout: float = GUEST_EXEC_TIMEOUT_S) -> Optional[str]:
+    """A guest text file's content, or None. Used for the decoded
+    (JSON-Lines) audit log."""
+    try:
+        pid = ps_exec(qga_sock, f"fetch {guest_path}",
+                      f"Get-Content -LiteralPath '{guest_path}' -Raw",
+                      capture=True, timeout=timeout)
+    except GuestExecError:
+        return None
+    status = qga_exec_wait(qga_sock, pid, timeout)
+    if status is None or status.get("exitcode") != 0:
+        return None
+    return b64_text(status.get("out-data"))
+
+
+def fetch_guest_binary_file(qga_sock: Path, guest_path: str,
+                            timeout: float = GUEST_EXEC_TIMEOUT_S
+                            ) -> Optional[bytes]:
+    """A guest file's raw bytes, or None. paranoid.exe's failure dumps are
+    binary, so they travel as base64 through guest-exec's own base64
+    envelope rather than as text, which would mangle them."""
+    script = (f"[Convert]::ToBase64String("
+              f"[System.IO.File]::ReadAllBytes('{guest_path}'))")
+    try:
+        pid = ps_exec(qga_sock, f"fetch {guest_path}", script, capture=True,
+                      timeout=timeout)
+    except GuestExecError:
+        return None
+    status = qga_exec_wait(qga_sock, pid, timeout)
+    if status is None or status.get("exitcode") != 0:
+        return None
+    try:
+        return base64.b64decode(b64_text(status.get("out-data")).strip())
+    except ValueError:
+        return None
+
+
+def collect_paranoid_corruption(qga_sock: Path, paranoid_path: str,
+                                drive_number: int, run_dir: Path,
+                                timeout: float = GUEST_EXEC_TIMEOUT_S) -> dict:
+    """After a paranoid.exe writer exits early (--stop-on-first-error means
+    that only happens on a verification failure or similar fatal error),
+    decode its binary audit log to JSON-Lines on the guest and pull both it
+    and any failure dumps paranoid.exe itself wrote (see
+    paranoid_failures_dir) back to run_dir on the host, for analysis after
+    the run. Never raises -- these diagnostics must not take down the
+    corruption finding they explain."""
+    artifacts: dict = {}
+    log_path = paranoid_log_path(drive_number)
+    decoded_guest_path = fr"C:\test\paranoid-PhysicalDrive{drive_number}.jsonl"
+    try:
+        pid = qga_exec(qga_sock,
+                        f"decode paranoid audit log for PhysicalDrive{drive_number}",
+                        paranoid_path,
+                        ["log", "--log-path", log_path, "--start", "0",
+                         "--slot-size", str(WRITER_BLOCK_BYTES),
+                         "--out", decoded_guest_path],
+                        capture=True, timeout=timeout)
+        status = qga_exec_wait(qga_sock, pid, timeout)
+    except GuestExecError as exc:
+        status = None
+        artifacts["decode_error"] = str(exc)
+    if status is None and "decode_error" not in artifacts:
+        artifacts["decode_error"] = "decode timed out"
+    elif status is not None and status.get("exitcode") != 0:
+        artifacts["decode_error"] = (
+            f"exitcode={status.get('exitcode')}: "
+            f"{b64_text(status.get('err-data')).strip()[:300]}")
+
+    if "decode_error" not in artifacts:
+        decoded = fetch_guest_text_file(qga_sock, decoded_guest_path, timeout)
+        if decoded is None:
+            artifacts["decoded_log_error"] = "could not fetch decoded audit log"
+        else:
+            host_path = run_dir / f"paranoid-PhysicalDrive{drive_number}.jsonl"
+            host_path.write_text(decoded)
+            artifacts["decoded_log"] = str(host_path)
+
+    failures_dir = paranoid_failures_dir(log_path)
+    dump_files = list_guest_files(qga_sock, failures_dir, timeout)
+    fetched = []
+    for guest_file in dump_files:
+        data = fetch_guest_binary_file(qga_sock, guest_file, timeout)
+        if data is None:
+            continue
+        host_file = run_dir / (f"paranoid-PhysicalDrive{drive_number}-"
+                               f"{PureWindowsPath(guest_file).name}")
+        host_file.write_bytes(data)
+        fetched.append(str(host_file))
+    artifacts["failure_dumps"] = fetched
+    if dump_files and not fetched:
+        artifacts["failure_dumps_error"] = (
+            f"found {len(dump_files)} dump file(s) in {failures_dir} but "
+            f"could not fetch any of them")
+    return artifacts
 
 
 def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
@@ -1840,6 +2054,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
 def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: float,
              ram: str, cpus: str, taskset_cores: Optional[str], keep_all: bool,
              qmp_module, io_driver: str, diskspd_path: str, fio_path: str,
+             paranoid_path: str,
              probability: float, delay_ms: int, delay_max_ms: int, ops: list,
              seed: int, heartbeat_s: float, vioscsi_telemetry_script: str,
              disk_dir: Optional[Path] = None,
@@ -2054,7 +2269,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
               f"QEMU stacks{', dumping guest memory' if dump_now else ''} "
               f"and watching the guest agent and LUNs for {probe_s:.0f}s",
               file=sys.stderr)
-        writer_exe = {"diskspd": diskspd_path, "fio": fio_path}.get(io_driver)
+        writer_exe = {"diskspd": diskspd_path, "fio": fio_path,
+                      "paranoid": paranoid_path}.get(io_driver)
         try:
             summary = diagnose_launch_failure(
                 diag,
@@ -2209,6 +2425,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 writer_pids.append(launch_writer(qga_sock, drive_no,
                                                   writer_duration, io_driver,
                                                   diskspd_path, fio_path,
+                                                  paranoid_path, delay_max_ms,
                                                   qga_resyncs))
             except NoReplyError as exc:
                 diagnose_failed_launch("no-reply",
@@ -2263,6 +2480,11 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                     qga_sock, fio_path, drive_numbers[lun_specs[0].serial],
                     delay_max_ms)
                 diag = f" fio diagnostic: {result['fio_diagnostic']}"
+            elif io_driver == "paranoid":
+                result["paranoid_diagnostic"] = paranoid_diagnostic(
+                    qga_sock, paranoid_path, drive_numbers[lun_specs[0].serial],
+                    delay_max_ms)
+                diag = f" paranoid diagnostic: {result['paranoid_diagnostic']}"
             result["error"] = (
                 f"writers are not driving I/O: only {total_wps:.1f} write ops/s "
                 f"across all {total_luns} LUN(s) (need >= {MIN_WRITE_OPS_PER_S}). "
@@ -2442,6 +2664,46 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 return result
 
             if now - last_heartbeat >= heartbeat_s:
+                # Checked at heartbeat cadence, not every poll: a writer's
+                # exit status is its own guest-agent round trip per LUN, and
+                # the module docstring already flags that as too costly to
+                # do on every 2s poll at high LUN counts. A writer only
+                # exits here under --stop-on-first-error, i.e. a
+                # verification failure or other fatal error -- never a
+                # clean finish, since writer_duration outlasts duration_s.
+                if io_driver == "paranoid":
+                    exited = [(spec, st) for spec, st in
+                             zip(lun_specs, writer_states(qga_sock, writer_pids))
+                             if st["exited"]]
+                    if exited:
+                        result["outcome"] = "data-corruption"
+                        result["elapsed_s"] = elapsed
+                        failures = []
+                        for spec, st in exited:
+                            drive_no = drive_numbers[spec.serial]
+                            print(f"    paranoid.exe writer for "
+                                  f"PhysicalDrive{drive_no} exited early "
+                                  f"(exitcode={st['exitcode']}) after "
+                                  f"{elapsed:.0f}s -- likely data corruption; "
+                                  f"retrieving its audit log and any failure "
+                                  f"dumps", file=sys.stderr)
+                            artifacts = collect_paranoid_corruption(
+                                qga_sock, paranoid_path, drive_no, run_dir)
+                            failures.append({"lun": spec.dev_id,
+                                             "drive": drive_no,
+                                             "exitcode": st["exitcode"],
+                                             **artifacts})
+                        result["paranoid_failures"] = failures
+                        result["error"] = (
+                            "paranoid.exe writer(s) exited early under "
+                            "--stop-on-first-error -- likely data corruption "
+                            f"on: {[f['lun'] for f in failures]}; audit "
+                            "log(s) and any failure dump(s) retrieved to the "
+                            "run directory for analysis")
+                        write_status({"elapsed_s": elapsed})
+                        collect_vioscsi_telemetry()
+                        write_status({"elapsed_s": elapsed})
+                        return result
                 cur_wops = write_ops_by_node(qmp)
                 sample_s = now - last_heartbeat
                 wps = sum(lun_write_delta(prev_wops, cur_wops, s) for s in lun_specs) / sample_s
@@ -2633,22 +2895,31 @@ def main() -> int:
     ap.add_argument("--ops", default="read,write",
                      help="comma list of operation types the rule matches "
                           "(default: %(default)s)")
-    ap.add_argument("--io-driver", choices=["powershell", "diskspd", "fio"],
+    ap.add_argument("--io-driver",
+                     choices=["powershell", "diskspd", "fio", "paranoid"],
                      default="powershell",
                      help="how to drive guest I/O: 'powershell' (default) runs "
                           "the built-in raw-write loop (writes only -- use "
-                          "diskspd or fio to also exercise reads); 'diskspd' "
-                          "launches Microsoft's diskspd.exe with a 50/50 "
-                          "read/write mix against each LUN's PhysicalDriveN; "
-                          "'fio' launches fio.exe with a 50/50 random "
-                          "read/write mix and crc32c data-integrity "
-                          "verification against each LUN's PhysicalDriveN")
+                          "diskspd, fio or paranoid to also exercise reads); "
+                          "'diskspd' launches Microsoft's diskspd.exe with a "
+                          "50/50 read/write mix against each LUN's "
+                          "PhysicalDriveN; 'fio' launches fio.exe with a 50/50 "
+                          "random read/write mix and crc32c data-integrity "
+                          "verification against each LUN's PhysicalDriveN; "
+                          "'paranoid' launches paranoid.exe with a 50/50 "
+                          "mixed, unbuffered random I/O workload against each "
+                          "LUN's PhysicalDriveN, with its own per-request "
+                          "timeout raised past --delay-max-ms so the rule's "
+                          "hold is not mistaken for a stuck device")
     ap.add_argument("--diskspd-path", default=DEFAULT_DISKSPD_PATH,
                      help="guest-side path to diskspd.exe, used when "
                           "--io-driver=diskspd (default: %(default)s)")
     ap.add_argument("--fio-path", default=DEFAULT_FIO_PATH,
                      help="guest-side path to fio.exe, used when "
                           "--io-driver=fio (default: %(default)s)")
+    ap.add_argument("--paranoid-path", default=DEFAULT_PARANOID_PATH,
+                     help="guest-side path to paranoid.exe, used when "
+                          "--io-driver=paranoid (default: %(default)s)")
     ap.add_argument("--vioscsi-telemetry-script",
                      default=DEFAULT_VIOSCSI_TELEMETRY_SCRIPT,
                      help="guest-side PowerShell script to run and collect "
@@ -2732,6 +3003,7 @@ def main() -> int:
                        duration_s, args.ram, args.cpus,
                        args.host_pressure_cores, args.keep_all, qmp_module,
                        args.io_driver, args.diskspd_path, args.fio_path,
+                       args.paranoid_path,
                        args.probability, args.delay_ms, args.delay_max_ms, ops,
                        args.seed, args.heartbeat_seconds,
                        args.vioscsi_telemetry_script,
@@ -2745,7 +3017,8 @@ def main() -> int:
     print()
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
     print(f"Result written to {results_path}")
-    if result["outcome"] in ("crash-suspected", "qemu-exited", "error"):
+    if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
+                             "data-corruption"):
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0
