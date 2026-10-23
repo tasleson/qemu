@@ -14,7 +14,10 @@
 #
 # The rule is baked into each LUN's '-blockdev' at VM startup (the
 # 'delays.0.*' properties), not armed/released over QMP, since it needs to
-# stay live for the whole run rather than being cycled. Sustained raw
+# stay live for the whole run rather than being cycled. (With --fill-wait,
+# the default for --io-driver=paranoid, it is instead armed over QMP once
+# every LUN image is fully allocated, so the writer's sequential initialize
+# pass is not crawling through holds.) Sustained raw
 # writes are driven from inside the guest via qemu-guest-agent for the
 # full test duration. The harness just watches for the guest going dark
 # (guest-agent stops answering, screen stops changing) as a bugcheck
@@ -95,6 +98,21 @@ DEFAULT_RAM = "8G"
 DEFAULT_CPUS = "5"
 LUN_IMAGE_SIZE = "4G"
 
+# paranoid.exe's '--initialize' writes every LUN end to end before its
+# random mix starts. With the tail-latency rule live, that sequential pass
+# crawls along one 61-65s hold at a time and the soak spends its hours
+# filling disks instead of stressing the driver. So for that driver the
+# rule is left out of '-blockdev' and armed over QMP only once every LUN's
+# image on the host has grown to its full virtual size (see wait_for_fill).
+DEFAULT_FILL_TIMEOUT_S = 2 * 3600
+FILL_POLL_INTERVAL_S = 10.0
+FILL_PROGRESS_INTERVAL_S = 60.0
+# How often (in polls) to ask the guest whether a writer has exited -- one
+# agent call per writer, so not every poll at high LUN counts.
+FILL_WRITER_CHECK_POLLS = 6
+# No image grew at all for this long: the fill has stalled.
+FILL_STALL_S = 600.0
+
 BOOT_TIMEOUT_S = 180
 # Generous on purpose: at high LUN counts the agent can take a long while to
 # answer -- 30s was enough to abort a 75-LUN run during writer ramp-up --
@@ -117,6 +135,10 @@ STACK_CAPTURE_TIMEOUT_S = 120
 # the main loop carries it out a moment later, so a poll that has just read
 # the message can still find the VM running. Give it this long to pause.
 STOP_ON_BROKEN_SETTLE_S = 2.0
+# --watch-after-break: how often to look at the run state, and how often to
+# keep a screenshot while waiting to see whether the guest bugchecks.
+WATCH_POLL_S = 2.0
+WATCH_SHOT_INTERVAL_S = 60.0
 POLL_INTERVAL_S = 2
 AGENT_SILENCE_THRESHOLD_S = 15
 # How many agent silences in the soak loop get an info qtree capture of
@@ -153,6 +175,15 @@ WRITER_WINDOW_BYTES = 32 * 1024 * 1024
 WRITER_BLOCK_BYTES = 64 * 1024
 WRITER_THREADS = 4
 WRITER_QUEUE_DEPTH = 32
+
+
+def parse_size_bytes(size_str: str) -> int:
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    s = size_str.strip()
+    if s and s[-1].upper() in units:
+        return int(float(s[:-1]) * units[s[-1].upper()])
+    return int(s)
+
 
 # paranoid.exe's own '--per-request-timeout-ms' is independent of (and
 # would otherwise fight) the rule's hold: a single-queue op held past the
@@ -533,7 +564,7 @@ foreach ($s in $serials) {{
     if ($d) {{
         if ($d.IsOffline) {{ Set-Disk -Number $d.Number -IsOffline $false }}
         if ($d.IsReadOnly) {{ Set-Disk -Number $d.Number -IsReadOnly $false }}
-        Write-Output "MAP $s $($d.Number)"
+        Write-Output "MAP $s $($d.Number) $($d.Size)"
     }} else {{
         Write-Output "MISSING $s"
     }}
@@ -649,20 +680,21 @@ def build_paranoid_args(drive_number: int, duration_s: float,
     return [
         "run",
         "--disk", str(drive_number),
-        "--start", "0",
-        "--length", str(WRITER_WINDOW_BYTES),
+        "--initialize",
         "--mode", "mixed",
+        "--threads", "4",
         "--read-percent", "50",
-        "--queue-depth", str(WRITER_THREADS * WRITER_QUEUE_DEPTH),
-        "--slot-size", str(WRITER_BLOCK_BYTES),
+        "--queue-depth", "512",
+        "--slot-size", "16384",
         "--duration-secs", str(int(round(duration_s))),
         "--order", "random",
-        "--unbuffered",
+        "--write-through",
         "--per-request-timeout-ms",
         str(delay_max_ms + PARANOID_TIMEOUT_MARGIN_MS),
         "--log-path", paranoid_log_path(drive_number),
         "--verify-every", str(PARANOID_VERIFY_EVERY),
         "--stop-on-first-error",
+        "--max-io-sectors", "128",
         "--i-understand-this-erases-data",
     ]
 
@@ -681,14 +713,23 @@ def resolve_drive_numbers(qga_sock: Path, serials: list,
         raise RuntimeError(f"guest-exec ({RESOLVE_REQUEST}) timed out")
     out = b64_text(status.get("out-data"))
     mapping: dict = {}
+    sizes: dict = {}
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) == 3 and parts[0] == "MAP":
+        if len(parts) == 4 and parts[0] == "MAP":
             mapping[parts[1]] = int(parts[2])
+            sizes[parts[1]] = int(parts[3])
     missing = [s for s in serials if s not in mapping]
     if missing:
         raise RuntimeError(f"guest could not find disk(s) with serial(s): {missing}\n"
                             f"guest-exec output was:\n{out}")
+    # A LUN the guest sees at some other size would never fill to the
+    # image's virtual size, so wait_for_fill would only time out on it.
+    want = parse_size_bytes(LUN_IMAGE_SIZE)
+    wrong = {s: n for s, n in sizes.items() if n != want}
+    if wrong:
+        raise RuntimeError(f"guest sees disk(s) at the wrong size (want {want} "
+                            f"bytes): {wrong}")
     return mapping
 
 
@@ -1082,7 +1123,9 @@ def tail_rule_props(rule_id: str, probability: float, delay_ms: int,
     """Render the tail-latency rule as '-blockdev' properties (delays.0.*),
     so it is live for the LUN's very first I/O rather than armed afterward
     over QMP -- this rule needs to stay in effect for the whole run, not be
-    cycled, so there is no reason to arm it any other way."""
+    cycled, so there is no reason to arm it any other way. The exception
+    is --fill-wait: then it is armed over QMP once the LUNs have filled
+    (see tail_rule / wait_for_fill)."""
     props = [f"delays.0.id={rule_id}",
              f"delays.0.probability={probability}",
              f"delays.0.delay-ms={delay_ms}",
@@ -1090,6 +1133,127 @@ def tail_rule_props(rule_id: str, probability: float, delay_ms: int,
     for i, op in enumerate(ops):
         props.append(f"delays.0.ops.{i}={op}")
     return ",".join(props)
+
+
+def tail_rule(rule_id: str, probability: float, delay_ms: int,
+              delay_max_ms: int, ops: list) -> dict:
+    """The same rule as tail_rule_props, as x-inject-error-delay-add's
+    'rule' argument -- for arming it after the fill (see wait_for_fill)."""
+    return {"id": rule_id, "probability": probability, "delay-ms": delay_ms,
+            "delay-max-ms": delay_max_ms, "ops": list(ops)}
+
+
+def arm_tail_rules(qmp, lun_specs: list, probability: float, delay_ms: int,
+                   delay_max_ms: int, ops: list) -> None:
+    for spec in lun_specs:
+        qmp_call(qmp, "x-inject-error-delay-add", node_name=spec.err_node,
+                 rule=tail_rule(spec.err_node, probability, delay_ms,
+                                delay_max_ms, ops))
+
+
+def image_bytes_on_disk(path: Path) -> int:
+    """Host bytes actually allocated to an image file. A fresh qcow2 is
+    sparse, so this only reaches the virtual size once the guest has
+    written every cluster."""
+    try:
+        return path.stat().st_blocks * 512
+    except FileNotFoundError:
+        return 0
+
+
+def image_data_bytes(qmp, path: Path, node: str) -> Optional[int]:
+    """Guest-visible bytes the image actually has data for, per its own
+    metadata. image_bytes_on_disk also counts qcow2 metadata, so it can
+    reach the virtual size with a few clusters still unwritten; this is
+    the exact check. '-U' since the running VM holds the image lock.
+    None if the flush failed or qemu-img could not read it.
+
+    The running QEMU keeps qcow2 L2 updates in its metadata cache until
+    something flushes the node, and paranoid.exe's write-through I/O does
+    not reliably do that, so without the flush below qemu-img reads stale
+    L2 tables: the last ~100 MiB each writer thread laid down shows as
+    unallocated indefinitely even though the host clusters (and their
+    refcounts) are already on disk. 'node' is flushed recursively, so the
+    LUN's top node is enough."""
+    try:
+        out = qmp_call(qmp, "human-monitor-command",
+                       command_line=f'qemu-io {node} "flush"')
+    except RuntimeError:
+        return None
+    if out and out.strip():
+        # HMP reports qemu-io failures as text, not as a QMP error.
+        return None
+    try:
+        out = subprocess.run([str(QEMU_IMG), "map", "-U", "--output=json",
+                              str(path)],
+                             check=True, capture_output=True, text=True,
+                             timeout=60).stdout
+        return sum(e["length"] for e in json.loads(out) if e.get("data"))
+    except (subprocess.SubprocessError, ValueError, KeyError):
+        return None
+
+
+def wait_for_fill(qmp, lun_specs: list, target_bytes: int,
+                  timeout_s: float, proc: subprocess.Popen, qga_sock: Path,
+                  writer_pids: list) -> dict:
+    """Block until every LUN image has as many bytes allocated on the host
+    as the disk's virtual size -- i.e. the writers' sequential initialize
+    pass has touched every cluster -- or until that can no longer happen.
+
+    Returns a summary whose 'status' is 'filled' on success, otherwise
+    'qemu-exited', 'writer-exited', 'stalled' or 'timeout'."""
+    t0 = time.monotonic()
+    deadline = t0 + timeout_s
+    last_report = t0
+    last_growth = t0
+    prev_total = -1
+    polls = 0
+    filled: set = set()
+    while True:
+        on_disk = {s.serial: image_bytes_on_disk(s.image) for s in lun_specs}
+        total = sum(on_disk.values())
+        for s in lun_specs:
+            if s.serial in filled or on_disk[s.serial] < target_bytes:
+                continue
+            data = image_data_bytes(qmp, s.image, s.err_node)
+            if data is not None and data >= target_bytes:
+                filled.add(s.serial)
+        short = sorted(s.serial for s in lun_specs if s.serial not in filled)
+        now = time.monotonic()
+        info: dict = {"elapsed_s": round(now - t0, 1),
+                      "target_bytes": target_bytes,
+                      "bytes_on_disk": on_disk,
+                      "short": short}
+        if not short:
+            info["status"] = "filled"
+            return info
+        if total > prev_total:
+            prev_total = total
+            last_growth = now
+        if proc.poll() is not None:
+            info["status"] = "qemu-exited"
+            return info
+        if polls and polls % FILL_WRITER_CHECK_POLLS == 0:
+            states = writer_states(qga_sock, writer_pids)
+            if any(st["exited"] for st in states):
+                info["status"] = "writer-exited"
+                info["writer_states"] = states
+                return info
+        if now - last_growth >= FILL_STALL_S:
+            info["status"] = "stalled"
+            return info
+        if now >= deadline:
+            info["status"] = "timeout"
+            return info
+        if now - last_report >= FILL_PROGRESS_INTERVAL_S:
+            last_report = now
+            want = target_bytes * len(lun_specs)
+            print(f"    filling LUNs: {total / 1024**3:.1f} of "
+                  f"{want / 1024**3:.1f} GiB on disk, {len(short)} of "
+                  f"{len(lun_specs)} LUN(s) short, {now - t0:.0f}s elapsed",
+                  file=sys.stderr)
+        polls += 1
+        time.sleep(FILL_POLL_INTERVAL_S)
 
 
 def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
@@ -1101,7 +1265,9 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      tmf_trace: bool = True,
                      stop_on_broken: bool = True,
                      ring_diag: bool = True,
-                     qga_trace: bool = True) -> list:
+                     qga_trace: bool = True,
+                     arm_at_start: bool = True,
+                     hv_crash: bool = False) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -1111,7 +1277,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-machine", "q35,accel=kvm,smm=on",
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-cpu", "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,"
-                "hv-synic,hv-stimer,hv-time,hv-ipi,hv-tlbflush",
+                "hv-synic,hv-stimer,hv-time,hv-ipi,hv-tlbflush"
+                + (",hv-crash" if hv_crash else ""),
         "-smp", cpus,
         "-m", ram,
         "-device", "vmcoreinfo",
@@ -1140,6 +1307,10 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-device", "ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0",
     ]
 
+    if hv_crash:
+        # QEMU's default panic action is shutdown, which would power the VM
+        # off and take the crashed guest's memory with it.
+        argv += ["-action", "panic=pause"]
     if tmf_trace:
         for event in TMF_TRACE_EVENTS:
             argv += ["-trace", f"enable={event}"]
@@ -1169,13 +1340,15 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         argv += ["-device", props]
 
     for spec in lun_specs:
-        rule_props = tail_rule_props(spec.err_node, probability, delay_ms,
-                                      delay_max_ms, ops, seed)
+        err_props = f"node-name={spec.err_node},seed={seed}"
+        if arm_at_start:
+            err_props += "," + tail_rule_props(spec.err_node, probability,
+                                               delay_ms, delay_max_ms, ops,
+                                               seed)
         argv += [
             "-blockdev", f"driver=file,filename={spec.image},node-name={spec.file_node}",
             "-blockdev", f"driver=qcow2,file={spec.file_node},node-name={spec.fmt_node}",
-            "-blockdev", f"driver=inject-error,image={spec.fmt_node},"
-                          f"node-name={spec.err_node},seed={seed},{rule_props}",
+            "-blockdev", f"driver=inject-error,image={spec.fmt_node},{err_props}",
             "-device", f"scsi-hd,drive={spec.err_node},bus=scsi{spec.adapter}.0,"
                        f"scsi-id={spec.target},lun={spec.lun},"
                        f"id={spec.dev_id},serial={spec.serial}",
@@ -2063,7 +2236,10 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              stop_on_broken: bool = True,
              ring_diag: bool = True,
              dump_on_agent_stall: bool = False,
-             qga_trace: bool = True) -> dict:
+             qga_trace: bool = True,
+             fill_wait: bool = False,
+             fill_timeout_s: float = DEFAULT_FILL_TIMEOUT_S,
+             watch_after_break_s: float = 0.0) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -2082,6 +2258,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     screenshot = run_dir / "screen.ppm"
     dump_path = run_dir / "crash.dmp"
     break_dump_path = run_dir / "break.dmp"
+    panic_dump_path = run_dir / "panic.dmp"
     qemu_log_path = run_dir / "qemu.log"
 
     qmp = None
@@ -2182,6 +2359,61 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                   file=sys.stderr)
         write_status({"elapsed_s": time.monotonic() - start})
         return True
+
+    def capture_guest_panic() -> dict:
+        """Screenshot and Windows-format dump of a guest that bugchecked
+        (hv-crash left the VM in guest-panicked)."""
+        shot = run_dir / "watch-panic.ppm"
+        screendump_hash(qmp, shot)
+        print(f"    guest bugchecked; dumping guest memory to "
+              f"{panic_dump_path}", file=sys.stderr)
+        return {"screenshot": str(shot),
+                "dump": try_dump_guest_memory(qmp, panic_dump_path, proc.pid,
+                                              err_nodes),
+                "dump_path": str(panic_dump_path)}
+
+    def watch_after_break() -> None:
+        """Leave the guest running after a break and see whether it
+        bugchecks. The guest reports a bugcheck through the Hyper-V crash
+        MSRs (hv-crash), which parks the VM in guest-panicked; that gets a
+        Windows-format dump with the real bugcheck code. Screenshots are
+        kept along the way either way."""
+        watch: dict = {"minutes": watch_after_break_s / 60.0}
+        result["watch_after_break"] = watch
+        print(f"    watching the guest for {watch_after_break_s / 60.0:.0f} "
+              f"min for a bugcheck", file=sys.stderr)
+        t0 = time.monotonic()
+        next_shot = t0
+        shots = 0
+        while True:
+            now = time.monotonic()
+            watch["elapsed_s"] = round(now - t0, 1)
+            if proc.poll() is not None:
+                watch["outcome"] = "qemu-exited"
+                break
+            try:
+                status = qmp_call(qmp, "query-status").get("status")
+            except Exception as exc:
+                watch["outcome"] = f"query-status failed: {exc!r}"
+                break
+            if status == "guest-panicked":
+                watch["outcome"] = "guest-panicked"
+                watch.update(capture_guest_panic())
+                break
+            if now >= t0 + watch_after_break_s:
+                watch["outcome"] = f"no bugcheck (status {status})"
+                break
+            if now >= next_shot:
+                next_shot = now + WATCH_SHOT_INTERVAL_S
+                shots += 1
+                screendump_hash(qmp, run_dir / f"watch-{shots:03d}.ppm")
+            time.sleep(WATCH_POLL_S)
+        watch["agent_alive"] = qga_ping(qga_sock)
+        print(f"    after the break: {watch['outcome']} "
+              f"({watch['elapsed_s']:.0f}s watched, guest agent "
+              f"{'answering' if watch['agent_alive'] else 'silent'})",
+              file=sys.stderr)
+        write_status({"elapsed_s": time.monotonic() - start})
 
     def capture_postmortem() -> None:
         result["telemetry_failure_screenshot"] = (
@@ -2310,12 +2542,19 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # in a dead patch between bursts.
         io_probe_window_s = delay_max_ms / 1000.0 + IO_PROBE_MARGIN_S
         writer_duration = duration_s + WARMUP_S + io_probe_window_s + WRITER_DURATION_SLACK_S
+        # The fill runs inside the writer's own lifetime, before the soak
+        # starts counting: budget for the longest it is allowed to take.
+        # stop_writers ends them at the close of the run either way.
+        if fill_wait:
+            writer_duration += fill_timeout_s
 
         argv = build_qemu_argv(boot_overlay, vars_overlay, qmp_sock, qga_sock,
                                 serial_log, tpm_sock, adapters, lun_specs, seed,
                                 ram, cpus, taskset_cores, probability, delay_ms,
                                 delay_max_ms, ops, iothreads, tmf_trace,
-                                stop_on_broken, ring_diag, qga_trace)
+                                stop_on_broken, ring_diag, qga_trace,
+                                arm_at_start=not fill_wait,
+                                hv_crash=watch_after_break_s > 0)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -2328,6 +2567,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "ring_diag": ring_diag,
                 "dump_on_agent_stall": dump_on_agent_stall,
                 "qga_trace": qga_trace,
+                "fill_wait": fill_wait,
+                "fill_timeout_s": fill_timeout_s,
+                "watch_after_break_s": watch_after_break_s,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -2432,6 +2674,36 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                        f"writer for PhysicalDrive{drive_no}",
                                        request_sent_at, exc, drive_no)
                 raise
+
+        if fill_wait:
+            target_bytes = parse_size_bytes(LUN_IMAGE_SIZE)
+            print(f"    waiting up to {fill_timeout_s:.0f}s for all "
+                  f"{total_luns} LUN image(s) to reach {LUN_IMAGE_SIZE} on "
+                  f"disk before arming the tail-latency rule",
+                  file=sys.stderr)
+            fill = wait_for_fill(qmp, lun_specs, target_bytes,
+                                 fill_timeout_s, proc, qga_sock,
+                                 writer_pids)
+            result["fill"] = fill
+            if fill["status"] == "qemu-exited":
+                raise qemu_died_error("while waiting for the LUNs to fill")
+            if fill["status"] != "filled":
+                # A ring break pauses the VM, which stops the fill cold.
+                dump_if_stopped_on_broken()
+                short = {k: fill["bytes_on_disk"][k] for k in fill["short"]}
+                result["outcome"] = "fill-failed"
+                result["elapsed_s"] = time.monotonic() - start
+                result["error"] = (
+                    f"LUN images did not fill to {target_bytes} bytes on "
+                    f"disk ({fill['status']} after {fill['elapsed_s']:.0f}s); "
+                    f"short: {short}")
+                collect_vioscsi_telemetry()
+                return result
+            print(f"    all LUNs filled in {fill['elapsed_s']:.0f}s; arming "
+                  f"the tail-latency rule", file=sys.stderr)
+            arm_tail_rules(qmp, lun_specs, probability, delay_ms,
+                           delay_max_ms, ops)
+            result["rule_armed_after_fill_s"] = fill["elapsed_s"]
 
         time.sleep(WARMUP_S)
 
@@ -2604,6 +2876,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 # Adapters keep falling over while telemetry is collected.
                 record_trace()
                 write_status({"elapsed_s": elapsed})
+                if watch_after_break_s > 0 and result.get("break_dump"):
+                    watch_after_break()
                 return result
 
             if proc.poll() is not None:
@@ -2612,6 +2886,19 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 result["elapsed_s"] = elapsed
                 write_status({"elapsed_s": elapsed})
                 return result
+
+            if watch_after_break_s > 0:
+                try:
+                    panicked = (qmp_call(qmp, "query-status").get("status")
+                                == "guest-panicked")
+                except Exception:
+                    panicked = False
+                if panicked:
+                    result["outcome"] = "guest-panicked"
+                    result["elapsed_s"] = elapsed
+                    result["guest_panic"] = capture_guest_panic()
+                    write_status({"elapsed_s": elapsed})
+                    return result
 
             if qga_ping(qga_sock):
                 agent_alive = True
@@ -2831,6 +3118,15 @@ def main() -> int:
                           "while the failing request is still where the "
                           "driver left it, then resume. The dump removes the "
                           "delay rules (default: on)")
+    ap.add_argument("--watch-after-break", type=float, default=0.0,
+                     metavar="MINUTES",
+                     help="after a ring break has been dumped and the VM "
+                          "resumed, keep it running this long and see "
+                          "whether Windows bugchecks (hv-crash, so no guest "
+                          "driver is needed). A bugcheck pauses the VM and "
+                          "writes panic.dmp with the real bugcheck code; "
+                          "screenshots go to watch-NNN.ppm (default: 0, "
+                          "stop at the break)")
     ap.add_argument("--ring-diag", action=argparse.BooleanOptionalAction,
                      default=True,
                      help="virtio-scsi's healthy-path break diagnostics: "
@@ -2920,6 +3216,20 @@ def main() -> int:
     ap.add_argument("--paranoid-path", default=DEFAULT_PARANOID_PATH,
                      help="guest-side path to paranoid.exe, used when "
                           "--io-driver=paranoid (default: %(default)s)")
+    ap.add_argument("--fill-wait", action=argparse.BooleanOptionalAction,
+                     default=None,
+                     help="hold off arming the tail-latency rule until every "
+                          "LUN image is fully allocated on the host (all "
+                          f"{LUN_IMAGE_SIZE} written), so the writer's "
+                          "sequential initialize pass runs at full speed. "
+                          "Default: on for --io-driver=paranoid (whose "
+                          "--initialize fills the disk), off otherwise -- the "
+                          "other drivers only touch a small window and would "
+                          "never fill it")
+    ap.add_argument("--fill-timeout-minutes", type=float,
+                     default=DEFAULT_FILL_TIMEOUT_S / 60,
+                     help="give up if the LUNs have not filled within this "
+                          "long (default: %(default)s)")
     ap.add_argument("--vioscsi-telemetry-script",
                      default=DEFAULT_VIOSCSI_TELEMETRY_SCRIPT,
                      help="guest-side PowerShell script to run and collect "
@@ -2980,6 +3290,11 @@ def main() -> int:
 
     ops = [o.strip() for o in args.ops.split(",") if o.strip()]
     duration_s = args.duration_hours * 3600.0
+    fill_wait = (args.io_driver == "paranoid" if args.fill_wait is None
+                 else args.fill_wait)
+    if args.fill_timeout_minutes <= 0:
+        print("Error: --fill-timeout-minutes must be > 0.", file=sys.stderr)
+        return 1
 
     err = check_prereqs()
     if err:
@@ -3009,7 +3324,9 @@ def main() -> int:
                        args.vioscsi_telemetry_script,
                        args.disk_dir, args.iothreads, args.tmf_trace,
                        args.stop_on_broken, args.ring_diag,
-                       args.dump_on_agent_stall, args.qga_trace)
+                       args.dump_on_agent_stall, args.qga_trace,
+                       fill_wait, args.fill_timeout_minutes * 60.0,
+                       args.watch_after_break * 60.0)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
@@ -3018,7 +3335,8 @@ def main() -> int:
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
     print(f"Result written to {results_path}")
     if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
-                             "data-corruption"):
+                             "guest-panicked", "data-corruption",
+                             "fill-failed"):
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0
