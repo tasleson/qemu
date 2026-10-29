@@ -239,6 +239,17 @@ Reset race                  a hold that straddles the guest's timeout, so
                             the completion lands during recovery
 =========================== ================================================
 
+``scripts/fuzz-windows-inject-reset-inflight.py`` runs the last two of
+these for hours against a Windows guest with the vioscsi driver, with the
+reset made deliberate rather than incidental: a fraction of each LUN's
+requests is stalled while the rest are merely slowed, so the queue keeps
+filling until the guest's own timeout and escalation chain resets the
+adapter and the drain completes the whole held set at once.  It counts
+how deep the hold was at each reset and which TMFs led up to it.
+``scripts/fuzz-windows-inject-tail-latency.py`` is the timed-hold
+counterpart, which holds a small fraction of requests past the guest's
+timeout for the whole run.  See their ``--help``.
+
 
 SCSI Target Faults
 ------------------
