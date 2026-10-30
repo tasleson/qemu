@@ -1729,6 +1729,33 @@ static void test_fault_vq_mapping(void *obj, void *data,
     fault_end(vs);
 }
 
+/*
+ * A TMF response x-tmf-delay holds back is dropped by a device reset, rather
+ * than landing on the ring the guest set up afterwards.
+ */
+static void test_tmf_delay_device_reset(void *obj, void *data,
+                                        QGuestAllocator *t_alloc)
+{
+    QVirtioSCSIPCI *scsi_pci = obj;
+    QVirtioDevice *dev = scsi_pci->scsi.vdev;
+    QVirtioSCSIQueues *vs = fault_start(obj, t_alloc);
+    FaultPending tmf;
+
+    fault_tmf(vs, &tmf, VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET, 1, 0, 0);
+    fault_assert_idle(vs);
+
+    qvirtio_reset(dev);
+    qvirtio_scsi_pci_free(vs);
+    qvirtio_start_device(dev);
+    vs = qvirtio_scsi_init(dev);
+
+    qtest_clock_step(global_qtest, 2000 * FAULT_MS);
+    fault_assert_idle(vs);
+    fault_assert_read_good(vs, 1, 0);
+    fault_assert_read_good(vs, 1, 0);
+    qvirtio_scsi_pci_free(vs);
+}
+
 static void *virtio_scsi_hotplug_setup(GString *cmd_line, void *arg)
 {
     g_string_append(cmd_line,
@@ -1957,6 +1984,13 @@ static void register_virtio_scsi_test(void)
     opts.edge = (QOSGraphEdgeOptions) { };
     qos_add_test("fault-vq-mapping", "virtio-scsi-pci", test_fault_vq_mapping,
                  &opts);
+
+    opts.before = virtio_scsi_setup_fault;
+    opts.edge = (QOSGraphEdgeOptions) {
+        .extra_device_opts = "x-tmf-delay-ms=1000,x-tmf-delay-count=1",
+    };
+    qos_add_test("tmf-delay-device-reset", "virtio-scsi-pci",
+                 test_tmf_delay_device_reset, &opts);
 }
 
 libqos_init(register_virtio_scsi_test);
