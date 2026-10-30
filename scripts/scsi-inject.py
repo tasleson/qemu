@@ -5,13 +5,17 @@
 # SCSI response injection tool for QEMU
 #
 # Sets SCSI command response overrides on SCSI disk devices via QMP,
-# useful for fuzzing guest storage management software.
+# useful for fuzzing guest storage management software, and arms SCSI
+# target faults that hold a target's commands until the guest recovers.
 #
 # Usage: $builddir/run scripts/scsi-inject.py [options] <command> [args]
 
 import argparse
+import asyncio
+import json
 import struct
 import sys
+import time
 from base64 import b64encode
 
 try:
@@ -184,6 +188,102 @@ def cmd_clear(args):
     print(f"Cleared {what} on {args.device}")
 
 
+def fault_options(args):
+    fault = {"id": args.id, "target": args.target}
+    for name in ("lun", "delay_ms", "delay_max_ms", "probability",
+                 "max_hits", "clear_on", "below_clear", "tmf_hang_ms"):
+        val = getattr(args, name)
+        if val is not None:
+            fault[name.replace("_", "-")] = val
+    return fault
+
+
+def cmd_fault_add(args):
+    qmp = qmp_connect(args)
+    qmp_execute(qmp, "x-scsi-fault-add",
+                {"device": args.device, "fault": fault_options(args)})
+    qmp.close()
+    print(f"Armed fault {args.id} on {args.device} target {args.target}")
+
+
+def cmd_fault_remove(args):
+    qmp = qmp_connect(args)
+    cmd_args = {"device": args.device}
+    if args.id:
+        cmd_args["id"] = args.id
+    ret = qmp_execute(qmp, "x-scsi-fault-remove", cmd_args)
+    qmp.close()
+    print(f"Removed {ret['count']} fault(s) from {args.device}")
+
+
+def format_fault(f):
+    where = f"target {f['target']}"
+    if "lun" in f:
+        where += f" lun {f['lun']}"
+    if f["stall"]:
+        hold = "until recovery"
+    elif f["delay-ms"] == f["delay-max-ms"]:
+        hold = f"{f['delay-ms']} ms"
+    else:
+        hold = f"{f['delay-ms']}-{f['delay-max-ms']} ms"
+    attempts = ", ".join(f"{k} {v}" for k, v in f["attempts"].items() if v)
+    return (f"{f['id']}: {where}, hold {hold}, clear on {f['clear-on']}, "
+            f"below that {f['below-clear']}; held {f['held']} now, "
+            f"{f['hits']} in all; attempts: {attempts or 'none'}")
+
+
+def cmd_fault_list(args):
+    qmp = qmp_connect(args)
+    faults = qmp_execute(qmp, "x-scsi-fault-list", {"device": args.device})
+    qmp.close()
+    if args.json:
+        print(json.dumps(faults, indent=2))
+        return
+    if not faults:
+        print(f"No faults armed on {args.device}")
+    for f in faults:
+        print(format_fault(f))
+
+
+# fault-wait exit codes besides 0 (cleared) and 1 (error); argparse takes 2
+EXIT_TIMEOUT = 4
+EXIT_NOT_ARMED = 5
+
+
+def cmd_fault_wait(args):
+    qmp = qmp_connect(args)
+    # Events only reach connected clients, so look for the fault after
+    # connecting: if it's gone already, its event has been and gone too
+    faults = qmp_execute(qmp, "x-scsi-fault-list", {"device": args.device})
+    if not any(f["id"] == args.id for f in faults):
+        qmp.close()
+        print(f"Fault {args.id} is not armed on {args.device} "
+              "(already cleared, or never added)", file=sys.stderr)
+        sys.exit(EXIT_NOT_ARMED)
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    while True:
+        wait = True
+        if deadline is not None:
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                qmp.close()
+                print(f"Timed out waiting for fault {args.id} to clear",
+                      file=sys.stderr)
+                sys.exit(EXIT_TIMEOUT)
+        try:
+            ev = qmp.pull_event(wait=wait)
+        except (TimeoutError, asyncio.TimeoutError):
+            ev = None
+        if not ev or ev["event"] != "SCSI_FAULT_CLEARED":
+            continue
+        data = ev["data"]
+        if data["device"] == args.device and data["id"] == args.id:
+            break
+    qmp.close()
+    print(f"Fault {args.id} on {args.device} cleared by {data['recovery']} "
+          f"with {data['held']} command(s) held")
+
+
 def parse_page(val):
     return int(val, 0)
 
@@ -200,6 +300,9 @@ examples:
   %(prog)s vpd-raw disk0 0x80 00800100FF
   %(prog)s clear disk0
   %(prog)s clear disk0 --type inquiry-vpd --page 0x80
+  %(prog)s fault-add scsi0 hang1 1 --clear-on target-reset
+  %(prog)s fault-wait scsi0 hang1 --timeout 300
+  %(prog)s fault-list scsi0
 """,
     )
 
@@ -278,6 +381,74 @@ examples:
                    help="page code (required with --type inquiry-vpd "
                         "or mode-sense-page)")
     p.set_defaults(func=cmd_clear)
+
+    recoveries = ["abort-task", "task-set", "lun-reset", "target-reset",
+                  "bus-reset", "manual"]
+
+    # -- fault-add --
+    p = sub.add_parser("fault-add",
+                       help="hold a target's commands until it is recovered")
+    p.add_argument("device", help="SCSI adapter ID (e.g. scsi0)")
+    p.add_argument("id", help="name of the fault")
+    p.add_argument("target", type=int, help="SCSI target id")
+    p.add_argument("--lun", type=int,
+                   help="hold only this LUN (default: every LUN)")
+    p.add_argument("--delay-ms", type=int,
+                   help="hold each command this long, then run it "
+                        "(default: until the fault clears)")
+    p.add_argument("--delay-max-ms", type=int,
+                   help="pick each hold time at random up to this")
+    p.add_argument("--probability", type=float,
+                   help="fraction of commands to hold (default: 1.0)")
+    p.add_argument("--max-hits", type=int,
+                   help="stop holding after this many commands")
+    p.add_argument("--clear-on", choices=recoveries,
+                   help="least recovery that clears the fault "
+                        "(default: lun-reset)")
+    p.add_argument("--below-clear", choices=["proceed", "reject", "hang"],
+                   help="what lesser recovery does (default: proceed)")
+    p.add_argument("--tmf-hang-ms", type=int,
+                   help="with --below-clear hang, answer a hung TMF after "
+                        "this long")
+    p.set_defaults(func=cmd_fault_add)
+
+    # -- fault-remove --
+    p = sub.add_parser("fault-remove",
+                       help="disarm faults, letting held commands run")
+    p.add_argument("device", help="SCSI adapter ID")
+    p.add_argument("id", nargs="?", help="fault to remove (default: all)")
+    p.set_defaults(func=cmd_fault_remove)
+
+    # -- fault-list --
+    p = sub.add_parser("fault-list", help="list armed faults")
+    p.add_argument("device", help="SCSI adapter ID")
+    p.add_argument("--json", action="store_true",
+                   help="print the raw QMP reply")
+    p.set_defaults(func=cmd_fault_list)
+
+    # -- fault-wait --
+    p = sub.add_parser("fault-wait",
+                       help="wait until a fault clears and say what "
+                            "cleared it",
+                       description="Wait until a fault clears and say what "
+                                   "cleared it. Keeps the QMP connection "
+                                   "open while waiting, so use a second "
+                                   "-qmp socket for other commands "
+                                   "meanwhile.",
+                       epilog=f"""\
+exit status:
+  0  the fault cleared
+  1  error, e.g. QMP failed
+  2  bad command line
+  {EXIT_TIMEOUT}  --timeout ran out first
+  {EXIT_NOT_ARMED}  the fault isn't armed: already cleared, or never added
+""",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("device", help="SCSI adapter ID, as given to fault-add")
+    p.add_argument("id", help="fault to wait for")
+    p.add_argument("--timeout", type=float,
+                   help="give up after this many seconds")
+    p.set_defaults(func=cmd_fault_wait)
 
     args = parser.parse_args()
     args.func(args)
