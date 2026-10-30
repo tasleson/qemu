@@ -46,10 +46,7 @@
 
 
 import argparse
-import json
-import shutil
 import sys
-import time
 from pathlib import Path
 
 # The shared machinery lives next to this script, which is not necessarily
@@ -57,9 +54,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (FAILURE_OUTCOMES, VM_DIR, SoakStrategy,
-                                 add_common_args, check_prereqs,
-                                 load_qmp_module, run_soak, usage_note)
+from vioscsi_soak_common import (VM_DIR, SoakStrategy, add_common_args,
+                                 run_soak_main, usage_note)
 
 SOAK_DIR = VM_DIR / "soak-tail-latency"
 
@@ -118,87 +114,22 @@ def main() -> int:
     add_common_args(ap, SOAK_DIR, rule_args=add_rule_args)
     args = ap.parse_args()
 
-    if args.host_pressure_cores and not shutil.which("taskset"):
-        print("Error: --host-pressure-cores given but 'taskset' not found in PATH.",
-              file=sys.stderr)
-        return 1
-
     if not (0.0 <= args.probability <= 1.0):
         print("Error: --probability must be between 0.0 and 1.0.", file=sys.stderr)
         return 1
 
-    if args.adapters < 1 or args.targets < 1 or args.luns_per_target < 1:
-        print("Error: --adapters, --targets and --luns-per-target must all "
-              "be >= 1.", file=sys.stderr)
-        return 1
-    if args.iothreads is not None and args.iothreads < 0:
-        print("Error: --iothreads must be >= 0 (0 keeps adapter I/O in "
-              "QEMU's main loop).", file=sys.stderr)
-        return 1
-    # virtio-scsi's own limits (VIRTIO_SCSI_MAX_TARGET / VIRTIO_SCSI_MAX_LUN
-    # in include/hw/virtio/virtio-scsi.h) -- fail fast with a clear message
-    # instead of QEMU rejecting the device partway through startup.
-    if args.targets > 256:
-        print("Error: --targets must be <= 256 (virtio-scsi's max target id "
-              "is 255).", file=sys.stderr)
-        return 1
-    if args.luns_per_target > 16384:
-        print("Error: --luns-per-target must be <= 16384 (virtio-scsi's max "
-              "LUN is 16383).", file=sys.stderr)
-        return 1
-
     ops = [o.strip() for o in args.ops.split(",") if o.strip()]
-    duration_s = args.duration_hours * 3600.0
-    fill_wait = (args.io_driver == "paranoid" if args.fill_wait is None
-                 else args.fill_wait)
-    if args.fill_timeout_minutes <= 0:
-        print("Error: --fill-timeout-minutes must be > 0.", file=sys.stderr)
-        return 1
-
-    err = check_prereqs()
-    if err:
-        print(f"Error: {err}", file=sys.stderr)
-        return 1
-
-    qmp_module = load_qmp_module()
-    if qmp_module is None:
-        return 1
-
-    SOAK_DIR.mkdir(parents=True, exist_ok=True)
-
     total_luns = args.adapters * args.targets * args.luns_per_target
-    print(f"Starting {args.duration_hours:.1f}h tail-latency soak: "
-          f"{args.probability * 100:.1f}% of {ops} ops on {total_luns} LUN(s) "
-          f"({args.adapters} adapter(s) x {args.targets} target(s) x "
-          f"{args.luns_per_target} lun(s)) held "
-          f"{args.delay_ms}-{args.delay_max_ms}ms.")
+    banner = (f"Starting {args.duration_hours:.1f}h tail-latency soak: "
+              f"{args.probability * 100:.1f}% of {ops} ops on "
+              f"{total_luns} LUN(s) "
+              f"({args.adapters} adapter(s) x {args.targets} target(s) x "
+              f"{args.luns_per_target} lun(s)) held "
+              f"{args.delay_ms}-{args.delay_max_ms}ms.")
 
     strategy = TailLatencyStrategy(args.probability, args.delay_ms,
                                    args.delay_max_ms, ops)
-    result = run_soak(SOAK_DIR, args.adapters, args.targets,
-                       args.luns_per_target,
-                       duration_s, args.ram, args.cpus,
-                       args.host_pressure_cores, args.keep_all, qmp_module,
-                       args.io_driver, args.diskspd_path, args.fio_path,
-                       args.paranoid_path, strategy,
-                       args.seed, args.heartbeat_seconds,
-                       args.vioscsi_telemetry_script,
-                       args.disk_dir, args.iothreads, args.tmf_trace,
-                       args.stop_on_broken, args.ring_diag,
-                       args.dump_on_agent_stall, args.qga_trace,
-                       fill_wait, args.fill_timeout_minutes * 60.0,
-                       args.watch_after_break * 60.0)
-
-    results_path = SOAK_DIR / f"result-{int(time.time())}.json"
-    results_path.write_text(json.dumps(result, indent=2))
-
-    print()
-    print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
-    print(f"Result written to {results_path}")
-    if result["outcome"] in FAILURE_OUTCOMES:
-        print(f"Artifacts in {result['run_dir']}")
-        return 1
-    return 0
+    return run_soak_main(SOAK_DIR, args, strategy, banner)
 
 
 if __name__ == "__main__":

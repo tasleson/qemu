@@ -88,7 +88,6 @@
 # unmodified across different machines.
 
 import argparse
-import base64
 import dataclasses
 import fcntl
 import hashlib
@@ -105,6 +104,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+# The shared machinery lives next to this script, which is not necessarily
+# the directory the harness is run from.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# pylint: disable=wrong-import-position
+from vioscsi_soak_common import (_qga_request, b64_text, build_writer_script,
+                                 encode_ps, load_qmp_module, make_overlay,
+                                 other_swtpm_pids)
 
 QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
 QEMU_BUILD = Path(os.environ.get("QEMU_BUILD", str(QEMU_SRC / "build")))
@@ -171,10 +179,6 @@ STATIC_SCREEN_THRESHOLD_S = 20  # corroborating signal once agent has gone quiet
 IO_PROBE_WINDOW_S = 3.0
 MIN_WRITE_OPS_PER_S = 2.0
 
-# Sequential writes past this offset wrap back to 0. Keeps every write
-# sector-aligned and inside the 1G scratch LUN without ever hitting EOF,
-# which would otherwise throw partway through a run and end the loop.
-WRITER_WINDOW_BYTES = 32 * 1024 * 1024
 WRITER_BLOCK_BYTES = 64 * 1024
 
 # The reset race is about *many* commands in flight when a reset lands: the
@@ -224,13 +228,6 @@ Environment overrides for running on different machines:
 # The agent answers the request-side byte with a parse error of its own,
 # which the sync skips like any other reply that isn't its echo.
 QGA_SENTINEL = b"\xff"
-
-
-def _qga_request(execute: str, arguments: Optional[dict] = None) -> bytes:
-    msg: dict = {"execute": execute}
-    if arguments is not None:
-        msg["arguments"] = arguments
-    return (json.dumps(msg) + "\n").encode()
 
 
 def _qga_replies(s: socket.socket, deadline: float):
@@ -317,16 +314,6 @@ def qga_exec_wait(sock_path: Path, pid: int, timeout: float) -> Optional[dict]:
     return None
 
 
-def b64_text(data: Optional[str]) -> str:
-    if not data:
-        return ""
-    return base64.b64decode(data).decode("utf-8", errors="replace")
-
-
-def encode_ps(script: str) -> str:
-    return base64.b64encode(script.encode("utf-16-le")).decode()
-
-
 def ps_exec(sock_path: Path, script: str, capture: bool,
             timeout: float = GUEST_EXEC_TIMEOUT_S) -> Optional[int]:
     args = ["-NoProfile", "-NonInteractive", "-EncodedCommand", encode_ps(script)]
@@ -351,34 +338,6 @@ foreach ($s in $serials) {{
     }} else {{
         Write-Output "MISSING $s"
     }}
-}}
-"""
-
-
-def build_writer_script(drive_number: int, duration_s: float) -> str:
-    window_blocks = WRITER_WINDOW_BYTES // WRITER_BLOCK_BYTES
-    return f"""
-$path = "\\\\.\\PhysicalDrive{drive_number}"
-$blockSize = {WRITER_BLOCK_BYTES}
-$windowBlocks = {window_blocks}
-$buf = New-Object byte[] $blockSize
-(New-Object Random).NextBytes($buf)
-$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-$i = 0
-$deadline = (Get-Date).AddSeconds({duration_s})
-try {{
-    while ((Get-Date) -lt $deadline) {{
-        try {{
-            $fs.Seek((($i % $windowBlocks) * $blockSize), [System.IO.SeekOrigin]::Begin) | Out-Null
-            $fs.Write($buf, 0, $buf.Length)
-            $fs.Flush()
-            $i++
-        }} catch {{
-            Start-Sleep -Milliseconds 200
-        }}
-    }}
-}} finally {{
-    $fs.Close()
 }}
 """
 
@@ -480,22 +439,6 @@ class LunSpec:
 def make_blank_image(path: Path, size: str = LUN_IMAGE_SIZE) -> None:
     subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", str(path), size],
                    check=True, capture_output=True)
-
-
-def make_overlay(golden: Path, dest: Path) -> None:
-    subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
-                    "-b", str(golden), str(dest)],
-                   check=True, capture_output=True)
-
-
-def other_swtpm_pids(exclude_pid: int) -> list:
-    try:
-        out = subprocess.run(["pgrep", "-f", "swtpm socket"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    exclude = str(exclude_pid)
-    return [pid for pid in out.stdout.split() if pid != exclude]
 
 
 def check_tpm_dir_lockable() -> None:
@@ -1441,20 +1384,6 @@ def check_prereqs() -> Optional[str]:
         print(f"Note: {TRACE_EVENTS} not found, tracing disabled for this run.",
               file=sys.stderr)
     return None
-
-
-def load_qmp_module():
-    site_packages = QEMU_BUILD / "pyvenv" / "lib"
-    for py_dir in site_packages.glob("python*/site-packages"):
-        sys.path.insert(0, str(py_dir))
-    try:
-        from qemu.qmp import legacy as qmp_module  # type: ignore
-        return qmp_module
-    except ImportError:
-        print("Error: could not import qemu.qmp from the build's pyvenv.\n"
-              "Build QEMU first (ninja -C build) so build/pyvenv exists.",
-              file=sys.stderr)
-        return None
 
 
 def main() -> int:

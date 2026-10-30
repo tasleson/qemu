@@ -88,6 +88,11 @@ WRITER_STOP_TIMEOUT_S = 30
 AGENT_CHECK_ATTEMPTS = 3
 AGENT_CHECK_TIMEOUT_S = 5.0
 
+# VIRTIO_SCSI_MAX_TARGET and VIRTIO_SCSI_MAX_LUN (the highest ids, so one
+# less than the counts here) from include/hw/virtio/virtio-scsi.h.
+VIRTIO_SCSI_MAX_TARGETS = 256
+VIRTIO_SCSI_MAX_LUNS = 16384
+
 DEFAULT_RAM = "8G"
 DEFAULT_CPUS = "5"
 LUN_IMAGE_SIZE = "4G"
@@ -3474,6 +3479,92 @@ def load_qmp_module():
               "Build QEMU first (ninja -C build) so build/pyvenv exists.",
               file=sys.stderr)
         return None
+
+
+def check_common_args(args) -> Optional[str]:
+    """What is wrong with the options add_common_args() defines, as a
+    message to print, or None. Each harness still checks its own rule
+    options itself; only what they all share lives here."""
+    if args.host_pressure_cores and not shutil.which("taskset"):
+        return "--host-pressure-cores given but 'taskset' not found in PATH."
+    if args.adapters < 1 or args.targets < 1 or args.luns_per_target < 1:
+        return "--adapters, --targets and --luns-per-target must all be >= 1."
+    if args.iothreads is not None and args.iothreads < 0:
+        return ("--iothreads must be >= 0 (0 keeps adapter I/O in QEMU's "
+                "main loop).")
+    # virtio-scsi's own limits (VIRTIO_SCSI_MAX_TARGET / VIRTIO_SCSI_MAX_LUN
+    # in include/hw/virtio/virtio-scsi.h) -- fail fast with a clear message
+    # instead of QEMU rejecting the device partway through startup.
+    if args.targets > VIRTIO_SCSI_MAX_TARGETS:
+        return (f"--targets must be <= {VIRTIO_SCSI_MAX_TARGETS} "
+                f"(virtio-scsi's max target id is "
+                f"{VIRTIO_SCSI_MAX_TARGETS - 1}).")
+    if args.luns_per_target > VIRTIO_SCSI_MAX_LUNS:
+        return (f"--luns-per-target must be <= {VIRTIO_SCSI_MAX_LUNS} "
+                f"(virtio-scsi's max LUN is {VIRTIO_SCSI_MAX_LUNS - 1}).")
+    if args.fill_timeout_minutes <= 0:
+        return "--fill-timeout-minutes must be > 0."
+    return None
+
+
+def run_soak_main(soak_dir: Path, args, strategy: SoakStrategy, banner: str,
+                  summary=None) -> int:
+    """Everything a harness's main() does identically once it has parsed
+    and checked its own rule options: the shared argument checks, the
+    prerequisites, the QMP module, the run, the result file and the exit
+    code. Returns what main() should return.
+
+    @banner is printed once the run is committed to starting. @summary,
+    if given, is called with the result and returns extra lines to print
+    under the outcome -- whatever that harness measured and the outcome
+    alone does not say.
+
+    Harnesses call run_soak() only through here, so its two dozen
+    arguments are wired up in one place rather than once per harness.
+    """
+    for err in (check_common_args(args), check_prereqs()):
+        if err:
+            print(f"Error: {err}", file=sys.stderr)
+            return 1
+
+    qmp_module = load_qmp_module()
+    if qmp_module is None:
+        return 1
+
+    soak_dir.mkdir(parents=True, exist_ok=True)
+    print(banner)
+
+    result = run_soak(soak_dir, args.adapters, args.targets,
+                      args.luns_per_target,
+                      args.duration_hours * 3600.0, args.ram, args.cpus,
+                      args.host_pressure_cores, args.keep_all, qmp_module,
+                      args.io_driver, args.diskspd_path, args.fio_path,
+                      args.paranoid_path, strategy,
+                      args.seed, args.heartbeat_seconds,
+                      args.vioscsi_telemetry_script,
+                      args.disk_dir, args.iothreads, args.tmf_trace,
+                      args.stop_on_broken, args.ring_diag,
+                      args.dump_on_agent_stall, args.qga_trace,
+                      # paranoid.exe is the only writer that needs every
+                      # LUN filled before the rules are armed, so it is
+                      # the default --fill-wait answer for every harness.
+                      (args.io_driver == "paranoid" if args.fill_wait is None
+                       else args.fill_wait),
+                      args.fill_timeout_minutes * 60.0,
+                      args.watch_after_break * 60.0)
+
+    results_path = soak_dir / f"result-{int(time.time())}.json"
+    results_path.write_text(json.dumps(result, indent=2))
+
+    print()
+    print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
+    for line in (summary(result) if summary else []):
+        print(line)
+    print(f"Result written to {results_path}")
+    if result["outcome"] in FAILURE_OUTCOMES:
+        print(f"Artifacts in {result['run_dir']}")
+        return 1
+    return 0
 
 
 def add_common_args(ap: argparse.ArgumentParser, soak_dir: Path,
