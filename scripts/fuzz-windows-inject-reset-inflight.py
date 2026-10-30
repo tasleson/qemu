@@ -64,10 +64,22 @@
 # set by the guest's own timeout/escalation chain, not by any number on
 # this command line -- which is exactly what the test is measuring.
 #
-# Each reset is recorded as a cycle: when it happened, on which adapter,
-# how deep the in-flight hold was in the sample immediately before it,
-# which TMF subtypes led up to it, and how long after the stall rule was
-# armed. --cycles N ends the run once N of them have been seen.
+# Each reset is recorded as a cycle: what kind it was, when it happened,
+# on which adapter, how deep the in-flight hold was in the sample
+# immediately before it, which TMF subtypes led up to it, and how long
+# after the stall rule was armed. --cycles N ends the run once N of them
+# have been seen.
+#
+# A cycle is not only the adapter reset. A logical unit or I_T nexus
+# reset ends the hold the same way: it reaches scsi_device_purge_requests()
+# (hw/scsi/scsi-bus.c), which ends in blk_drain() on the LUN's
+# BlockBackend, which trips inject_error_drain_begin() on that LUN's
+# inject-error node and wakes everything it holds -- for one LUN rather
+# than for the whole adapter, but woken all the same. Counting only the
+# adapter reset reports zero cycles for a guest that recovers at the LUN
+# level and never escalates, which is the common case: storport will
+# retry a logical_unit_reset against the same LUN every timeout for as
+# long as the application keeps asking.
 #
 # Prerequisites: identical to fuzz-windows-inject-scsi-reset.py -- see
 # that script's usage_note() / module docstring, or run this one with
@@ -89,10 +101,11 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (TMF_SUBTYPES, VM_DIR, SoakContext,
-                                 SoakStrategy, add_common_args, arm_delay_rules,
-                                 check_prereqs, load_qmp_module, qmp_call,
-                                 run_soak, usage_note, utc_now)
+from vioscsi_soak_common import (FAILURE_OUTCOMES, TMF_SUBTYPES, VM_DIR,
+                                 SoakContext, SoakStrategy, add_common_args,
+                                 arm_delay_rules, check_prereqs,
+                                 load_qmp_module, qmp_call, run_soak,
+                                 usage_note, utc_now)
 
 SOAK_DIR = VM_DIR / "soak-reset-inflight"
 
@@ -122,6 +135,15 @@ BUS_RE = re.compile(r"scsi(\d+)")
 # paranoid.exe's --per-request-timeout-ms -- has to sit above that or it
 # will fire while the test is working exactly as intended.
 DEFAULT_STALL_BUDGET_MS = 300000
+
+# The recovery events that count as a cycle, each with the key QemuStderr
+# tallies it under, in the order storport escalates through them. See the
+# module docstring for why the two TMFs count and not just the adapter
+# reset. Narrower kinds come first so that a tick which caught a whole
+# escalation chain numbers its cycles in the order they happened.
+CYCLE_KINDS = (("logical_unit_reset", "tmf_req:logical_unit_reset"),
+               ("i_t_nexus_reset", "tmf_req:i_t_nexus_reset"),
+               ("adapter_reset", "reset"))
 
 
 def _tmf_name(subtype: str) -> str:
@@ -157,7 +179,9 @@ class ResetInflightStrategy(SoakStrategy):
         self.depth: dict = {}
         self.prev_depth: dict = {}
         self.max_depth: dict = {}
-        self.resets: collections.Counter = collections.Counter()
+        # adapter -> kind -> count, and bus -> kind -> count already
+        # attributed to a cycle.
+        self.resets: dict = {}
         self.seen_resets: dict = {}
         self.seen_tmfs: dict = {}
         self.cycle_log: list = []
@@ -209,12 +233,12 @@ class ResetInflightStrategy(SoakStrategy):
 
         self._sample_inflight(ctx)
         self._do_pending_releases(ctx)
-        for adapter, tmfs in self._new_resets(ctx):
-            self._record_cycle(ctx, adapter, tmfs)
+        for adapter, kind, tmfs in self._new_resets(ctx):
+            self._record_cycle(ctx, adapter, kind, tmfs)
 
         ctx.result["reset_cycles"] = self.cycle_log
         ctx.result["max_inflight_by_adapter"] = dict(self.max_depth)
-        ctx.result["resets_by_adapter"] = dict(self.resets)
+        ctx.result["resets_by_adapter"] = self._resets_snapshot()
         if self.releases:
             ctx.result["timed_releases"] = self.releases
         if self.sample_errors:
@@ -265,13 +289,21 @@ class ResetInflightStrategy(SoakStrategy):
                 "held": max(prev["held"], cur["held"]),
                 "stalled": max(prev["stalled"], cur["stalled"])}
 
+    def _resets_snapshot(self) -> dict:
+        """A copy deep enough to hand to the result and the heartbeat:
+        both are serialised later, and the per-kind dicts keep being
+        counted up in the meantime."""
+        return {adapter: dict(kinds)
+                for adapter, kinds in self.resets.items()}
+
     def _new_resets(self, ctx: SoakContext):
-        """Adapters that have reset since the last tick, each with the
-        TMF subtypes seen on that adapter in the same interval.
+        """Recovery events seen since the last tick, each as (adapter,
+        kind, tmfs): the kind is one of CYCLE_KINDS, and tmfs is the TMF
+        subtypes seen on that adapter in the same interval.
 
         QemuStderr tallies trace lines per bus cumulatively for the whole
         soak (take_counts() is only called before the soak starts), so a
-        new reset is a rise in that adapter's 'reset' count."""
+        new event is a rise in that adapter's count for its kind."""
         stderr = ctx.qemu_stderr
         if stderr is None:
             return
@@ -286,32 +318,49 @@ class ResetInflightStrategy(SoakStrategy):
             seen = self.seen_tmfs.get(bus, {})
             delta = {k: v - seen.get(k, 0) for k, v in tmfs.items()
                      if v > seen.get(k, 0)}
-            resets = counts.get("reset", 0)
-            new = resets - self.seen_resets.get(bus, 0)
-            self.seen_resets[bus] = resets
-            if new <= 0:
+            seen_kinds = self.seen_resets.setdefault(bus, {})
+            new = []
+            for kind, key in CYCLE_KINDS:
+                total = counts.get(key, 0)
+                new += [kind] * max(0, total - seen_kinds.get(kind, 0))
+                seen_kinds[kind] = total
+            if not new:
                 continue
             # Only claim the TMFs once they have been attributed to a
             # cycle, so an adapter that escalates over several ticks
             # before resetting still reports the whole chain.
             self.seen_tmfs[bus] = tmfs
-            for _ in range(new):
-                yield adapter, delta
+            # The chain belongs to the tick, not to each event in it, so
+            # it goes on the first cycle only. Handing the same delta to
+            # every cycle a tick yields would make the field impossible
+            # to sum across cycles.
+            for i, kind in enumerate(new):
+                yield adapter, kind, delta if i == 0 else {}
 
-    def _record_cycle(self, ctx: SoakContext, adapter: int, tmfs: dict) -> None:
+    def _record_cycle(self, ctx: SoakContext, adapter: int, kind: str,
+                      tmfs: dict) -> None:
+        # The hold is sampled per adapter, so for a LUN or target reset
+        # these depths cover more LUNs than the reset itself drained.
+        # They are still the right number to report -- how deep the
+        # adapter was when the guest gave up -- but they are not a count
+        # of what this one event woke.
         before = self.prev_depth.get(adapter, {"held": 0, "stalled": 0})
         now = time.monotonic()
-        self.resets[adapter] += 1
+        self.resets.setdefault(adapter, {})
+        self.resets[adapter][kind] = self.resets[adapter].get(kind, 0) + 1
         cycle = {"n": len(self.cycle_log) + 1,
+                 "kind": kind,
                  "time": utc_now(),
                  "elapsed_s": round(now - ctx.start, 1),
                  "adapter": adapter,
                  "held_before_reset": before["held"],
                  "stalled_before_reset": before["stalled"],
+                 # For a TMF-derived cycle this includes the TMF that is
+                 # the cycle, not only what led up to it.
                  "tmfs_before_reset": tmfs,
                  "since_armed_s": round(now - (self.armed_at or ctx.start), 1)}
         self.cycle_log.append(cycle)
-        print(f"[{cycle['time']}] reset #{cycle['n']} on scsi{adapter}: "
+        print(f"[{cycle['time']}] {kind} #{cycle['n']} on scsi{adapter}: "
               f"{before['stalled']} stalled of {before['held']} held, "
               f"TMFs {tmfs or '{}'}, "
               f"{cycle['since_armed_s']:.0f}s since armed")
@@ -351,7 +400,7 @@ class ResetInflightStrategy(SoakStrategy):
         return {"inflight_by_adapter": dict(self.depth),
                 "max_inflight_by_adapter": dict(self.max_depth),
                 "reset_cycles_done": len(self.cycle_log),
-                "resets_by_adapter": dict(self.resets)}
+                "resets_by_adapter": self._resets_snapshot()}
 
     def meta(self) -> dict:
         return {"stall_probability": self.stall_probability,
@@ -394,9 +443,10 @@ def add_rule_args(ap: argparse.ArgumentParser) -> None:
                           "per-request timeout; too low and they fire while "
                           "the test is working as intended")
     ap.add_argument("--cycles", type=int, default=0,
-                     help="stop once this many adapter resets have been "
-                          "observed (default: %(default)s, i.e. run for the "
-                          "full --duration-hours)")
+                     help="stop once this many resets have been observed, of "
+                          "any kind the guest recovers with -- logical unit, "
+                          "I_T nexus or adapter (default: %(default)s, i.e. "
+                          "run for the full --duration-hours)")
     ap.add_argument("--release-after-reset-ms", type=int, default=None,
                      metavar="MS",
                      help="instead of leaving every completion to the reset's "
@@ -525,14 +575,15 @@ def main() -> int:
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s), "
           f"{len(cycles)} reset cycle(s)")
     if cycles:
+        by_kind = collections.Counter(c["kind"] for c in cycles)
+        print("  " + ", ".join(f"{n} {kind}" for kind, n
+                               in sorted(by_kind.items())))
         deepest = max(cycles, key=lambda c: c["stalled_before_reset"])
         print(f"Deepest hold at a reset: {deepest['stalled_before_reset']} "
               f"stalled of {deepest['held_before_reset']} held on "
-              f"scsi{deepest['adapter']}")
+              f"scsi{deepest['adapter']} at a {deepest['kind']}")
     print(f"Result written to {results_path}")
-    if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
-                             "guest-panicked", "data-corruption",
-                             "fill-failed"):
+    if result["outcome"] in FAILURE_OUTCOMES:
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0
