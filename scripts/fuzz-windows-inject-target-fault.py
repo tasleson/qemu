@@ -45,10 +45,8 @@
 # the I/O-stall detector watches while a fault is armed.
 
 import argparse
-import base64
 import collections
 import dataclasses
-import fcntl
 import hashlib
 import itertools
 import json
@@ -57,18 +55,31 @@ import os
 import random
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Optional
+
+# The shared machinery lives next to this script, which is not necessarily
+# the directory the harness is run from.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# pylint: disable=wrong-import-position
+from vioscsi_soak_common import (GuestExecError, NoReplyError, _covers_luns,
+                                 _qga_call, b64_text, build_writer_script,
+                                 capture_qemu_stacks,
+                                 capture_vioscsi_telemetry, check_prereqs,
+                                 count_guest_processes, explain_break,
+                                 first_sight, load_qmp_module,
+                                 make_blank_image, make_overlay, ps_exec,
+                                 qga_call, qga_exec, qga_exec_wait, qga_ping,
+                                 start_swtpm, utc_now, wall_time)
 
 QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
 QEMU_BUILD = Path(os.environ.get("QEMU_BUILD", str(QEMU_SRC / "build")))
 QEMU_BIN = QEMU_BUILD / "qemu-system-x86_64"
-QEMU_IMG = QEMU_BUILD / "qemu-img"
 
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 VM_DIR = Path(os.environ.get("VM_DIR", str(HOME / "VirtualMachines" / "qemu" / "windows_inject")))
@@ -78,14 +89,15 @@ BOOT_DISK = VM_DIR / "boot.qcow2"
 OVMF_CODE = Path(os.environ.get(
     "OVMF_CODE", "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2"))
 OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TPM_DIR = VM_DIR / "tpm"  # shared, persistent -- same TPM state the golden image was installed with
-
-PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
 DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
 DEFAULT_FIO_PATH = r"C:\Program Files\fio\fio.exe"
+# Writers that check what they read back and exit non-zero on the first
+# mismatch: fio under '--verify_fatal=1'. Only for those does an early exit
+# mean the data came back wrong rather than the writer merely dying, so
+# only those are polled for it during the soak (see writers_failed).
+VERIFYING_IO_DRIVERS = ("fio",)
 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
-VIOSCSI_TELEMETRY_TIMEOUT_S = 60
 WRITER_STOP_TIMEOUT_S = 30
 # Before post-failure collection, how hard to try the guest agent. A busy
 # main loop can delay a reply by seconds, so one short ping is not enough to
@@ -96,7 +108,6 @@ AGENT_CHECK_TIMEOUT_S = 5.0
 
 DEFAULT_RAM = "8G"
 DEFAULT_CPUS = "5"
-LUN_IMAGE_SIZE = "4G"
 
 BOOT_TIMEOUT_S = 180
 # Generous on purpose: at high LUN counts the agent can take a long while to
@@ -119,7 +130,6 @@ DUMP_POLL_INTERVAL_S = 2
 # QEMU refuses 'cont' while it runs. How much longer to wait for it to end
 # before leaving the VM paused and saying so.
 DUMP_RESUME_WAIT_S = 900
-STACK_CAPTURE_TIMEOUT_S = 120
 # x-stop-on-broken asks for the stop right after virtio_error() prints, but
 # the main loop carries it out a moment later, so a poll that has just read
 # the message can still find the VM running. Give it this long to pause.
@@ -156,7 +166,6 @@ MIN_WRITE_OPS_PER_S = 2.0
 # qemu-ga to come back.
 LAUNCH_PROBE_S = 120.0
 LAUNCH_PROBE_INTERVAL_S = 5.0  # between pings; each also samples the LUNs
-WRITER_COUNT_TIMEOUT_S = 60  # counting writer processes once the agent is back
 
 # After a virtio-scsi ring breaks, how long to watch which adapters still
 # complete writes. The faults are removed first, so nothing is held; the
@@ -242,316 +251,6 @@ Environment overrides for running on different machines:
 # ------------------------------------------------------------------
 
 
-# A guest-sync-delimited reply, and the request that resets the agent's
-# parser, are both preceded by this byte; it never occurs in JSON text.
-# The agent answers the request-side byte with a parse error of its own,
-# which the sync skips like any other reply that isn't its echo.
-QGA_SENTINEL = b"\xff"
-
-
-def _qga_request(execute: str, arguments: Optional[dict] = None) -> bytes:
-    msg: dict = {"execute": execute}
-    if arguments is not None:
-        msg["arguments"] = arguments
-    return (json.dumps(msg) + "\n").encode()
-
-
-# A sync the agent never saw -- run-1791557706 lost one about 10s after the
-# boot ping had answered, with no load on the guest at all -- would
-# otherwise cost the call its whole timeout. After this long without an
-# echo, send another. Only ever the sync: the command that follows it may
-# not be idempotent (guest-exec isn't).
-QGA_SYNC_RESEND_S = 5.0
-
-
-# The format of qemu.log's trace timestamps, to line up against them.
-UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime(UTC_FORMAT)
-
-
-def wall_time(mono: float) -> str:
-    """A time.monotonic() reading from the past, as utc_now() would have
-    put it then."""
-    then = time.time() - (time.monotonic() - mono)
-    return datetime.fromtimestamp(then, timezone.utc).strftime(UTC_FORMAT)
-
-
-@dataclasses.dataclass
-class QgaSync:
-    """How the guest-sync-delimited ahead of one agent command went."""
-    syncs_sent: int = 0
-    # From the first sync sent to the first echo of any of ours, or None.
-    first_echo_s: Optional[float] = None
-    # The first echo was for a sync we had already resent: that one was
-    # slow, not lost.
-    first_echo_stale: bool = False
-
-    def slow(self) -> bool:
-        return (self.syncs_sent > 1 or (self.first_echo_s is not None and
-                                        self.first_echo_s > QGA_SYNC_RESEND_S))
-
-    def describe(self) -> str:
-        echo = ("no echo" if self.first_echo_s is None else
-                f"first echo after {self.first_echo_s:.1f}s"
-                + (" (for an earlier sync)" if self.first_echo_stale else ""))
-        return f"{self.syncs_sent} sync(s) sent, {echo}"
-
-
-class _QgaReplies:
-    """The agent's replies on one connection, read up to a caller-chosen
-    point in time, so the sync can give up waiting and resend."""
-
-    def __init__(self, s: socket.socket):
-        self.s = s
-        self.buf = b""
-        self.pending: collections.deque = collections.deque()
-        self.eof = False
-
-    def next(self, until: float) -> Optional[dict]:
-        while not self.pending:
-            remaining = until - time.monotonic()
-            if self.eof or remaining <= 0:
-                return None
-            self.s.settimeout(remaining)
-            try:
-                chunk = self.s.recv(65536)
-            except socket.timeout:
-                return None
-            if not chunk:
-                self.eof = True
-                return None
-            # The sentinel only marks where a reply starts, so treating it
-            # as a line break also throws away any half-written stale reply.
-            self.buf += chunk.replace(QGA_SENTINEL, b"\n")
-            *lines, self.buf = self.buf.split(b"\n")
-            for line in lines:
-                try:
-                    resp = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(resp, dict) and ("return" in resp or
-                                               "error" in resp):
-                    self.pending.append(resp)
-        return self.pending.popleft()
-
-
-def _qga_call(sock_path: Path, execute: str, arguments: Optional[dict],
-              timeout: float
-              ) -> tuple[Optional[dict], Optional[str], QgaSync]:
-    """Run one guest agent command: (reply, None, sync), or (None, stage,
-    sync) where stage is how far it got -- "connect" (the socket could not
-    be reached), "sync" (no echo of any guest-sync-delimited we sent, so
-    the command was never sent) or "command" (synced, but the command
-    itself got no reply). sync says how the synchronization went.
-
-    The agent's virtio-serial channel outlives our connection: a reply to
-    a request whose client gave up -- timed out, or asked while the VM was
-    paused -- is still delivered, to whoever connects next, and would be
-    taken for the answer to the next command. So first synchronize with
-    guest-sync-delimited, as the agent's protocol asks, and drop
-    everything up to the echo of our own token. The agent answers in
-    order, so the next reply after that is ours.
-
-    A sync with no echo after QGA_SYNC_RESEND_S is resent with a fresh
-    token, while the timeout leaves a resend the time to be answered. Only
-    the echo of the latest token counts as synced: each earlier sync, and
-    the parse error each sentinel draws, gets its own reply first, and any
-    of those would be taken for the command's. Once an echo of ours shows
-    how long the agent takes to answer, the latest sync is given that long
-    on top before it counts as lost -- so an agent that is merely slow is
-    waited on, not chased with ever more syncs, while one that dropped the
-    latest sync after answering an earlier one still gets another.
-    """
-    deadline = time.monotonic() + timeout
-    sync = QgaSync()
-    tokens: list = []
-    stage = "connect"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(str(sock_path))
-            stage = "sync"
-            replies = _QgaReplies(s)
-
-            sent_at: dict = {}  # token -> when it was sent
-
-            def send_sync() -> float:
-                tokens.append(random.getrandbits(63))
-                s.sendall(QGA_SENTINEL + _qga_request(
-                    "guest-sync-delimited", {"id": tokens[-1]}))
-                sync.syncs_sent += 1
-                sent_at[tokens[-1]] = time.monotonic()
-                return sent_at[tokens[-1]]
-
-            first_sent = last_sent = send_sync()
-            latency = 0.0  # of the most recent echo of ours, once there is one
-            while True:
-                resend_at = last_sent + latency + QGA_SYNC_RESEND_S
-                resending = resend_at + QGA_SYNC_RESEND_S <= deadline
-                resp = replies.next(resend_at if resending else deadline)
-                if resp is None:
-                    if replies.eof or time.monotonic() >= deadline:
-                        return None, stage, sync
-                    if resending:
-                        last_sent = send_sync()
-                    continue
-                ret = resp.get("return")
-                if isinstance(ret, int) and ret in sent_at:
-                    now = time.monotonic()
-                    latency = now - sent_at[ret]
-                    if sync.first_echo_s is None:
-                        sync.first_echo_s = round(now - first_sent, 1)
-                        sync.first_echo_stale = ret != tokens[-1]
-                    if ret == tokens[-1]:
-                        break
-            stage = "command"
-            s.sendall(_qga_request(execute, arguments))
-            resp = replies.next(deadline)
-            return resp, (None if resp is not None else stage), sync
-    except (OSError, ConnectionError):
-        return None, stage, sync
-
-
-def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
-             timeout: float = 5.0) -> Optional[dict]:
-    """Run one guest agent command and return its reply, or None. See
-    _qga_call for the protocol, and for which stage went unanswered."""
-    return _qga_call(sock_path, execute, arguments, timeout)[0]
-
-
-def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
-    resp = qga_call(sock_path, "guest-ping", timeout=timeout)
-    return resp is not None and "return" in resp
-
-
-class GuestExecError(RuntimeError):
-    """A guest-exec request that did not come back with a pid.
-
-    The message distinguishes which of two very different failures
-    happened, because they call for opposite responses. If the agent
-    refused the request, the command or the guest is wrong. If the agent
-    never answered, the command may be fine and the process may even be
-    running, with only the reply lost. Collapsing both into "failed to
-    launch" sends you looking for a bug in the wrong place.
-    """
-
-
-class NoReplyError(GuestExecError):
-    """The agent never answered: the second case above. stage says how far
-    the request got (see _qga_call): at "sync" none of the syncs we sent
-    was echoed, so nothing came back over the channel and the command
-    never went out; at "command" the channel worked both ways and only
-    the command went unanswered. sync is how the synchronization went, and
-    command the agent command that went unanswered: the guest-exec itself,
-    or a guest-exec-status poll while waiting for it."""
-
-    def __init__(self, message: str, stage: str, sync: QgaSync,
-                 command: str = "guest-exec"):
-        super().__init__(message)
-        self.stage = stage
-        self.sync = sync
-        self.command = command
-
-
-def qga_exec(sock_path: Path, what: str, path: str, args: list, capture: bool,
-             timeout: float = GUEST_EXEC_TIMEOUT_S,
-             resyncs: Optional[list] = None) -> int:
-    """Run path in the guest and return its pid. A sync that needed
-    resending, or was slow to come back, is reported on stderr and
-    appended to resyncs if given -- the call still worked, but that is
-    the stall the resend exists for, and how long it lasted."""
-    resp, stage, sync = _qga_call(sock_path, "guest-exec",
-                                  {"path": path, "arg": args,
-                                   "capture-output": capture}, timeout)
-    if resp is None:
-        if stage == "connect":
-            why = (f"could not reach the guest agent's socket {sock_path}, "
-                   f"so the request to run {path!r} was never sent")
-        elif stage == "sync":
-            why = (f"the guest agent never answered any of the "
-                   f"{sync.syncs_sent} guest-sync-delimited sent ahead of it "
-                   f"over {timeout:.0f}s, so the request to run {path!r} was "
-                   f"never sent")
-        else:
-            why = (f"the guest agent answered the sync ({sync.describe()}) "
-                   f"but not the request to run {path!r} within "
-                   f"{timeout:.0f}s; it was sent, so the process may have "
-                   f"started and only the reply been lost")
-        raise NoReplyError(f"guest-exec ({what}): {why}", stage, sync)
-    if sync.slow():
-        print(f"    guest agent: {sync.describe()} ({what})", file=sys.stderr)
-        if resyncs is not None:
-            resyncs.append({"at": utc_now(), "request": what,
-                            **dataclasses.asdict(sync)})
-    if "error" in resp:
-        err = resp["error"] if isinstance(resp["error"], dict) else {}
-        raise GuestExecError(
-            f"guest-exec ({what}): the guest agent refused to run {path!r}: "
-            f"{err.get('class', '?')}: {err.get('desc', resp['error'])}")
-    pid = resp.get("return", {}).get("pid")
-    if pid is None:
-        raise GuestExecError(
-            f"guest-exec ({what}): the guest agent accepted {path!r} but "
-            f"returned no pid: {resp!r}")
-    return pid
-
-
-def qga_exec_wait(sock_path: Path, pid: int, timeout: float,
-                  silent_raises: Optional[str] = None) -> Optional[dict]:
-    """Poll guest-exec-status until pid exits; its status, or None.
-
-    None folds together a process still running and an agent that stopped
-    answering the polls. With silent_raises -- the request's name, for the
-    message -- a wait that ends on the second, the last poll unanswered and
-    none answered for AGENT_SILENCE_THRESHOLD_S, raises NoReplyError
-    instead, so it can be diagnosed like an unanswered guest-exec. An agent
-    that kept saying "not exited" still gets None."""
-    start = time.monotonic()
-    deadline = start + timeout
-    last_answer = start  # the guest-exec that started pid was answered
-    stage: Optional[str] = None
-    sync = QgaSync()
-    while time.monotonic() < deadline:
-        resp, stage, sync = _qga_call(sock_path, "guest-exec-status",
-                                      {"pid": pid}, 5.0)
-        if resp is not None:
-            last_answer = time.monotonic()
-            if "return" in resp and resp["return"].get("exited"):
-                return resp["return"]
-        time.sleep(0.3)
-    silent_s = time.monotonic() - last_answer
-    if (silent_raises is not None and stage is not None
-            and silent_s >= AGENT_SILENCE_THRESHOLD_S):
-        raise NoReplyError(
-            f"guest-exec-status ({silent_raises}): the guest agent stopped "
-            f"answering the status polls for pid {pid}: none answered in the "
-            f"last {silent_s:.0f}s of the {timeout:.0f}s wait (last poll: no "
-            f"reply at {stage}, {sync.describe()})", stage, sync,
-            "guest-exec-status")
-    return None
-
-
-def b64_text(data: Optional[str]) -> str:
-    if not data:
-        return ""
-    return base64.b64decode(data).decode("utf-8", errors="replace")
-
-
-def encode_ps(script: str) -> str:
-    return base64.b64encode(script.encode("utf-16-le")).decode()
-
-
-def ps_exec(sock_path: Path, what: str, script: str, capture: bool,
-            timeout: float = GUEST_EXEC_TIMEOUT_S,
-            resyncs: Optional[list] = None) -> int:
-    args = ["-NoProfile", "-NonInteractive", "-EncodedCommand", encode_ps(script)]
-    return qga_exec(sock_path, what, PS_EXE, args, capture=capture,
-                     timeout=timeout, resyncs=resyncs)
-
-
 # ------------------------------------------------------------------
 # Guest-side PowerShell payloads
 # ------------------------------------------------------------------
@@ -570,34 +269,6 @@ foreach ($s in $serials) {{
     }} else {{
         Write-Output "MISSING $s"
     }}
-}}
-"""
-
-
-def build_writer_script(drive_number: int, duration_s: float) -> str:
-    window_blocks = WRITER_WINDOW_BYTES // WRITER_BLOCK_BYTES
-    return f"""
-$path = "\\\\.\\PhysicalDrive{drive_number}"
-$blockSize = {WRITER_BLOCK_BYTES}
-$windowBlocks = {window_blocks}
-$buf = New-Object byte[] $blockSize
-(New-Object Random).NextBytes($buf)
-$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-$i = 0
-$deadline = (Get-Date).AddSeconds({duration_s})
-try {{
-    while ((Get-Date) -lt $deadline) {{
-        try {{
-            $fs.Seek((($i % $windowBlocks) * $blockSize), [System.IO.SeekOrigin]::Begin) | Out-Null
-            $fs.Write($buf, 0, $buf.Length)
-            $fs.Flush()
-            $i++
-        }} catch {{
-            Start-Sleep -Milliseconds 200
-        }}
-    }}
-}} finally {{
-    $fs.Close()
 }}
 """
 
@@ -688,9 +359,13 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                          build_diskspd_args(drive_number, duration_s),
                          capture=False, resyncs=resyncs)
     if io_driver == "fio":
+        # Captured, unlike the other drivers': fio writes "verify: bad
+        # magic header ..." and the failing offset to stderr, and the agent
+        # only hands that back for a process started with capture-output.
+        # The exit code alone would say a verify failed but not where.
         return qga_exec(qga_sock, what, fio_path,
                          build_fio_args(drive_number, duration_s),
-                         capture=False, resyncs=resyncs)
+                         capture=True, resyncs=resyncs)
     return ps_exec(qga_sock, what,
                     build_writer_script(drive_number, duration_s),
                     capture=False, resyncs=resyncs)
@@ -734,59 +409,58 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int) -> str:
             f"stdout={out[:400]!r}; stderr={err[:400]!r}")
 
 
-def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
-                               timeout: float = VIOSCSI_TELEMETRY_TIMEOUT_S
-                               ) -> tuple[bool, str]:
-    """Run the guest's vioscsi telemetry PowerShell script and save its
-    output to out_path on the host. Returns (ok, status message). Never
-    raises -- a telemetry capture failure (e.g. the guest going dark right
-    as a crash is suspected) shouldn't abort the harness, just get
-    recorded as a short status; the caller decides whether to grab a
-    postmortem dump."""
-    try:
-        pid = qga_exec(qga_sock, "vioscsi telemetry", PS_EXE,
-                        ["-NoProfile", "-NonInteractive", "-File", script_path],
-                        capture=True, timeout=timeout)
-    except GuestExecError as exc:
-        msg = str(exc)
-        out_path.write_text(msg + "\n")
-        return False, msg
-    status = qga_exec_wait(qga_sock, pid, timeout=timeout)
-    if status is None:
-        msg = f"telemetry script timed out after {timeout:.0f}s"
-        out_path.write_text(msg + "\n")
-        return False, msg
-    out = b64_text(status.get("out-data"))
-    err = b64_text(status.get("err-data"))
-    text = out
-    if err:
-        text += f"\n--- stderr ---\n{err}"
-    out_path.write_text(text)
-    ok = status.get("exitcode") == 0 and bool(out.strip())
-    return ok, f"exitcode={status.get('exitcode')}, saved to {out_path}"
+WRITER_STDERR_TAIL_CHARS = 8000
 
 
-def writer_states(qga_sock: Path, pids: list) -> list:
+def writer_states(qga_sock: Path, pids: list,
+                   seen: Optional[dict] = None) -> list:
+    """Each writer's exit state, newest poll first.
+
+    The agent answers guest-exec-status for an exited process once: it
+    hands back the exit code and whatever output was captured, then reaps
+    the pid, and every later poll of it fails. So the first poll that says
+    "exited" carries the only copy of that writer's stderr there will ever
+    be, and re-polling would turn a known exit back into an unknown one.
+
+    Pass @seen -- a pid -> state dict the caller keeps across calls -- to
+    make that stick: a pid already known to have exited is answered from
+    it instead of re-polled, and every fresh state is recorded in it.
+    That also spares the agent a round trip per dead writer, which is the
+    bulk of them once a run is failing.
+    """
     states = []
     for pid in pids:
+        if seen is not None and seen.get(pid, {}).get("exited"):
+            states.append(seen[pid])
+            continue
         resp = qga_call(qga_sock, "guest-exec-status", {"pid": pid}, timeout=5.0)
         ret = resp.get("return", {}) if resp and "return" in resp else {}
-        states.append({"pid": pid, "exited": ret.get("exited"),
-                       "exitcode": ret.get("exitcode")})
+        state = {"pid": pid, "exited": ret.get("exited"),
+                 "exitcode": ret.get("exitcode")}
+        # Only writers launched with captured output (fio) have any, and
+        # the agent hands it back only once the process exits.
+        err = b64_text(ret.get("err-data")).strip()
+        if err:
+            state["stderr_tail"] = err[-WRITER_STDERR_TAIL_CHARS:]
+        if seen is not None:
+            seen[pid] = state
+        states.append(state)
     return states
 
 
-def wait_for_writers(qga_sock: Path, pids: list, timeout: float) -> list:
+def wait_for_writers(qga_sock: Path, pids: list, timeout: float,
+                      seen: Optional[dict] = None) -> list:
     deadline = time.monotonic() + timeout
-    states = writer_states(qga_sock, pids)
+    states = writer_states(qga_sock, pids, seen)
     while time.monotonic() < deadline and any(not s["exited"] for s in states):
         time.sleep(1.0)
-        states = writer_states(qga_sock, pids)
+        states = writer_states(qga_sock, pids, seen)
     return states
 
 
 def stop_writers(qga_sock: Path, pids: list,
-                  timeout: float = WRITER_STOP_TIMEOUT_S) -> list:
+                  timeout: float = WRITER_STOP_TIMEOUT_S,
+                  seen: Optional[dict] = None) -> list:
     """Force-stop any writer still running and wait for it to exit.
 
     Writers are launched with writer_duration, padded well past the
@@ -795,15 +469,20 @@ def stop_writers(qga_sock: Path, pids: list,
     Left alone they'd keep hammering the guest with I/O for up to another
     ~10 minutes after the harness is done watching, which races vioscsi
     telemetry collection (and anything else run post-test) against a guest
-    still under full write load."""
-    for st in writer_states(qga_sock, pids):
+    still under full write load.
+
+    Pass @seen through so a writer that already exited -- the one that
+    failed verification, say -- keeps the state and stderr it exited with
+    rather than having them replaced by a poll the agent can no longer
+    answer. See writer_states()."""
+    for st in writer_states(qga_sock, pids, seen):
         if not st["exited"]:
             try:
                 qga_exec(qga_sock, f"taskkill pid {st['pid']}", TASKKILL_EXE,
                           ["/F", "/PID", str(st["pid"])], capture=False)
             except GuestExecError:
                 pass  # best-effort; wait_for_writers reports what survived
-    return wait_for_writers(qga_sock, pids, timeout)
+    return wait_for_writers(qga_sock, pids, timeout, seen)
 
 
 # ------------------------------------------------------------------
@@ -821,93 +500,6 @@ class LunSpec:
     fmt_node: str
     dev_id: str
     serial: str
-
-
-def make_blank_image(path: Path, size: str = LUN_IMAGE_SIZE) -> None:
-    subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", str(path), size],
-                   check=True, capture_output=True)
-
-
-def make_overlay(golden: Path, dest: Path) -> None:
-    subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
-                    "-b", str(golden), str(dest)],
-                   check=True, capture_output=True)
-
-
-def other_swtpm_pids(exclude_pid: int) -> list:
-    try:
-        out = subprocess.run(["pgrep", "-f", "swtpm socket"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    exclude = str(exclude_pid)
-    return [pid for pid in out.stdout.split() if pid != exclude]
-
-
-def check_tpm_dir_lockable() -> None:
-    # See fuzz-windows-inject-scsi-reset.py's check_tpm_dir_lockable for why
-    # this pre-check matters: swtpm's own lock is lazy (taken at CMD_INIT,
-    # not startup), so waiting for its control socket to appear proves
-    # nothing about contention on the shared, persistent TPM_DIR.
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = TPM_DIR / ".lock"
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o640)
-    except OSError:
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            holders = other_swtpm_pids(os.getpid())
-            raise RuntimeError(
-                f"the shared TPM state dir {TPM_DIR} is already locked by "
-                f"another process -- swtpm here would fail CMD_INIT and QEMU "
-                f"would die with 'TPM result for CMD_INIT: 0x9'. swtpm "
-                f"process(es) currently running: "
-                f"{holders if holders else 'none visible via pgrep'}. Shut "
-                f"that VM down (or kill the stray swtpm) and retry.")
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
-    check_tpm_dir_lockable()
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
-    if tpm_sock.exists():
-        tpm_sock.unlink()
-    log_path = tpm_sock.parent / "swtpm-startup.log"
-    log_file = log_path.open("wb")
-    proc = subprocess.Popen([
-        "swtpm", "socket",
-        "--tpmstate", f"dir={TPM_DIR}",
-        "--ctrl", f"type=unixio,path={tpm_sock}",
-        "--tpm2",
-    ], stdout=log_file, stderr=subprocess.STDOUT)
-    log_file.close()
-    for _ in range(50):
-        if tpm_sock.exists():
-            return proc
-        exit_code = proc.poll()
-        if exit_code is not None:
-            output = log_path.read_text(errors="replace").strip()
-            raise RuntimeError(
-                f"swtpm exited immediately (code {exit_code}) instead of "
-                f"creating its control socket. swtpm output:\n{output}")
-        time.sleep(0.1)
-    proc.kill()
-    other_swtpm = other_swtpm_pids(proc.pid)
-    hint = (f" -- other swtpm process(es) currently running: {other_swtpm}; "
-            f"one of them likely already holds the exclusive lock on "
-            f"{TPM_DIR}" if other_swtpm else
-            f" -- no other swtpm process is currently visible, so this "
-            f"isn't the usual {TPM_DIR} lock contention; check the swtpm "
-            f"install and permissions on that directory")
-    raise RuntimeError(
-        f"swtpm did not create its control socket within 5s -- it likely "
-        f"blocked silently trying to lock {TPM_DIR} rather than erroring "
-        f"out{hint}")
 
 
 def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
@@ -1063,38 +655,6 @@ def virtio_serial_ports(qmp) -> list:
                           "host_connected": m.group(3) == "on",
                           "throttled": m.group(4) == "on"})
     return ports
-
-
-def capture_qemu_stacks(pid: int, out: Path) -> None:
-    lines = []
-    for task in sorted(Path(f"/proc/{pid}/task").glob("*"),
-                       key=lambda t: int(t.name)):
-        try:
-            comm = (task / "comm").read_text().strip()
-            state = (task / "stat").read_text().rsplit(")", 1)[1].split()[0]
-            wchan = (task / "wchan").read_text().strip()
-        except OSError:
-            continue
-        lines.append(f"tid={task.name} comm={comm} state={state} wchan={wchan}")
-    text = "\n".join(lines) + "\n\n"
-
-    if shutil.which("gdb"):
-        env = dict(os.environ, DEBUGINFOD_URLS="")
-        try:
-            r = subprocess.run(
-                ["gdb", "-batch", "-nx", "-p", str(pid),
-                 "-ex", "set pagination off",
-                 "-ex", "thread apply all bt"],
-                capture_output=True, text=True, env=env,
-                timeout=STACK_CAPTURE_TIMEOUT_S)
-            text += r.stdout + r.stderr
-        except subprocess.TimeoutExpired:
-            text += f"gdb timed out after {STACK_CAPTURE_TIMEOUT_S}s\n"
-    else:
-        text += "gdb not installed; no userspace backtrace\n"
-
-    out.write_text(text)
-    print(f"    QEMU thread stacks saved to {out}", file=sys.stderr)
 
 
 def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
@@ -1310,77 +870,6 @@ CHR_SOCKET_LABEL_RE = re.compile(r"\((\S+)\)$")
 # include/chardev/char.h, QEMUChrEvent
 CHR_EVENTS = {0: "break", 1: "opened", 2: "mux_in", 3: "mux_out",
               4: "closed"}
-
-# What virtio_scsi_broken_verdict says happened to the request the ring
-# broke on, comparing its first sighting while pending (at a TMF or during a
-# drain) with what the device read. See virtio_scsi_diag_broken() in
-# hw/scsi/virtio-scsi.c.
-VERDICT_MEANINGS = {
-    "zeroed": "valid while pending, all zeros when the device read it: the "
-              "guest rewrote a request it had already handed over (the "
-              "signature of an early-completed SRB whose extension, and so "
-              "its indirect table, BuildIo zeroed)",
-    "rewritten": "valid while pending, different when the device read it: "
-                 "the guest reused the request's memory while it was still "
-                 "queued (check the entries for another request's shape, or "
-                 "for garbage, which would mean a stray write)",
-    "head-changed": "the avail slot named a different descriptor when read "
-                    "than while pending: guest ring bookkeeping",
-    "no-snapshot": "never seen pending, so there is nothing to compare: "
-                   "published and consumed outside any TMF or drain",
-    "no-chain": "broke on something other than a descriptor chain (e.g. "
-                "request headers of the wrong size)",
-    "not-request": "broke on the control or event queue, not a request queue",
-    "unreadable": "part of the chain points at memory that isn't RAM (MMIO "
-                  "or unmapped), so there was nothing to read or compare: a "
-                  "garbage descriptor address -- see addr in the chain record",
-    "diag-off": "run with --no-ring-diag, so nothing was recorded to compare; "
-                "the chain record still shows what the device failed on",
-}
-
-# Where the "before" picture of the failing entry was taken. Only a kick
-# seen during a drain is (to within microseconds) the moment the guest
-# published it; the other two are taken at the reset, and the entry may have
-# been published -- and changed -- any time before that.
-FIRST_SIGHT = {
-    "kick": "as the guest published it (a kick during the reset's drain)",
-    "drain": "only when the reset's drain began",
-    "tmf": "only when the TMF arrived",
-}
-
-
-def first_sight(before: dict) -> str:
-    where = FIRST_SIGHT.get(before.get("source"), "at an unknown point")
-    age_ms = int(before.get("age_us", 0)) / 1000
-    return f"first seen {where}, {age_ms:.1f} ms before the device read it"
-
-
-def explain_break(ev: dict) -> str:
-    verdict = ev.get("verdict")
-    if verdict is None:
-        return "no verdict traced (QEMU without the diagnostics?)"
-    before = ev.get("before", {})
-    if verdict == "unchanged":
-        zero = int(before.get("zero_len", 0))
-        if not zero:
-            meaning = ("failed exactly as first seen, with nothing "
-                       "zero-length in it: look at QEMU")
-        elif before.get("source") == "kick":
-            meaning = (f"failed exactly as the guest published it, with {zero} "
-                       "zero-length element(s) already in it: the driver "
-                       "built the request that way")
-        else:
-            meaning = (f"failed exactly as first seen, with {zero} "
-                       "zero-length element(s) already in it -- but it was "
-                       "first seen at the reset, not as published, so it "
-                       "could have been published intact and changed before "
-                       "then; this does not rule out a rewrite")
-    else:
-        meaning = VERDICT_MEANINGS.get(verdict, "unknown verdict")
-    if ev.get("verdict_detail", {}).get("head_inflight") == "1":
-        meaning += ("; the failing head was also still in flight in QEMU, "
-                    "so the guest re-published a descriptor it never got back")
-    return meaning
 TRACE_FIELD_RE = re.compile(r"(\w+)=(\S+)")
 TRACE_CONTEXT_LINES = 20  # per-adapter history attached to a broken event
 
@@ -1824,27 +1313,6 @@ def fault_holds(faults: dict) -> dict:
             for dev, fl in faults.items() if isinstance(fl, list)}
 
 
-def count_guest_processes(qga_sock: Path, exe_path: str,
-                          timeout: float = WRITER_COUNT_TIMEOUT_S
-                          ) -> Optional[int]:
-    """How many processes the guest is running from exe_path's image name,
-    or None if the agent could not say."""
-    name = PureWindowsPath(exe_path).stem.replace("'", "''")
-    script = f"@(Get-Process -Name '{name}' -ErrorAction SilentlyContinue).Count"
-    try:
-        pid = ps_exec(qga_sock, f"count of {name} processes", script,
-                      capture=True, timeout=timeout)
-    except GuestExecError:
-        return None
-    status = qga_exec_wait(qga_sock, pid, timeout)
-    if status is None:
-        return None
-    try:
-        return int(b64_text(status.get("out-data")).strip())
-    except ValueError:
-        return None
-
-
 def _lun_writes_phrase(writes: dict, complete: bool) -> str:
     # "With writes", not "live": an adapter that stopped popping still
     # completes the requests it had already started.
@@ -1854,17 +1322,6 @@ def _lun_writes_phrase(writes: dict, complete: bool) -> str:
     if not complete:
         phrase += " (some query-blockstats samples failed)"
     return phrase
-
-
-def _covers_luns(wops: dict, lun_specs: list) -> bool:
-    """Whether a write_ops_by_node() sample can be trusted for a delta.
-
-    It swallows QMP failures per view, and only the device view carries a
-    LUN's accounting -- the node view's wr_operations is 0 -- so a sample
-    whose device-view query failed comes back non-empty and all zero.
-    That reads as "no I/O", and makes the next good sample look like
-    every write since boot."""
-    return all(s.dev_id in wops for s in lun_specs)
 
 
 def no_faults_armed() -> None:
@@ -2706,7 +2163,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # Stop the writers first: they're still live (see stop_writers'
         # docstring), and leaving them running races the telemetry query
         # against a guest saturated with I/O.
-        result["writer_states"] = stop_writers(qga_sock, writer_pids)
+        result["writer_states"] = stop_writers(qga_sock, writer_pids,
+                                                seen=writer_seen)
         print(f"    collecting vioscsi telemetry via {vioscsi_telemetry_script}",
               file=sys.stderr)
         ok, msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
@@ -2718,6 +2176,59 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                   "screenshot and a guest memory dump for postmortem",
                   file=sys.stderr)
             capture_postmortem()
+
+    def writers_failed(elapsed: float) -> bool:
+        """Whether a verifying writer has exited, i.e. read back data that
+        did not match what it wrote. Fills in the whole result -- outcome,
+        error and the evidence the writer left -- and returns True, so the
+        caller only has to return it.
+
+        Not called on every 2s poll: a writer's exit status is its own
+        guest-agent round trip per LUN, far too costly at high LUN counts.
+        Only the heartbeat and the end of the run ask. An exit is always a
+        failure for these drivers, never a clean finish, since
+        writer_duration outlasts duration_s.
+        """
+        if io_driver not in VERIFYING_IO_DRIVERS:
+            return False
+        exited = [st for st in writer_states(qga_sock, writer_pids,
+                                             writer_seen)
+                  if st["exited"]]
+        if not exited:
+            return False
+        result["outcome"] = "data-corruption"
+        result["elapsed_s"] = elapsed
+        # Survives the stop_writers() poll that collect_vioscsi_telemetry()
+        # does below, because writer_seen holds these states and that poll
+        # is answered from it rather than from an agent that has already
+        # reaped the pids. See writer_states().
+        result["writer_states"] = exited
+        # One writer per LUN, so the pids that exited name the LUNs that
+        # failed. The verify message and its offset are in each one's
+        # stderr_tail.
+        lost = sorted(writer_luns.get(s["pid"], f"pid {s['pid']}")
+                      for s in exited)
+        codes = sorted({s["exitcode"] for s in exited},
+                       key=lambda c: (c is None, c))
+        print(f"    {io_driver} writer(s) exited early (exitcode={codes}) "
+              f"after {elapsed:.0f}s on {lost} -- likely data corruption",
+              file=sys.stderr)
+        result["error"] = (
+            f"{io_driver} writer(s) exited early with verification fatal "
+            f"on the first mismatch -- likely data corruption on: {lost}; "
+            f"see writer_states' stderr_tail for the failing offset(s)")
+        # Same postmortem the clean path records, and for more reason: the
+        # trace fold and the fault tallies are how many commands the run
+        # had held, and how the guest answered, when the data went wrong.
+        # Taken over QMP before collect_vioscsi_telemetry(), which stops
+        # the writers and may find the agent gone; the disarm is also what
+        # lets the surviving writers finish being killed.
+        disarm("data corruption")
+        record_trace()
+        write_status({"elapsed_s": elapsed})
+        collect_vioscsi_telemetry()
+        write_status({"elapsed_s": elapsed})
+        return True
 
     def diagnose_failed_launch(reason: str, request: Optional[str] = None,
                                request_sent_at: Optional[str] = None,
@@ -2883,6 +2394,13 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # part way through still records how many writers did come up --
         # "32 of 75 started" is the whole diagnosis in that case.
         result["writer_pids"] = writer_pids
+        # pid -> LUN: which LUN a writer that exited was driving. One
+        # writer per LUN, so this names the failing LUNs on its own.
+        writer_luns: dict = {}
+        # pid -> the state it was last polled in, shared by every poll in
+        # this run so an exit and the stderr it carried survive the polls
+        # that come after it. See writer_states().
+        writer_seen: dict = {}
 
         serials = [s.serial for s in lun_specs]
         request_sent_at = utc_now()
@@ -2908,10 +2426,11 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             # diagnostics are for an agent that went quiet.
             request_sent_at = utc_now()
             try:
-                writer_pids.append(launch_writer(qga_sock, drive_no,
-                                                  writer_duration, io_driver,
-                                                  diskspd_path, fio_path,
-                                                  qga_resyncs))
+                pid = launch_writer(qga_sock, drive_no, writer_duration,
+                                     io_driver, diskspd_path, fio_path,
+                                     qga_resyncs)
+                writer_pids.append(pid)
+                writer_luns[pid] = spec.dev_id
             except NoReplyError as exc:
                 diagnose_failed_launch("no-reply",
                                        f"writer for PhysicalDrive{drive_no}",
@@ -2944,7 +2463,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             if attempt + 1 < IO_PROBE_ATTEMPTS:
                 print(f"    no write I/O seen yet (attempt {attempt + 1}/"
                       f"{IO_PROBE_ATTEMPTS}), retrying...", file=sys.stderr)
-        result["writer_states"] = writer_states(qga_sock, writer_pids)
+        result["writer_states"] = writer_states(qga_sock, writer_pids,
+                                                writer_seen)
         result["pre_test_write_ops_per_s"] = wps_per_lun
         result["pre_test_write_ops_per_s_total"] = round(total_wps, 1)
         if total_wps < MIN_WRITE_OPS_PER_S and not broke_in_preflight:
@@ -3164,6 +2684,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 return result
 
             if now - last_heartbeat >= heartbeat_s:
+                if writers_failed(elapsed):
+                    return result
                 cur_wops = write_ops_by_node(qmp)
                 sample_s = now - last_heartbeat
                 wps = sum(lun_write_delta(prev_wops, cur_wops, s) for s in lun_specs) / sample_s
@@ -3186,6 +2708,12 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 write_status(hb)
 
             time.sleep(POLL_INTERVAL_S)
+
+        # The soak ran its duration, but the last heartbeat can be up to
+        # heartbeat_s old: a verify failure since then would otherwise be
+        # reported as a clean run.
+        if writers_failed(time.monotonic() - start):
+            return result
 
         result["outcome"] = "completed"
         result["elapsed_s"] = time.monotonic() - start
@@ -3255,30 +2783,6 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             result["serial_log"] = str(serial_log)
             result["qemu_log"] = str(qemu_log_path)
             result["dump"] = str(dump_path) if dump_path.exists() else None
-
-
-def check_prereqs() -> Optional[str]:
-    for path, what in ((BOOT_DISK, "boot disk"), (OVMF_VARS, "OVMF NVRAM"),
-                        (QEMU_BIN, "qemu binary")):
-        if not path.exists():
-            return (f"{what} not found: {path}\n"
-                    "Run './scripts/setup-windows-inject-vm.sh create' and "
-                    "'install' first (see --help for full prerequisites).")
-    return None
-
-
-def load_qmp_module():
-    site_packages = QEMU_BUILD / "pyvenv" / "lib"
-    for py_dir in site_packages.glob("python*/site-packages"):
-        sys.path.insert(0, str(py_dir))
-    try:
-        from qemu.qmp import legacy as qmp_module  # type: ignore
-        return qmp_module
-    except ImportError:
-        print("Error: could not import qemu.qmp from the build's pyvenv.\n"
-              "Build QEMU first (ninja -C build) so build/pyvenv exists.",
-              file=sys.stderr)
-        return None
 
 
 def main() -> int:
@@ -3552,7 +3056,8 @@ def main() -> int:
     print()
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
     print(f"Result written to {results_path}")
-    if result["outcome"] in ("crash-suspected", "qemu-exited", "error"):
+    if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
+                             "data-corruption"):
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0
