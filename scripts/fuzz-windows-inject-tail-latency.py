@@ -57,9 +57,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (VM_DIR, SoakStrategy, add_common_args,
-                                 check_prereqs, load_qmp_module, run_soak,
-                                 usage_note)
+from vioscsi_soak_common import (FAILURE_OUTCOMES, VM_DIR, SoakStrategy,
+                                 add_common_args, check_prereqs,
+                                 load_qmp_module, run_soak, usage_note)
 
 SOAK_DIR = VM_DIR / "soak-tail-latency"
 
@@ -195,9 +195,7 @@ def main() -> int:
     print()
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
     print(f"Result written to {results_path}")
-    if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
-                             "guest-panicked", "data-corruption",
-                             "fill-failed"):
+    if result["outcome"] in FAILURE_OUTCOMES:
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0

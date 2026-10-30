@@ -49,6 +49,35 @@ TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
 DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
 DEFAULT_FIO_PATH = r"C:\Program Files\fio\fio.exe"
 DEFAULT_PARANOID_PATH = r"C:\test\paranoid.exe"
+# Writers that check what they read back and exit non-zero on the first
+# mismatch: paranoid.exe under '--stop-on-first-error', fio under
+# '--verify_fatal=1'. Only for these does an early exit mean the data came
+# back wrong rather than the writer merely dying, so only these are polled
+# for it during the soak (see the heartbeat's writer_states check).
+VERIFYING_IO_DRIVERS = ("paranoid", "fio")
+# Why a verifying writer exited: because what it read back did not match
+# what it wrote, or because the read itself failed. The two are different
+# findings -- the first says the device handed over wrong data, the second
+# says a command was failed to the application after the guest gave up on
+# it -- so they get different outcomes and must not be reported as one.
+#
+# fio prints a "verify" line naming the mismatch and sets EILSEQ (err=84)
+# on a verification failure; on a failed request it prints "io_u error"
+# with the OS error, e.g.
+#   fio: io_u error on file \\.\PhysicalDrive1: Input/output error: read
+#   offset=17104896, buflen=65536
+# paranoid.exe leaves a failure dump per LUN on a mismatch and none on an
+# I/O error, so for it the dumps decide and stderr is only the fallback.
+WRITER_CORRUPTION_SIGNATURES = ("verify: bad", "verify failed",
+                                "verify type mismatch", "err=84")
+WRITER_IO_ERROR_SIGNATURES = ("io_u error", "input/output error",
+                              "i/o error")
+# Outcomes the CLIs treat as a finding: they print the artifact directory
+# and exit non-zero. Shared so the harnesses cannot drift apart over which
+# outcomes matter.
+FAILURE_OUTCOMES = ("crash-suspected", "qemu-exited", "error",
+                    "guest-panicked", "data-corruption", "io-error",
+                    "writer-exited", "fill-failed")
 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
 VIOSCSI_TELEMETRY_TIMEOUT_S = 60
 WRITER_STOP_TIMEOUT_S = 30
@@ -735,9 +764,13 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                          build_diskspd_args(drive_number, duration_s),
                          capture=False, resyncs=resyncs)
     if io_driver == "fio":
+        # Captured, like paranoid.exe's: fio writes "verify: bad magic
+        # header ..." and the failing offset to stderr, and the agent only
+        # hands that back for a process started with capture-output. The
+        # exit code alone would say a verify failed but not where.
         return qga_exec(qga_sock, what, fio_path,
                          build_fio_args(drive_number, duration_s),
-                         capture=False, resyncs=resyncs)
+                         capture=True, resyncs=resyncs)
     return ps_exec(qga_sock, what,
                     build_writer_script(drive_number, duration_s),
                     capture=False, resyncs=resyncs)
@@ -991,33 +1024,82 @@ def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
 WRITER_STDERR_TAIL_CHARS = 8000
 
 
-def writer_states(qga_sock: Path, pids: list) -> list:
+def writer_states(qga_sock: Path, pids: list,
+                   seen: Optional[dict] = None) -> list:
+    """Each writer's exit state, newest poll first.
+
+    The agent answers guest-exec-status for an exited process once: it
+    hands back the exit code and whatever output was captured, then reaps
+    the pid, and every later poll of it fails. So the first poll that says
+    "exited" carries the only copy of that writer's stderr there will ever
+    be, and re-polling would turn a known exit back into an unknown one.
+
+    Pass @seen -- a pid -> state dict the caller keeps across calls -- to
+    make that stick: a pid already known to have exited is answered from
+    it instead of re-polled, and every fresh state is recorded in it.
+    That also spares the agent a round trip per dead writer, which is the
+    bulk of them once a run is failing.
+    """
     states = []
     for pid in pids:
+        if seen is not None and seen.get(pid, {}).get("exited"):
+            states.append(seen[pid])
+            continue
         resp = qga_call(qga_sock, "guest-exec-status", {"pid": pid}, timeout=5.0)
         ret = resp.get("return", {}) if resp and "return" in resp else {}
         state = {"pid": pid, "exited": ret.get("exited"),
                  "exitcode": ret.get("exitcode")}
-        # Only writers launched with captured output (paranoid.exe) have
-        # any, and the agent hands it back only once the process exits.
+        # Only writers launched with captured output (paranoid.exe, fio)
+        # have any, and the agent hands it back only once the process
+        # exits.
         err = b64_text(ret.get("err-data")).strip()
         if err:
             state["stderr_tail"] = err[-WRITER_STDERR_TAIL_CHARS:]
+        if seen is not None:
+            seen[pid] = state
         states.append(state)
     return states
 
 
-def wait_for_writers(qga_sock: Path, pids: list, timeout: float) -> list:
+def classify_writer_exit(states: list) -> tuple:
+    """(outcome, why) for writers that exited on their own, read off the
+    stderr they left: see WRITER_CORRUPTION_SIGNATURES.
+
+    A verify line wins over an I/O error in the same stderr -- fio keeps
+    going through failed requests until --verify_fatal stops it, so a
+    mismatch anywhere in the tail is the reason it is gone. With neither
+    signature there is nothing to stand behind, and the caller must say
+    only that the writer exited; guessing "corruption" there is how a
+    stalled command that storport eventually failed to the application
+    gets filed as a data-integrity bug.
+    """
+    tails = [st.get("stderr_tail", "").lower() for st in states]
+    for sig in WRITER_CORRUPTION_SIGNATURES:
+        if any(sig in tail for tail in tails):
+            return "data-corruption", f"verification failed ({sig!r} in stderr)"
+    for sig in WRITER_IO_ERROR_SIGNATURES:
+        if any(sig in tail for tail in tails):
+            return "io-error", (f"a request was failed to the writer "
+                                f"({sig!r} in stderr), with no verification "
+                                f"mismatch reported")
+    return "writer-exited", ("neither a verification mismatch nor an I/O "
+                             "error in stderr" if any(tails)
+                             else "no stderr captured")
+
+
+def wait_for_writers(qga_sock: Path, pids: list, timeout: float,
+                      seen: Optional[dict] = None) -> list:
     deadline = time.monotonic() + timeout
-    states = writer_states(qga_sock, pids)
+    states = writer_states(qga_sock, pids, seen)
     while time.monotonic() < deadline and any(not s["exited"] for s in states):
         time.sleep(1.0)
-        states = writer_states(qga_sock, pids)
+        states = writer_states(qga_sock, pids, seen)
     return states
 
 
 def stop_writers(qga_sock: Path, pids: list,
-                  timeout: float = WRITER_STOP_TIMEOUT_S) -> list:
+                  timeout: float = WRITER_STOP_TIMEOUT_S,
+                  seen: Optional[dict] = None) -> list:
     """Force-stop any writer still running and wait for it to exit.
 
     Writers are launched with writer_duration, padded well past the
@@ -1026,15 +1108,18 @@ def stop_writers(qga_sock: Path, pids: list,
     Left alone they'd keep hammering the guest with I/O for up to another
     ~10 minutes after the harness is done watching, which races vioscsi
     telemetry collection (and anything else run post-test) against a guest
-    still under full write load."""
-    for st in writer_states(qga_sock, pids):
+    Pass @seen through so a writer that already exited -- the one that
+    failed verification, say -- keeps the state and stderr it exited with
+    rather than having them replaced by a poll the agent can no longer
+    answer. See writer_states()."""
+    for st in writer_states(qga_sock, pids, seen):
         if not st["exited"]:
             try:
                 qga_exec(qga_sock, f"taskkill pid {st['pid']}", TASKKILL_EXE,
                           ["/F", "/PID", str(st["pid"])], capture=False)
             except GuestExecError:
                 pass  # best-effort; wait_for_writers reports what survived
-    return wait_for_writers(qga_sock, pids, timeout)
+    return wait_for_writers(qga_sock, pids, timeout, seen)
 
 
 # ------------------------------------------------------------------
@@ -1250,7 +1335,7 @@ def image_data_bytes(qmp, path: Path, node: str) -> Optional[int]:
 
 def wait_for_fill(qmp, lun_specs: list, target_bytes: int,
                   timeout_s: float, proc: subprocess.Popen, qga_sock: Path,
-                  writer_pids: list) -> dict:
+                  writer_pids: list, seen: Optional[dict] = None) -> dict:
     """Block until every LUN image has as many bytes allocated on the host
     as the disk's virtual size -- i.e. the writers' sequential initialize
     pass has touched every cluster -- or until that can no longer happen.
@@ -1289,7 +1374,7 @@ def wait_for_fill(qmp, lun_specs: list, target_bytes: int,
             info["status"] = "qemu-exited"
             return info
         if polls and polls % FILL_WRITER_CHECK_POLLS == 0:
-            states = writer_states(qga_sock, writer_pids)
+            states = writer_states(qga_sock, writer_pids, seen)
             if any(st["exited"] for st in states):
                 info["status"] = "writer-exited"
                 info["writer_states"] = states
@@ -2613,7 +2698,8 @@ def run_soak(soak_dir: Path,
         # Stop the writers first: they're still live (see stop_writers'
         # docstring), and leaving them running races the telemetry query
         # against a guest saturated with I/O.
-        result["writer_states"] = stop_writers(qga_sock, writer_pids)
+        result["writer_states"] = stop_writers(qga_sock, writer_pids,
+                                                seen=writer_seen)
         print(f"    collecting vioscsi telemetry via {vioscsi_telemetry_script}",
               file=sys.stderr)
         ok, msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
@@ -2625,6 +2711,110 @@ def run_soak(soak_dir: Path,
                   "screenshot and a guest memory dump for postmortem",
                   file=sys.stderr)
             capture_postmortem()
+
+    def writers_failed(elapsed: float) -> bool:
+        """Whether a verifying writer has exited on its own, and why.
+        Fills in the whole result -- outcome, error and the evidence each
+        driver leaves -- and returns True, so the caller only has to
+        return it.
+
+        The outcome is not assumed: a writer can exit because it read
+        back data that did not match what it wrote, or because a request
+        was failed to it, and classify_writer_exit() decides which from
+        the evidence. Both end the run; only the first is a
+        data-integrity finding.
+
+        Not called on every 2s poll: a writer's exit status is its own
+        guest-agent round trip per LUN, and the module docstring flags that
+        as too costly at high LUN counts. Only the heartbeat and the end of
+        the run ask. An exit is always a failure for these drivers, never a
+        clean finish, since writer_duration outlasts duration_s.
+        """
+        if io_driver not in VERIFYING_IO_DRIVERS:
+            return False
+        exited = [st for st in writer_states(qga_sock, writer_pids,
+                                             writer_seen)
+                  if st["exited"]]
+        if not exited:
+            return False
+        st = exited[0]
+        outcome, why = classify_writer_exit(exited)
+        result["outcome"] = outcome
+        result["elapsed_s"] = elapsed
+        # The writers that ended the run, as against the ones
+        # collect_vioscsi_telemetry() force-stops a moment later. Its
+        # stop_writers() sweep overwrites result["writer_states"] with
+        # every pid, and a killed writer is indistinguishable there from
+        # one that died on its own -- same "exited", same exit code -- so
+        # the set that actually failed has to be recorded under its own
+        # key before that happens.
+        result["writer_states"] = exited
+        result["failed_writers"] = [st["pid"] for st in exited]
+        if io_driver == "paranoid":
+            print(f"    paranoid.exe writer exited early "
+                  f"(exitcode={st['exitcode']}) after "
+                  f"{elapsed:.0f}s -- {why}; "
+                  f"retrieving the audit log and failure dumps "
+                  f"of each LUN that left any", file=sys.stderr)
+            # One process drives every LUN, so its exit alone doesn't say
+            # which LUN failed: the one(s) with failure dumps do. Only
+            # those are collected -- a full sweep is several guest round
+            # trips per LUN, far too slow at high LUN counts.
+            failures = []
+            for spec in lun_specs:
+                drive_no = drive_numbers[spec.serial]
+                if not list_guest_files(
+                        qga_sock, paranoid_failures_dir(
+                            paranoid_log_path(drive_no))):
+                    continue
+                artifacts = collect_paranoid_corruption(
+                    qga_sock, paranoid_path, drive_no, run_dir)
+                failures.append({"lun": spec.dev_id,
+                                 "drive": drive_no,
+                                 "exitcode": st["exitcode"],
+                                 **artifacts})
+            result["paranoid_failures"] = failures
+            if failures:
+                # A failure dump is a mismatch paranoid.exe captured, so
+                # it outranks whatever its stderr happened to say.
+                result["outcome"] = "data-corruption"
+                where = (f"data corruption on: "
+                         f"{[f['lun'] for f in failures]}; audit "
+                         f"log(s) and failure dump(s) retrieved "
+                         f"to the run directory for analysis")
+            else:
+                where = (f"no LUN left a failure dump, and {why}; see "
+                         f"writer_states' stderr_tail for why it exited")
+            result["error"] = (
+                "paranoid.exe writer exited early under "
+                f"--stop-on-first-error -- {where}")
+        else:
+            # One writer per LUN, so the pids that exited name the LUNs
+            # that failed. The verify message or the OS error and its
+            # offset are in each one's stderr_tail; there are no separate
+            # dump files to fetch.
+            lost = sorted(writer_luns.get(s["pid"], f"pid {s['pid']}")
+                          for s in exited)
+            codes = sorted({s["exitcode"] for s in exited},
+                           key=lambda c: (c is None, c))
+            print(f"    {io_driver} writer(s) exited early "
+                  f"(exitcode={codes}) after {elapsed:.0f}s on {lost} "
+                  f"-- {why}", file=sys.stderr)
+            result["error"] = (
+                f"{io_driver} writer(s) exited early on {lost}: {why}; "
+                f"see writer_states' stderr_tail for the failing "
+                f"offset(s)")
+        # Same postmortem the clean path records, and for more reason: the
+        # trace fold and the rule tallies are how many commands the run had
+        # held, and how the guest answered, when the data went wrong. Taken
+        # over QMP before collect_vioscsi_telemetry(), which stops the
+        # writers and may find the agent gone.
+        record_trace()
+        result["rule_hits"] = rule_hits(qmp, err_nodes)
+        write_status({"elapsed_s": elapsed})
+        collect_vioscsi_telemetry()
+        write_status({"elapsed_s": elapsed})
+        return True
 
     def diagnose_failed_launch(reason: str, request: Optional[str] = None,
                                request_sent_at: Optional[str] = None,
@@ -2821,6 +3011,15 @@ def run_soak(soak_dir: Path,
         # part way through still records how many writers did come up --
         # "32 of 75 started" is the whole diagnosis in that case.
         result["writer_pids"] = writer_pids
+        # pid -> LUN, for the per-LUN writers: which LUN a writer that
+        # exited was driving. paranoid.exe drives every LUN from one
+        # process and names the failing ones by its own dumps instead, so
+        # it leaves this empty.
+        writer_luns: dict = {}
+        # pid -> the state it was last polled in, shared by every poll in
+        # this run so an exit and the stderr it carried survive the polls
+        # that come after it. See writer_states().
+        writer_seen: dict = {}
 
         serials = [s.serial for s in lun_specs]
         request_sent_at = utc_now()
@@ -2859,9 +3058,11 @@ def run_soak(soak_dir: Path,
                 # diagnostics are for an agent that went quiet.
                 request_sent_at = utc_now()
                 try:
-                    writer_pids.append(launch_writer(
+                    pid = launch_writer(
                         qga_sock, drive_no, writer_duration, io_driver,
-                        diskspd_path, fio_path, qga_resyncs))
+                        diskspd_path, fio_path, qga_resyncs)
+                    writer_pids.append(pid)
+                    writer_luns[pid] = spec.dev_id
                 except NoReplyError as exc:
                     diagnose_failed_launch(
                         "no-reply", f"writer for PhysicalDrive{drive_no}",
@@ -2876,7 +3077,7 @@ def run_soak(soak_dir: Path,
                   file=sys.stderr)
             fill = wait_for_fill(qmp, lun_specs, target_bytes,
                                  fill_timeout_s, proc, qga_sock,
-                                 writer_pids)
+                                 writer_pids, writer_seen)
             result["fill"] = fill
             if fill["status"] == "qemu-exited":
                 raise qemu_died_error("while waiting for the LUNs to fill")
@@ -2927,7 +3128,8 @@ def run_soak(soak_dir: Path,
             if attempt + 1 < IO_PROBE_ATTEMPTS:
                 print(f"    no write I/O seen yet (attempt {attempt + 1}/"
                       f"{IO_PROBE_ATTEMPTS}), retrying...", file=sys.stderr)
-        result["writer_states"] = writer_states(qga_sock, writer_pids)
+        result["writer_states"] = writer_states(qga_sock, writer_pids,
+                                                writer_seen)
         result["pre_test_write_ops_per_s"] = wps_per_lun
         result["pre_test_write_ops_per_s_total"] = round(total_wps, 1)
         if total_wps < MIN_WRITE_OPS_PER_S and not broke_in_preflight:
@@ -3144,61 +3346,8 @@ def run_soak(soak_dir: Path,
                 return result
 
             if now - last_heartbeat >= heartbeat_s:
-                # Checked at heartbeat cadence, not every poll: a writer's
-                # exit status is its own guest-agent round trip per LUN, and
-                # the module docstring already flags that as too costly to
-                # do on every 2s poll at high LUN counts. A writer only
-                # exits here under --stop-on-first-error, i.e. a
-                # verification failure or other fatal error -- never a
-                # clean finish, since writer_duration outlasts duration_s.
-                if io_driver == "paranoid":
-                    exited = [st for st in writer_states(qga_sock, writer_pids)
-                              if st["exited"]]
-                    if exited:
-                        st = exited[0]
-                        result["outcome"] = "data-corruption"
-                        result["elapsed_s"] = elapsed
-                        result["writer_states"] = exited
-                        print(f"    paranoid.exe writer exited early "
-                              f"(exitcode={st['exitcode']}) after "
-                              f"{elapsed:.0f}s -- likely data corruption; "
-                              f"retrieving the audit log and failure dumps "
-                              f"of each LUN that left any", file=sys.stderr)
-                        # One process drives every LUN, so its exit alone
-                        # doesn't say which LUN failed: the one(s) with
-                        # failure dumps do. Only those are collected -- a
-                        # full sweep is several guest round trips per LUN,
-                        # far too slow at high LUN counts.
-                        failures = []
-                        for spec in lun_specs:
-                            drive_no = drive_numbers[spec.serial]
-                            if not list_guest_files(
-                                    qga_sock, paranoid_failures_dir(
-                                        paranoid_log_path(drive_no))):
-                                continue
-                            artifacts = collect_paranoid_corruption(
-                                qga_sock, paranoid_path, drive_no, run_dir)
-                            failures.append({"lun": spec.dev_id,
-                                             "drive": drive_no,
-                                             "exitcode": st["exitcode"],
-                                             **artifacts})
-                        result["paranoid_failures"] = failures
-                        if failures:
-                            where = (f"likely data corruption on: "
-                                     f"{[f['lun'] for f in failures]}; audit "
-                                     f"log(s) and failure dump(s) retrieved "
-                                     f"to the run directory for analysis")
-                        else:
-                            where = ("no LUN left failure dumps; see "
-                                     "writer_states' stderr_tail for why "
-                                     "it exited")
-                        result["error"] = (
-                            "paranoid.exe writer exited early under "
-                            f"--stop-on-first-error -- {where}")
-                        write_status({"elapsed_s": elapsed})
-                        collect_vioscsi_telemetry()
-                        write_status({"elapsed_s": elapsed})
-                        return result
+                if writers_failed(elapsed):
+                    return result
                 cur_wops = write_ops_by_node(qmp)
                 sample_s = now - last_heartbeat
                 wps = sum(lun_write_delta(prev_wops, cur_wops, s) for s in lun_specs) / sample_s
@@ -3233,6 +3382,12 @@ def run_soak(soak_dir: Path,
                 return result
 
             time.sleep(POLL_INTERVAL_S)
+
+        # The soak ran its duration, but the last heartbeat can be up to
+        # heartbeat_s old: a writer that died since then would otherwise
+        # be reported as a clean run.
+        if writers_failed(time.monotonic() - start):
+            return result
 
         result["outcome"] = "completed"
         result["elapsed_s"] = time.monotonic() - start
