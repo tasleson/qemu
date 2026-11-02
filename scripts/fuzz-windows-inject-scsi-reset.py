@@ -109,35 +109,32 @@ from typing import Any, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (_qga_request, b64_text, build_writer_script,
-                                 clone_tpm_state, encode_ps, load_qmp_module,
-                                 make_overlay, other_swtpm_pids)
+from vioscsi_soak_common import (AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
+                                 BOOT_TIMEOUT_S, DEFAULT_CPUS,
+                                 DEFAULT_DISKSPD_PATH, DEFAULT_RAM,
+                                 DUMP_POLL_INTERVAL_S, DUMP_START_TIMEOUT_S,
+                                 DUMP_TIMEOUT_S, MIN_WRITE_OPS_PER_S,
+                                 OVMF_CODE, OVMF_VARS, POLL_INTERVAL_S, PS_EXE,
+                                 QEMU_BIN, QEMU_IMG, QEMU_SRC, QGA_SENTINEL,
+                                 QMP_CMD_TIMEOUT_S, QMP_CONNECT_TIMEOUT_S,
+                                 STACK_CAPTURE_TIMEOUT_S,
+                                 STATIC_SCREEN_THRESHOLD_S, VM_DIR,
+                                 WRITER_BLOCK_BYTES, WRITER_QUEUE_DEPTH,
+                                 WRITER_THREADS, _qga_request, b64_text,
+                                 build_writer_script, clone_tpm_state,
+                                 encode_ps, load_qmp_module, make_overlay,
+                                 other_swtpm_pids)
 
-QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
-QEMU_BUILD = Path(os.environ.get("QEMU_BUILD", str(QEMU_SRC / "build")))
-QEMU_BIN = QEMU_BUILD / "qemu-system-x86_64"
-QEMU_IMG = QEMU_BUILD / "qemu-img"
-
-HOME = Path(os.environ.get("HOME", str(Path.home())))
-VM_DIR = Path(os.environ.get("VM_DIR", str(HOME / "VirtualMachines" / "qemu" / "windows_inject")))
 FUZZ_DIR = VM_DIR / "fuzz-scsi-reset"
-
-BOOT_DISK = VM_DIR / "boot.qcow2"
-OVMF_CODE = Path(os.environ.get(
-    "OVMF_CODE", "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2"))
-OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TPM_DIR = VM_DIR / "tpm"  # golden, read-only source cloned per run -- see clone_tpm_state()
 
 TRACE_EVENTS = QEMU_SRC / "scripts" / "windows-storage-trace-events"
 
-PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
-
-DEFAULT_RAM = "8G"
-DEFAULT_CPUS = "5"     # It' might be interesting to have odd number, we shall see
+# Smaller than the shared default on purpose: this harness creates its
+# scratch LUNs per trial, and the stall race needs no capacity.
 LUN_IMAGE_SIZE = "1G"
 
-BOOT_TIMEOUT_S = 180
+# Shorter than the shared default on purpose: this harness runs a handful
+# of LUNs, so a guest that does not answer quickly is already a finding.
 GUEST_EXEC_TIMEOUT_S = 30
 DEFAULT_SETTLE_S = 2.0  # how long to let I/O run cleanly before arming a stall.
                         # Used both for the initial warmup (so the first arm
@@ -153,41 +150,13 @@ DEFAULT_SETTLE_S = 2.0  # how long to let I/O run cleanly before arming a stall.
 # resume poll returns the instant I/O picks back up, so a large ceiling only
 # costs wall-clock on trials that genuinely never recover.
 DEFAULT_RECOVERY_TIMEOUT_S = 120
-QMP_CMD_TIMEOUT_S = 15
-QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
-                            # the host busy enough that a freshly-started
-                            # QEMU's QMP monitor isn't ready to accept yet
-DUMP_TIMEOUT_S = 900  # a win-dmp writes out all of guest RAM; minutes, not seconds
-DUMP_START_TIMEOUT_S = 300  # dump-guest-memory stops the VM (drain + flush of
-                            # every image) before detaching, which can outlast
-                            # QMP_CMD_TIMEOUT_S on a busy host
-DUMP_POLL_INTERVAL_S = 2
-STACK_CAPTURE_TIMEOUT_S = 120  # gdb attaching to a large QEMU and loading its
-                               # symbols takes a while
-POLL_INTERVAL_S = 2
-AGENT_SILENCE_THRESHOLD_S = 15  # guest-agent silence this long, post-boot, is
-                                 # itself a strong crash signal (its service
-                                 # dies with the rest of the guest at a BSOD)
-STATIC_SCREEN_THRESHOLD_S = 20  # corroborating signal once agent has gone quiet
 
 # Pre-flight I/O verification. Before arming any stall we sample completed
 # write ops across the LUNs over this window and require the writers to be
-# driving at least this many per second in total -- otherwise the trial can
+# driving at least MIN_WRITE_OPS_PER_S in total -- otherwise the trial can
 # only ever "recover" trivially (nothing in flight to stall), which is exactly
 # the silent no-op a broken --io-driver / --diskspd-path produces.
 IO_PROBE_WINDOW_S = 3.0
-MIN_WRITE_OPS_PER_S = 2.0
-
-WRITER_BLOCK_BYTES = 64 * 1024
-
-# The reset race is about *many* commands in flight when a reset lands: the
-# vioscsi bug is concurrent TMFs colliding on the adapter's shared
-# tmf_cmd/reset_in_progress state. A single outstanding write (the old -t1 -o1)
-# lets a stall pin at most ~1 request per LUN, so there is nothing to race.
-# Drive a deep queue instead so an armed stall pins dozens of in-flight
-# commands per LUN, and storport has a real pile to reset concurrently.
-WRITER_THREADS = 4          # diskspd -t: worker threads per target
-WRITER_QUEUE_DEPTH = 32     # diskspd -o: outstanding I/Os per thread
 
 
 def usage_note() -> str:
@@ -220,13 +189,6 @@ Environment overrides for running on different machines:
 # QEMU guest agent client (JSON lines over its own virtio-serial socket,
 # separate from the main QMP protocol/socket)
 # ------------------------------------------------------------------
-
-
-# A guest-sync-delimited reply, and the request that resets the agent's
-# parser, are both preceded by this byte; it never occurs in JSON text.
-# The agent answers the request-side byte with a parse error of its own,
-# which the sync skips like any other reply that isn't its echo.
-QGA_SENTINEL = b"\xff"
 
 
 def _qga_replies(s: socket.socket, deadline: float):

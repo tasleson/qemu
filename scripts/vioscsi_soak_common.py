@@ -98,7 +98,7 @@ VIRTIO_SCSI_MAX_TARGETS = 256
 VIRTIO_SCSI_MAX_LUNS = 16384
 
 DEFAULT_RAM = "8G"
-DEFAULT_CPUS = "5"
+DEFAULT_CPUS = "5"     # It might be interesting to have an odd number, we shall see
 LUN_IMAGE_SIZE = "4G"
 
 # paranoid.exe's '--initialize' writes every LUN end to end before its
@@ -129,11 +129,16 @@ WRITER_LAUNCH_TIMEOUT_S = 600
 WARMUP_S = 5.0  # just long enough for guest-exec to actually launch the
                 # writer before the pre-flight probe starts timing itself
 QMP_CMD_TIMEOUT_S = 15
-QMP_CONNECT_TIMEOUT_S = 30
-DUMP_TIMEOUT_S = 900
-DUMP_START_TIMEOUT_S = 300
+QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
+                            # the host busy enough that a freshly-started
+                            # QEMU's QMP monitor isn't ready to accept yet
+DUMP_TIMEOUT_S = 900  # a win-dmp writes out all of guest RAM; minutes, not seconds
+DUMP_START_TIMEOUT_S = 300  # dump-guest-memory stops the VM (drain + flush of
+                            # every image) before detaching, which can outlast
+                            # QMP_CMD_TIMEOUT_S on a busy host
 DUMP_POLL_INTERVAL_S = 2
-STACK_CAPTURE_TIMEOUT_S = 120
+STACK_CAPTURE_TIMEOUT_S = 120  # gdb attaching to a large QEMU and loading its
+                               # symbols takes a while
 # x-stop-on-broken asks for the stop right after virtio_error() prints, but
 # the main loop carries it out a moment later, so a poll that has just read
 # the message can still find the VM running. Give it this long to pause.
@@ -143,12 +148,14 @@ STOP_ON_BROKEN_SETTLE_S = 2.0
 WATCH_POLL_S = 2.0
 WATCH_SHOT_INTERVAL_S = 60.0
 POLL_INTERVAL_S = 2
-AGENT_SILENCE_THRESHOLD_S = 15
+AGENT_SILENCE_THRESHOLD_S = 15  # guest-agent silence this long, post-boot, is
+                                # itself a strong crash signal (its service
+                                # dies with the rest of the guest at a BSOD)
 # How many agent silences in the soak loop get an info qtree capture of
 # the agent's port (see capture_qga_port); later ones get none, unless
 # the guest is declared dark.
 QGA_PORT_SILENCE_CAPTURES = 5
-STATIC_SCREEN_THRESHOLD_S = 20
+STATIC_SCREEN_THRESHOLD_S = 20  # corroborating signal once agent has gone quiet
 # Slack on top of the longest injected hold before "no block I/O completing"
 # counts as a stall rather than every writer waiting on a held request.
 IO_STALL_MARGIN_S = 30
@@ -176,8 +183,15 @@ WRITER_COUNT_TIMEOUT_S = 60  # counting writer processes once the agent is back
 
 WRITER_WINDOW_BYTES = 32 * 1024 * 1024
 WRITER_BLOCK_BYTES = 64 * 1024
-WRITER_THREADS = 4
-WRITER_QUEUE_DEPTH = 32
+
+# The reset race is about *many* commands in flight when a reset lands: the
+# vioscsi bug is concurrent TMFs colliding on the adapter's shared
+# tmf_cmd/reset_in_progress state. A single outstanding write (the old -t1 -o1)
+# lets a stall pin at most ~1 request per LUN, so there is nothing to race.
+# Drive a deep queue instead so an armed stall pins dozens of in-flight
+# commands per LUN, and storport has a real pile to reset concurrently.
+WRITER_THREADS = 4          # diskspd -t: worker threads per target
+WRITER_QUEUE_DEPTH = 32     # diskspd -o: outstanding I/Os per thread
 
 
 def parse_size_bytes(size_str: str) -> int:

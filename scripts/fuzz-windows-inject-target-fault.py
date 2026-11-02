@@ -51,7 +51,6 @@ import hashlib
 import itertools
 import json
 import math
-import os
 import random
 import re
 import shutil
@@ -67,8 +66,35 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (GuestExecError, NoReplyError, _covers_luns,
-                                 _qga_call, b64_text, build_writer_script,
+from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
+                                 AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
+                                 BOOT_TIMEOUT_S, CHR_EVENTS,
+                                 CHR_SOCKET_LABEL_RE, DEFAULT_CPUS,
+                                 DEFAULT_DISKSPD_PATH, DEFAULT_FIO_PATH,
+                                 DEFAULT_HEARTBEAT_S, DEFAULT_RAM,
+                                 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT, DIAG_EVENTS,
+                                 DUMP_POLL_INTERVAL_S, DUMP_START_TIMEOUT_S,
+                                 DUMP_TIMEOUT_S, GUEST_EXEC_TIMEOUT_S,
+                                 GuestExecError, IO_PROBE_ATTEMPTS,
+                                 IO_STALL_MARGIN_S, LAUNCH_PROBE_INTERVAL_S,
+                                 MIN_WRITE_OPS_PER_S, NoReplyError, OVMF_CODE,
+                                 OVMF_VARS, POLL_INTERVAL_S, QEMU_BIN,
+                                 QGA_PORT_SILENCE_CAPTURES, QGA_TRACE_EVENTS,
+                                 QGA_TRACE_FIELD_RE, QGA_TRACE_LINE_RE,
+                                 QMP_CMD_TIMEOUT_S, QMP_CONNECT_TIMEOUT_S,
+                                 QTREE_NAME_RE, QTREE_PORT_RE, RESOLVE_REQUEST,
+                                 STATIC_SCREEN_THRESHOLD_S,
+                                 STOP_ON_BROKEN_SETTLE_S, TASKKILL_EXE,
+                                 TMF_RESPONSES, TMF_SUBTYPES, TMF_TRACE_EVENTS,
+                                 TRACE_CONTEXT_LINES, TRACE_FIELD_RE,
+                                 TRACE_LINE_RE, VIRTIO_BROKEN_PATTERNS,
+                                 VIRTIO_SCSI_QUEUE_KINDS, VM_DIR, WARMUP_S,
+                                 WRITER_BLOCK_BYTES, WRITER_DURATION_SLACK_S,
+                                 WRITER_LAUNCH_TIMEOUT_S, WRITER_QUEUE_DEPTH,
+                                 WRITER_STDERR_TAIL_CHARS,
+                                 WRITER_STOP_TIMEOUT_S, WRITER_THREADS,
+                                 WRITER_WINDOW_BYTES, _covers_luns, _qga_call,
+                                 b64_text, build_writer_script,
                                  capture_qemu_stacks,
                                  capture_vioscsi_telemetry, check_prereqs,
                                  count_guest_processes, explain_break,
@@ -77,87 +103,32 @@ from vioscsi_soak_common import (GuestExecError, NoReplyError, _covers_luns,
                                  qga_call, qga_exec, qga_exec_wait, qga_ping,
                                  start_swtpm, utc_now, wall_time)
 
-QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
-QEMU_BUILD = Path(os.environ.get("QEMU_BUILD", str(QEMU_SRC / "build")))
-QEMU_BIN = QEMU_BUILD / "qemu-system-x86_64"
-
-HOME = Path(os.environ.get("HOME", str(Path.home())))
-VM_DIR = Path(os.environ.get("VM_DIR", str(HOME / "VirtualMachines" / "qemu" / "windows_inject")))
 SOAK_DIR = VM_DIR / "soak-target-fault"
 
-BOOT_DISK = VM_DIR / "boot.qcow2"
-OVMF_CODE = Path(os.environ.get(
-    "OVMF_CODE", "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2"))
-OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
-DEFAULT_DISKSPD_PATH = r"C:\Tools\diskspd.exe"
-DEFAULT_FIO_PATH = r"C:\Program Files\fio\fio.exe"
 # Writers that check what they read back and exit non-zero on the first
 # mismatch: fio under '--verify_fatal=1'. Only for those does an early exit
 # mean the data came back wrong rather than the writer merely dying, so
 # only those are polled for it during the soak (see writers_failed).
+# Deliberately narrower than the shared default: this harness does not
+# drive paranoid.exe.
 VERIFYING_IO_DRIVERS = ("fio",)
-DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
-WRITER_STOP_TIMEOUT_S = 30
-# Before post-failure collection, how hard to try the guest agent. A busy
-# main loop can delay a reply by seconds, so one short ping is not enough to
-# call it dead; but a dead one makes everything after it wait out
-# GUEST_EXEC_TIMEOUT_S per writer -- hours at 75 LUNs.
-AGENT_CHECK_ATTEMPTS = 3
-AGENT_CHECK_TIMEOUT_S = 5.0
-
-DEFAULT_RAM = "8G"
-DEFAULT_CPUS = "5"
-
-BOOT_TIMEOUT_S = 180
-# Generous on purpose: at high LUN counts the agent can take a long while to
-# answer -- 30s was enough to abort a 75-LUN run during writer ramp-up --
-# and a timeout here ends the run. Why it goes quiet is not settled; see
-# NoReplyError and the launch-failure diagnostics. A sync that goes
-# unechoed is resent within this (QGA_SYNC_RESEND_S). WRITER_LAUNCH_
-# TIMEOUT_S, not this, is what bounds an unattended run: a genuinely dead
-# guest must not cost 75 x this before the harness gives up.
-GUEST_EXEC_TIMEOUT_S = 120
-WRITER_LAUNCH_TIMEOUT_S = 600
-WARMUP_S = 5.0  # just long enough for guest-exec to actually launch the
-                # writer before the pre-flight probe starts timing itself
-QMP_CMD_TIMEOUT_S = 15
-QMP_CONNECT_TIMEOUT_S = 30
-DUMP_TIMEOUT_S = 900
-DUMP_START_TIMEOUT_S = 300
-DUMP_POLL_INTERVAL_S = 2
 # A dump the harness stopped the VM for can outlive DUMP_TIMEOUT_S, and
 # QEMU refuses 'cont' while it runs. How much longer to wait for it to end
 # before leaving the VM paused and saying so.
 DUMP_RESUME_WAIT_S = 900
-# x-stop-on-broken asks for the stop right after virtio_error() prints, but
-# the main loop carries it out a moment later, so a poll that has just read
-# the message can still find the VM running. Give it this long to pause.
-STOP_ON_BROKEN_SETTLE_S = 2.0
-POLL_INTERVAL_S = 2
-AGENT_SILENCE_THRESHOLD_S = 15
-# How many agent silences in the soak loop get an info qtree capture of
-# the agent's port (see capture_qga_port); later ones get none, unless
-# the guest is declared dark.
-QGA_PORT_SILENCE_CAPTURES = 5
-STATIC_SCREEN_THRESHOLD_S = 20
 # How long LUN writes may stop before that counts towards "the guest has
 # gone dark". Only LUNs no fault is holding are watched (see IoProgress
 # and FaultCycler.unfaulted), but they can still sit out a while: the guest
 # resetting the faulted target can pause the whole adapter, and a request
 # it already timed out is retried only after the guest's own I/O timeout.
 # So: that timeout, plus the longest hold any scenario puts on a command
-# (late-completion's), plus slack.
+# (late-completion's), plus slack (IO_STALL_MARGIN_S).
 GUEST_IO_TIMEOUT_S = 60  # storport's default per-request timeout
-IO_STALL_MARGIN_S = 30
-DEFAULT_HEARTBEAT_S = 300  # how often to log a progress line on an hours-long run
 
 # The pre-flight I/O probe runs before the first fault is armed, so nothing
-# is held and a healthy writer shows up within seconds. The retry covers a
-# writer that was slow to get going.
+# is held and a healthy writer shows up within seconds. The retry
+# (IO_PROBE_ATTEMPTS) covers a writer that was slow to get going.
 IO_PROBE_WINDOW_S = 10.0
-IO_PROBE_ATTEMPTS = 2
-MIN_WRITE_OPS_PER_S = 2.0
 
 # After an agent request before the soak (resolving drives, launching a
 # writer) went unanswered, keep watching the agent and the LUNs this long
@@ -165,7 +136,6 @@ MIN_WRITE_OPS_PER_S = 2.0
 # are not being held; the time is for a guest too starved to schedule
 # qemu-ga to come back.
 LAUNCH_PROBE_S = 120.0
-LAUNCH_PROBE_INTERVAL_S = 5.0  # between pings; each also samples the LUNs
 
 # After a virtio-scsi ring breaks, how long to watch which adapters still
 # complete writes. The faults are removed first, so nothing is held; the
@@ -187,16 +157,6 @@ CYCLE_TMF_LINES = 40
 # Arming failures in a row before the run gives up: a QEMU without
 # x-scsi-fault-*, or adapters the faults can't find, fail every time.
 MAX_CONSECUTIVE_ARM_FAILURES = 3
-
-WRITER_WINDOW_BYTES = 32 * 1024 * 1024
-WRITER_BLOCK_BYTES = 64 * 1024
-WRITER_THREADS = 4
-WRITER_QUEUE_DEPTH = 32
-
-# Writers are budgeted to outlast the configured test duration by this much,
-# so a slow boot or heartbeat overhead can never let them exit early and
-# leave the back half of a multi-hour run with no I/O to delay.
-WRITER_DURATION_SLACK_S = 600
 
 
 def scenario_list() -> str:
@@ -323,9 +283,6 @@ def build_fio_args(drive_number: int, duration_s: float) -> list:
     ]
 
 
-RESOLVE_REQUEST = "resolve disk numbers"
-
-
 def resolve_drive_numbers(qga_sock: Path, serials: list,
                           resyncs: Optional[list] = None) -> dict:
     pid = ps_exec(qga_sock, RESOLVE_REQUEST,
@@ -407,9 +364,6 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int) -> str:
     err = b64_text(status.get("err-data")).strip()
     return (f"fio exitcode={status.get('exitcode')}; "
             f"stdout={out[:400]!r}; stderr={err[:400]!r}")
-
-
-WRITER_STDERR_TAIL_CHARS = 8000
 
 
 def writer_states(qga_sock: Path, pids: list,
@@ -622,13 +576,6 @@ def screendump_hash(qmp, path: Path) -> Optional[str]:
         return None
 
 
-# What HMP "info qtree" prints for each virtio-serial port
-# (virtser_bus_dev_print) -- the only place QEMU reports a port throttled.
-QTREE_PORT_RE = re.compile(r"port (\d+), guest (on|off), host (on|off), "
-                           r"throttle (on|off)")
-QTREE_NAME_RE = re.compile(r'^\s*name = "(.*)"$')
-
-
 def virtio_serial_ports(qmp) -> list:
     """Each virtio-serial port as info qtree reports it: whether the guest
     has it open, whether a host client is connected, and whether QEMU is
@@ -775,61 +722,6 @@ def _dump_guest_memory(qmp, path: Path, qemu_pid: int) -> bool:
 # ------------------------------------------------------------------
 
 
-# virtio_error() in hw/virtio/virtio.c is how QEMU reacts to a guest that
-# puts something impossible in a virtqueue. It does not just complain: it
-# sets VIRTIO_CONFIG_S_NEEDS_RESET and vdev->broken, and virtqueue_pop()
-# then refuses to touch that device's queues ever again (see the
-# vdev->broken checks in virtio.c). So the device is dead for the rest of
-# the run, and every LUN behind it silently stops doing I/O.
-#
-# There is no QMP way to ask for this. 'broken' is not a QOM property, and
-# x-query-virtio-status -- the obvious candidate -- aborts QEMU outright on
-# this tree (visit_start_struct assertion, reproducible on any virtio
-# device on a bare -S VM), so it cannot be used here. What is left, and is
-# in fact perfectly reliable, is QEMU's own stderr, which the harness
-# already captures. These are virtio_error()'s messages from virtio.c (the
-# generic ring handling) plus virtio-scsi.c, with the printf escapes
-# loosened.
-VIRTIO_BROKEN_PATTERNS = tuple(re.compile(p) for p in (
-    r"virtio: zero sized buffers are not allowed",
-    r"virtio: too many write descriptors in",
-    r"virtio: bogus descriptor or out of resources",
-    r"virtio: queue \d+ size \d+ exceeds max size",
-    r"Desc next is \d+",
-    r"Invalid size for indirect buffer table",
-    r"Incorrect order for descriptors",
-    r"Cannot map descriptor ring",
-    r"Cannot map indirect buffer",
-    r"Looped descriptor",
-    r"Region caches not initialized",
-    r"Virtqueue size exceeded",
-    r"Guest moved used index from \d+ to \d+",
-    r"Guest says index \d+ is available",
-    r"VQ \d+ size 0x[0-9a-f]+ Guest index 0x[0-9a-f]+",
-    r"wrong size for virtio-scsi headers",
-))
-
-
-# Tracepoints enabled with --tmf-trace (the default). Every one carries
-# bus=scsiN.0, so each line can be pinned to an adapter. With the log
-# trace backend they go to stderr -- the same stream, and with
-# "-msg timestamp=on" the same clock, as virtio_error()'s messages -- so
-# qemu.log reads as one ordered timeline of what each adapter was asked
-# to do right up to the moment it broke.
-#
-# The rest explain a break when one happens, and are quiet otherwise: TMF
-# and drain snapshots (a line or two per reset), the chain the device
-# failed on and what it looked like when published (only at a break), and
-# requests popped while the device still held one with the same command
-# header or head (capped at 256 lines per adapter; the count keeps going in
-# the snapshot and verdict lines). virtqueue_chain_* comes from the virtio
-# core and names the adapter by proxy id (dev=scsi0) rather than bus.
-TMF_TRACE_EVENTS = ("virtio_scsi_tmf_*", "virtio_scsi_reset",
-                    "virtio_scsi_broken", "virtio_scsi_broken_*",
-                    "virtio_scsi_drain_*", "virtio_scsi_req_overlap",
-                    "virtio_scsi_stop_on_broken", "virtqueue_chain_*")
-TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?(virtio_scsi|virtqueue_chain)_(\w+) ")
-
 # The target faults' tracepoints the harness always enables (see
 # build_qemu_argv): the fault being armed, each recovery attempt on it and
 # what the fault made of it, and the fault clearing. Not scsi_fault_hold
@@ -838,50 +730,7 @@ TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?(virtio_scsi|virtqueue_chain)_(\w+) ")
 FAULT_TRACE_EVENTS = ("scsi_fault_add", "scsi_fault_recovery",
                       "scsi_fault_clear")
 FAULT_TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?scsi_fault_(\w+) ")
-# Diagnostic lines: attached to the broken event they explain, or tallied
-# separately, rather than counted with the TMFs or kept as TMF context.
-DIAG_EVENTS = ("broken_verdict", "broken_before", "broken_before_detail",
-               "broken_before_entry", "req_overlap", "tmf_snapshot",
-               "drain_begin", "drain_snapshot", "stop_on_broken")
 
-# Tracepoints enabled with --qga-trace (the default): the guest agent's
-# virtio-serial port, seen from QEMU. In run-1791602155 qemu-ga sat 56
-# minutes in one 81-byte write to that port, and vioser completes a write
-# only once QEMU hands the buffer back. These say whether QEMU ever got it
-# and what became of it: each guest write as it reaches the chardev
-# (flush_buf; out_len < in_len means the socket refused some and the port
-# is now throttled, holding the buffer), the port being throttled and
-# released, and our client connecting and leaving (chr_event). A few lines
-# per agent call, on the same clock as the TMFs.
-#
-# A client leaving releases a throttled port without a throttle line:
-# virtio_serial_close() clears the flag itself and throws the held buffer
-# away (discard_throttle_data detaches it, so the guest never gets it
-# back). Hence QemuStderr's closed_while_throttled. chr_socket_poll_err
-# marks the rarer order, where the write itself finds the socket dead with
-# no read pending and disconnects inside flush_buf -- the close, and the
-# discard, come before that write's own flush_buf line.
-QGA_TRACE_EVENTS = ("virtio_console_flush_buf", "virtio_serial_throttle_port",
-                    "virtio_console_chr_event", "chr_socket_poll_err")
-QGA_TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?(" + "|".join(QGA_TRACE_EVENTS)
-                               + r") ")
-QGA_TRACE_FIELD_RE = re.compile(r"(\w+) (-?\d+)")
-CHR_SOCKET_LABEL_RE = re.compile(r"\((\S+)\)$")
-# include/chardev/char.h, QEMUChrEvent
-CHR_EVENTS = {0: "break", 1: "opened", 2: "mux_in", 3: "mux_out",
-              4: "closed"}
-TRACE_FIELD_RE = re.compile(r"(\w+)=(\S+)")
-TRACE_CONTEXT_LINES = 20  # per-adapter history attached to a broken event
-
-# include/standard-headers/linux/virtio_scsi.h
-TMF_SUBTYPES = {0: "abort_task", 1: "abort_task_set", 2: "clear_aca",
-                3: "clear_task_set", 4: "i_t_nexus_reset",
-                5: "logical_unit_reset", 6: "query_task",
-                7: "query_task_set"}
-TMF_RESPONSES = {0: "ok", 2: "aborted", 3: "bad_target", 4: "reset",
-                 5: "busy", 9: "failure", 10: "function_succeeded",
-                 11: "function_rejected", 12: "incorrect_lun"}
-VIRTIO_SCSI_QUEUE_KINDS = {0: "control", 1: "event"}  # 2+ are request queues
 # TMF tracepoints that name a target, and so can be pinned to a fault cycle
 CYCLE_TMF_EVENTS = ("tmf_req", "tmf_resp", "tmf_hang", "tmf_drop",
                     "tmf_delay")
