@@ -122,6 +122,9 @@ BASELINE_RULE_ID = "baseline"
 # number is all this harness reports.
 BUS_RE = re.compile(r"scsi(\d+)")
 
+# The rule ops --ops accepts: InjectDelayOp in qapi/block-core.json.
+INJECT_DELAY_OPS = ("read", "write", "flush", "discard", "write-zeroes")
+
 # How long the stalled set may sit before the guest is expected to have
 # reset the adapter, and the floor under max_hold_ms(). Storport's
 # per-command timeout is ~60s and it escalates through abort_task,
@@ -172,9 +175,11 @@ class ResetInflightStrategy(SoakStrategy):
         # Per-adapter view of the hold, refreshed every tick. prev_depth is
         # what makes the measurement worth anything: by the time a reset
         # shows up in the trace the drain has already emptied the hold, so
-        # the depth that matters is the last one sampled before it.
-        self.depth: dict = {}
-        self.prev_depth: dict = {}
+        # the depth that matters is the last one sampled before it. None
+        # until there is such a sample: a reset seen then has no depth to
+        # report, which is not the same as a depth of zero.
+        self.depth: Optional[dict] = None
+        self.prev_depth: Optional[dict] = None
         self.max_depth: dict = {}
         # adapter -> kind -> count, and bus -> kind -> count already
         # attributed to a cycle.
@@ -221,6 +226,9 @@ class ResetInflightStrategy(SoakStrategy):
         # Every cycle is timed from here, so the first one is not credited
         # with however long the fill took.
         self.armed_at = time.monotonic()
+        # Nothing can be held by rules that were armed just now, so this
+        # is a real sample, and a reset the first tick sees has a depth.
+        self.depth = {}
 
     def on_tick(self, ctx: SoakContext) -> Optional[dict]:
         if self.armed_at is None:
@@ -229,6 +237,14 @@ class ResetInflightStrategy(SoakStrategy):
             self.armed_at = ctx.start
 
         self._sample_inflight(ctx)
+        # The loop polled stderr before its own QMP and guest-agent calls,
+        # which can take seconds. A reset that landed after that poll but
+        # before the sample above has already drained the hold, and would
+        # be detected next tick with this drained sample as prev_depth.
+        # Polling after the sample instead means every reset _new_resets
+        # sees happened after the previous sample.
+        if ctx.qemu_stderr is not None:
+            ctx.qemu_stderr.poll()
         self._do_pending_releases(ctx)
         for adapter, kind, tmfs in self._new_resets(ctx):
             self._record_cycle(ctx, adapter, kind, tmfs)
@@ -341,7 +357,10 @@ class ResetInflightStrategy(SoakStrategy):
         # They are still the right number to report -- how deep the
         # adapter was when the guest gave up -- but they are not a count
         # of what this one event woke.
-        before = self.prev_depth.get(adapter, {"held": 0, "stalled": 0})
+        if self.prev_depth is None:
+            before = {"held": None, "stalled": None}
+        else:
+            before = self.prev_depth.get(adapter, {"held": 0, "stalled": 0})
         now = time.monotonic()
         self.resets.setdefault(adapter, {})
         self.resets[adapter][kind] = self.resets[adapter].get(kind, 0) + 1
@@ -357,8 +376,11 @@ class ResetInflightStrategy(SoakStrategy):
                  "tmfs_before_reset": tmfs,
                  "since_armed_s": round(now - (self.armed_at or ctx.start), 1)}
         self.cycle_log.append(cycle)
+        depth = (f"{before['stalled']} stalled of {before['held']} held"
+                 if self.prev_depth is not None
+                 else "depth unknown (no earlier sample)")
         print(f"[{cycle['time']}] {kind} #{cycle['n']} on scsi{adapter}: "
-              f"{before['stalled']} stalled of {before['held']} held, "
+              f"{depth}, "
               f"TMFs {tmfs or '{}'}, "
               f"{cycle['since_armed_s']:.0f}s since armed")
         if self.release_after_reset_ms is not None:
@@ -382,7 +404,9 @@ class ResetInflightStrategy(SoakStrategy):
         due = [a for t, a in self.pending_releases if t <= now]
         self.pending_releases = [(t, a) for t, a in self.pending_releases
                                  if t > now]
-        for adapter in due:
+        # One release empties the adapter's nodes, so several resets on the
+        # same adapter coming due together need only one.
+        for adapter in dict.fromkeys(due):
             for spec in ctx.lun_specs:
                 if spec.adapter != adapter:
                     continue
@@ -394,7 +418,7 @@ class ResetInflightStrategy(SoakStrategy):
                 self.releases += out.get("count", 0)
 
     def heartbeat(self, ctx: SoakContext) -> dict:
-        return {"inflight_by_adapter": dict(self.depth),
+        return {"inflight_by_adapter": dict(self.depth or {}),
                 "max_inflight_by_adapter": dict(self.max_depth),
                 "reset_cycles_done": len(self.cycle_log),
                 "resets_by_adapter": self._resets_snapshot()}
@@ -462,8 +486,9 @@ def cycle_summary(result: dict) -> list:
              + (": " + ", ".join(f"{n} {kind}" for kind, n
                                  in sorted(by_kind.items())) if cycles
                 else "")]
-    if cycles:
-        deepest = max(cycles, key=lambda c: c["stalled_before_reset"])
+    measured = [c for c in cycles if c["stalled_before_reset"] is not None]
+    if measured:
+        deepest = max(measured, key=lambda c: c["stalled_before_reset"])
         lines.append(f"Deepest hold at a reset: "
                      f"{deepest['stalled_before_reset']} stalled of "
                      f"{deepest['held_before_reset']} held on "
@@ -511,6 +536,16 @@ def main() -> int:
         return 1
 
     ops = [o.strip() for o in args.ops.split(",") if o.strip()]
+    # Checked here rather than left to QEMU: an empty list on '-blockdev'
+    # silently means every op, and over QMP (--fill-wait) a bad name only
+    # fails once the whole fill has been waited out.
+    unknown = [o for o in ops if o not in INJECT_DELAY_OPS]
+    if not ops or unknown:
+        print(f"Error: --ops must name at least one of "
+              f"{', '.join(INJECT_DELAY_OPS)}"
+              + (f"; unknown: {', '.join(unknown)}" if unknown else "")
+              + ".", file=sys.stderr)
+        return 1
     total_luns = args.adapters * args.targets * args.luns_per_target
     stop = (f"{args.cycles} reset cycle(s)" if args.cycles
             else f"{args.duration_hours:.1f}h")
