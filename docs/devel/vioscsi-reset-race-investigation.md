@@ -1,13 +1,13 @@
 # vioscsi BSOD investigation: triage and reset-race theory
 
-🤖 Assisted-by: Claude Code (Sonnet 5)
+🤖 Assisted-by: Claude Code (Claude Opus 5.5)
 
 This document summarizes an investigation into a cluster of Windows guest
 BSOD reports that all mention `virtio-scsi`, filed against
 [virtio-win/kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows).
 It exists to let a human or an AI agent pick this work back up without
-re-deriving it from scratch. The reproduction harness this investigation
-produced is `scripts/fuzz-windows-inject-scsi-reset.py`; see
+re-deriving it from scratch. The reproduction harnesses it produced are
+the `scripts/fuzz-windows-inject-*.py` scripts; see
 [storage-error-injection.rst](storage-error-injection.rst) for the
 underlying `inject-error` tooling it's built on.
 
@@ -51,14 +51,14 @@ share the `vioscsi` label. Triage detail:
   obtained — see the crash-dump-collection recipe below, which addresses
   exactly this gap.
 
-## The reset-race theory (targeting #1014 / #877)
+## The reset path (targeting #1014 / #877)
 
-Reading the current `vioscsi` driver source
-([vioscsi.c](https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/vioscsi/vioscsi.c),
-[helper.c](https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/vioscsi/helper.c))
-shows a plausible mechanism for how "slow storage" turns into a
-corruption-class bugcheck via the driver's own timeout/reset handling,
-rather than storage latency being fatal on its own.
+Reading the `vioscsi` driver source shows how "slow storage" can turn
+into a corruption-class bugcheck through the driver's own timeout/reset
+handling, rather than storage latency being fatal on its own. Driver
+references below are to
+[d92b9c07](https://github.com/virtio-win/kvm-guest-drivers-windows/tree/d92b9c073ec1108f51846d0bd109c5796b46fd36/vioscsi)
+and name functions, since line numbers drift.
 
 ### The path
 
@@ -66,119 +66,142 @@ A storport request timeout (the `disk:TimeOutValue` /
 `vioscsi\Parameters:IoTimeoutValue` registry values, ~60-90s, per
 AlexMKX's differential testing in #1014) drives an
 `SRB_FUNCTION_RESET_LOGICAL_UNIT` down to vioscsi. `PreProcessRequest`
-(`vioscsi.c:1624`) dispatches this to `CompletePendingRequestsOnReset`
-under the driver's default action-on-reset setting
-(`adaptExt->action_on_reset = VioscsiResetCompleteRequests`,
-`vioscsi.c:445` — what every real-world deployment runs):
+dispatches it to `CompletePendingRequestsOnReset` under the default
+action-on-reset setting (`VioscsiResetCompleteRequests`, set in
+`VioScsiFindAdapter`), which is what every real-world deployment runs:
 
 ```c
-// vioscsi.c:1499-1550, CompletePendingRequestsOnReset (paraphrased)
-StorPortPause(DeviceExtension, 10);
-DeviceReset(DeviceExtension);          // fires an async TMF LUN reset, returns immediately
-for (each queue) {
-    // force-complete EVERY pending SRB on this queue with SRB_STATUS_BUS_RESET,
-    // regardless of whether it was the one that actually timed out
+// CompletePendingRequestsOnReset (paraphrased)
+if (!reset_in_progress) {
+    reset_in_progress = TRUE;
+    StorPortPause(DeviceExtension, 10);
+    DeviceReset(DeviceExtension);      // posts a LUN reset TMF, returns at once
+    for (each request queue) {
+        // complete EVERY pending SRB on the adapter with SRB_STATUS_BUS_RESET,
+        // not just the ones on the LUN that timed out
+    }
+    StorPortResume(DeviceExtension);
 }
-StorPortResume(DeviceExtension);
-adaptExt->reset_in_progress = FALSE;   // cleared unconditionally, NOT gated on the TMF response
+reset_in_progress = FALSE;             // not gated on the TMF response
 ```
 
-`DeviceReset()` (`helper.c:216`) doesn't block on the backend finishing
-the reset — it builds a task-management-function (TMF) request into a
-**single shared per-adapter scratch buffer** (`adaptExt->tmf_cmd`), sets
-`adaptExt->tmf_infly = TRUE`, and returns. The response is only reaped
-later, from the interrupt handler, when the control-queue completion
-arrives (`vioscsi.c:964-984`).
+`DeviceReset()` (`helper.c`) doesn't wait for the device. It builds the
+TMF in a single per-adapter buffer (`adaptExt->tmf_cmd`), posts it on the
+control queue, sets `adaptExt->tmf_infly = TRUE` and returns. The response
+is reaped later by the interrupt handler (`VioScsiInterrupt` /
+`VioScsiMSInterrupt`). Note too that the TMF always carries
+`lun[1] = 0`, so whatever LUN timed out, it resets target 0.
 
-### Where it's safe
+### Late data transfers into completed requests
 
-The obvious worry — a late completion for an already-force-completed SRB
-causing a double-complete/use-after-free — is guarded against.
-`ProcessQueue` (`vioscsi.c:1456-1481`) looks a completing request up by ID
-in the same `srb_list` that the reset path drains, under the same
-per-queue lock; if the reset path already removed it, the late completion
-is just logged (`"No SRB found for ID..."`) and dropped. This is *not*
-memory-unsafe, though it is a data-integrity smell: Windows was told
-`BUS_RESET` for an I/O that may have actually landed at the backend.
+The force-complete loop tells Windows that every pending SRB is finished
+while the device may still own its data buffers. `ProcessQueue` does
+guard the *completion*: a late response is looked up by ID in the
+`srb_list` the reset path drained, under the same per-queue lock, and is
+dropped with `"No SRB found for ID..."` if it is gone. Nothing guards the
+*data transfer*. For a read, the device writes the data into guest
+memory when the request finishes, which can be after Windows was told
+`BUS_RESET` and has reused the pages.
 
-### Where it isn't
+Where that data lands decides the symptom (this part is inference, not
+observed):
 
-Two things are **adapter-wide, not per-LUN**, and neither is gated on the
-prior reset's TMF response actually arriving:
+- I/O to a raw disk from an application buffer (what fio, diskspd and
+  paranoid in these harnesses do; the PowerShell writer only writes)
+  DMAs into the application's own buffer. The
+  application still owns it, so the result is a verify failure or silent
+  data corruption, not a bugcheck.
+- Paging I/O (file reads through the cache manager, page-file reads,
+  image loads) DMAs into physical pages that the memory manager puts back
+  on its lists when the I/O fails. A late write into one of those is
+  stray DMA into whatever the kernel used the page for next. That is the
+  class of `PFN_LIST_CORRUPT`, `PAGE_HASH_ERRORS_INPAGE` and
+  `CRITICAL_PROCESS_DIED` reported in #1014 and #877, whose reporters
+  were copying large files.
 
-1. **`reset_in_progress`** is cleared unconditionally right after the
-   force-complete loop finishes — not gated on `tmf_infly` clearing. If a
-   *second* LUN's own timeout fires a reset while the first LUN's TMF is
-   still outstanding, `DeviceReset()` re-enters and reuses the single
-   shared `adaptExt->tmf_cmd` scratch buffer/SGL (`helper.c:220-259`),
-   guarded only by `ASSERT(adaptExt->tmf_infly == FALSE)` — which
-   compiles to nothing in a free/retail build (what every reporter runs).
-   That's the driver handing the same DMA buffer to the device a second
-   time while the device may still be reading/writing it for the first,
-   unacknowledged TMF.
-2. **`StorPortResume()`** fires as soon as the force-complete loop
-   finishes, before the backend-side reset is confirmed done, so new I/O
-   to the same LUN can be issued while the earlier reset TMF is still in
-   flight.
+The `reset_via_tmf` driver branch makes `VioscsiResetSendTmf` the default:
+it waits for the TMF response, by which point the device has finished or
+cancelled every request on the LUN, before completing anything.
 
-Both require **multiple in-flight requests timing out close together** to
-trigger — exactly AlexMKX's setup in #1014 (three separate
-`virtio-scsi-pci` controllers/iothreads/LUNs, sustained slow ZFS-with-
-dedup backend; throttling bandwidth down or reducing guest RAM made it
-fail *faster*, both consistent with more requests queuing/timing out
-concurrently). The bugcheck codes reported (`PFN_LIST_CORRUPT`,
-`PAGE_HASH_ERRORS_INPAGE`, `CRITICAL_PROCESS_DIED`) are the class of
-symptom a stray DMA write into memory the kernel has since repurposed
-would produce.
+### Overlapping resets
 
-### The race window is narrower than it first looks
+`reset_in_progress` is cleared as soon as the force-complete loop ends,
+and storport takes `DeviceReset()`'s immediate `TRUE` as the reset being
+done. So a second reset can arrive while the first TMF is still in
+flight, and `DeviceReset()` then rebuilds and reposts `tmf_cmd` while the
+device owns it. The only guard is `ASSERT(adaptExt->tmf_infly == FALSE)`,
+which compiles to nothing in the retail driver. The INTx handler also
+clears `tmf_infly` on every interrupt, whether or not a TMF came back.
 
-QEMU's own handling of the LUN-reset TMF matters here. On the QEMU side,
-`VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET` (`hw/scsi/virtio-scsi.c:528`) calls
-`device_cold_reset()` on that one SCSI device, which drains its block
-node — and `inject_error_drain_begin()`
-(`block/inject-error.c:443`) wakes *every* held/delayed request on that
-node the instant drain starts, not after the injected delay elapses. So a
-single LUN's own TMF round-trip resolves in however long QEMU takes to
-schedule and run that drain (normally fast), **not** in however long an
-injected stall/delay holds the data request. The corruption-shaped race
-is therefore governed by host/guest **scheduling jitter between two
-independent LUN resets landing close together**, not by how long any one
-LUN is held — which is why the reproduction harness stalls *multiple*
-LUNs concurrently and sweeps the arm-timing gap between them, rather than
-just holding one disk for a long time.
+This overlap is real and needs no fault injection: an `NT_VERIFY` version
+of that guard fired in testing from storport's hierarchical reset path
+(`RaidUnitHierarchicalReset`), which led to the coalescing fix
+(driver commit 1b67babe). What it does on a retail driver is not
+established. The rebuilt TMF has the same contents and the same buffer
+addresses, so it may well be harmless there, and it should not be assumed
+to be the corruption path.
+
+### Holding the reset open from QEMU
+
+On the QEMU side, `VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET` (in
+`virtio_scsi_do_tmf()`) cold-resets that SCSI device, which drains its
+block node. `inject_error_drain_begin()` wakes every request a delay or
+stall rule holds as soon as the drain starts. So with the `inject-error`
+rules alone, the held requests finish during the TMF, only milliseconds
+after the driver force-completed them, and the race depends on
+scheduling jitter.
+
+Two QEMU knobs widen it on purpose:
+
+- `x-tmf-delay-ms` / `x-tmf-delay-count` on `virtio-scsi-pci` hold the
+  response of a TMF that has already been carried out. That keeps the
+  driver's reset in flight to race a second reset, but the data transfers
+  have already happened by then.
+- `x-scsi-fault-add` with `below-clear: hang` holds a TMF *before* it is
+  carried out, and the commands the fault holds have not run yet. When
+  the fault is removed they run and transfer their data, as late as the
+  harness wants (see [storage-error-injection.rst](storage-error-injection.rst)).
+  This is the one that can put a read's data into memory Windows has
+  already reused.
 
 ## Confirming it
 
-This is a well-grounded hypothesis from reading current source, not a
-confirmed root cause. Two things would nail it down:
+This is grounded in reading source, not a confirmed root cause for the
+reported BSODs. Two things would nail it down:
 
-1. **A checked/debug `vioscsi.sys` build.** `ASSERT` compiles to nothing
-   in the retail driver every reporter runs, so on retail this race (if
-   real) manifests as silent corruption; on a checked build it should
-   bugcheck immediately and attributably the moment two resets overlap —
-   far cheaper to confirm than catching silent corruption.
-2. **A dump from an actual repro.** Set up `-device vmcoreinfo` +
-   the guest-side `fwcfg` driver (from the virtio-win ISO) so a crash
+1. **A dump from a reproduction.** Use `-device vmcoreinfo` plus the
+   guest-side `fwcfg` driver (from the virtio-win ISO), so a crash
    produces a symbolized `win-dmp` via QMP `dump-guest-memory`, instead of
-   relying on Windows' own in-guest dump writer — which is exactly the
-   mechanism that stalled at 0% and produced no usable dump in #877.
-   Inspect `adaptExt->tmf_infly` / `adaptExt->reset_in_progress` and
-   whether corrupted memory correlates with the `tmf_cmd` scratch buffer.
+   relying on Windows' own in-guest dump writer. That writer is what
+   stalled at 0% and produced no usable dump in #877. With `hv-crash` and
+   `-action panic=pause`, a bugcheck parks the VM in `guest-panicked` and
+   QEMU's `GUEST_PANICKED` event carries the bugcheck code and arguments.
+2. **An A/B on the same recipe.** The upstream driver should bugcheck,
+   and the `reset_via_tmf` driver should survive. A bugcheck from a lab
+   recipe shows the fix closes that path. It does not show that #1014 or
+   #877 were that path; only a reporter's dump can.
 
-## Reproduction harness
+## Reproduction harnesses
 
-`scripts/fuzz-windows-inject-scsi-reset.py` automates the above: it boots
-the golden Windows image from `setup-windows-inject-vm.sh`, attaches N
-scratch SCSI LUNs to one `virtio-scsi-pci` adapter (default 3, matching
-#1014's shape), drives sustained raw writes to all of them via
-`qemu-guest-agent`, then arms a `stall` rule on every LUN concurrently
-with a swept host-side gap between each arm call, watching for guest-agent
-silence as the crash signal and attempting a `win-dmp` capture on a
-suspected crash. See the script's own header comment for the full
-mechanism writeup and `--help` for prerequisites and options.
+All of them boot the golden image from `setup-windows-inject-vm.sh`,
+attach scratch SCSI LUNs, drive I/O through `qemu-guest-agent` and share
+`scripts/vioscsi_soak_common.py`; see each script's header and `--help`:
 
-It has not yet been run against a live VM as of this writing — the golden
-image (`setup-windows-inject-vm.sh create`/`install`, plus
-qemu-guest-agent and the vioscsi driver installed in-guest) still needs
-to be set up on whichever machine runs it.
+- `fuzz-windows-inject-scsi-reset.py`: stalls several LUNs on one adapter
+  with a swept gap between the arm calls, optionally with `x-tmf-delay`,
+  to make storport reset them close together.
+- `fuzz-windows-inject-tail-latency.py`: long soak with a probabilistic
+  tail-latency rule across many adapters and targets.
+- `fuzz-windows-inject-target-fault.py`: soak with SCSI target faults,
+  checking how far up the escalation path the driver goes.
+- `fuzz-windows-inject-reset-inflight.py`: resets adapters under a deep
+  queue.
+
+They have been run many times, and the reset path above has produced
+hangs, broken rings and data corruption. None of them is set up to see a
+bugcheck: their I/O goes to raw disks from application buffers, which
+(per the reasoning above) turns a late transfer into a verify failure rather than
+a crash, and they stop at the first such failure. `hv-crash` is only
+enabled with `--watch-after-break`, `x-stop-on-broken` pauses the VM at
+a ring break, and the scsi-reset harness decides a crash happened from
+guest-agent silence and a still screen.
