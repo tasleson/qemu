@@ -89,7 +89,6 @@
 
 import argparse
 import dataclasses
-import fcntl
 import hashlib
 import itertools
 import json
@@ -111,8 +110,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
 from vioscsi_soak_common import (_qga_request, b64_text, build_writer_script,
-                                 encode_ps, load_qmp_module, make_overlay,
-                                 other_swtpm_pids)
+                                 clone_tpm_state, encode_ps, load_qmp_module,
+                                 make_overlay, other_swtpm_pids)
 
 QEMU_SRC = Path(os.environ.get("QEMU_SRC", str(Path(__file__).resolve().parents[1])))
 QEMU_BUILD = Path(os.environ.get("QEMU_BUILD", str(QEMU_SRC / "build")))
@@ -127,7 +126,7 @@ BOOT_DISK = VM_DIR / "boot.qcow2"
 OVMF_CODE = Path(os.environ.get(
     "OVMF_CODE", "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2"))
 OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TPM_DIR = VM_DIR / "tpm"  # shared, persistent -- same TPM state the golden image was installed with
+TPM_DIR = VM_DIR / "tpm"  # golden, read-only source cloned per run -- see clone_tpm_state()
 
 TRACE_EVENTS = QEMU_SRC / "scripts" / "windows-storage-trace-events"
 
@@ -441,65 +440,21 @@ def make_blank_image(path: Path, size: str = LUN_IMAGE_SIZE) -> None:
                    check=True, capture_output=True)
 
 
-def check_tpm_dir_lockable() -> None:
-    # TPM_DIR is shared and persistent, matching the golden image's real TPM
-    # state. swtpm takes swtpm's exclusive '.lock' on that directory -- but it
-    # does so *lazily*, only when QEMU sends CMD_INIT, not at startup. So a
-    # second swtpm sharing this dir (e.g. an interactive
-    # setup-windows-inject-vm.sh 'run' session, or an orphaned process from a
-    # prior run) starts up and creates its own control socket perfectly
-    # happily; the lock conflict only surfaces later as swtpm failing CMD_INIT
-    # ("Could not lock access to lockfile") and QEMU dying with an opaque
-    # "TPM result for CMD_INIT: 0x9 operation failed". Waiting for the control
-    # socket to appear therefore proves nothing about the lock.
-    #
-    # Detect the contention up front instead: try to grab the same flock
-    # non-blocking, then immediately drop it so swtpm can take it. There's a
-    # tiny TOCTOU window between here and swtpm's own lock, but a shared
-    # persistent TPM dir has no legitimate concurrent user anyway, so catching
-    # the common "another VM is already running against this dir" case with a
-    # clear message is well worth it.
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = TPM_DIR / ".lock"
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o640)
-    except OSError:
-        return  # can't pre-check (permissions); let swtpm report it instead
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            holders = other_swtpm_pids(os.getpid())
-            raise RuntimeError(
-                f"the shared TPM state dir {TPM_DIR} is already locked by "
-                f"another process -- swtpm here would fail CMD_INIT and QEMU "
-                f"would die with 'TPM result for CMD_INIT: 0x9'. This is "
-                f"almost always another VM sharing this dir (a running "
-                f"setup-windows-inject-vm.sh session, or an orphaned swtpm). "
-                f"swtpm process(es) currently running: "
-                f"{holders if holders else 'none visible via pgrep'}. Shut "
-                f"that VM down (or kill the stray swtpm) and retry.")
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
+def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
     # A fresh swtpm process is required per VM launch (its unixio ctrl
-    # channel doesn't survive a reconnect), but TPM_DIR itself is shared and
-    # persistent. Confirm nothing else already holds the state-dir lock before
-    # launching, since swtpm won't reveal that conflict until QEMU's CMD_INIT
-    # (see check_tpm_dir_lockable). If swtpm instead blocks trying to *create*
-    # its control socket, the timeout loop below still catches that.
-    check_tpm_dir_lockable()
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
+    # channel doesn't survive a reconnect). TPM_DIR holds the persistent
+    # state matching the golden image's real TPM; clone it per run instead of
+    # pointing swtpm straight at TPM_DIR so concurrent runs don't fight over
+    # swtpm's exclusive state-dir lock (a second swtpm sharing TPM_DIR fails
+    # CMD_INIT and kills QEMU with "TPM result for CMD_INIT: 0x9").
+    local_tpm_dir = clone_tpm_state(run_dir)
     if tpm_sock.exists():
         tpm_sock.unlink()
     log_path = tpm_sock.parent / "swtpm-startup.log"
     log_file = log_path.open("wb")
     proc = subprocess.Popen([
         "swtpm", "socket",
-        "--tpmstate", f"dir={TPM_DIR}",
+        "--tpmstate", f"dir={local_tpm_dir}",
         "--ctrl", f"type=unixio,path={tpm_sock}",
         "--tpm2",
     ], stdout=log_file, stderr=subprocess.STDOUT)
@@ -516,18 +471,12 @@ def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
         time.sleep(0.1)
     proc.kill()
     other_swtpm = other_swtpm_pids(proc.pid)
-    hint = (f" -- other swtpm process(es) currently running: {other_swtpm}; "
-            f"one of them likely already holds the exclusive lock on "
-            f"{TPM_DIR} (check for a leftover interactive "
-            f"setup-windows-inject-vm.sh session or an orphaned swtpm from "
-            f"a prior run, and kill it)" if other_swtpm else
-            f" -- no other swtpm process is currently visible, so this "
-            f"isn't the usual {TPM_DIR} lock contention; check the swtpm "
-            f"install and permissions on that directory")
+    hint = (f" -- other swtpm process(es) currently running: {other_swtpm}" if
+            other_swtpm else
+            f" -- no other swtpm process is currently visible; check the "
+            f"swtpm install and permissions on {local_tpm_dir}")
     raise RuntimeError(
-        f"swtpm did not create its control socket within 5s -- it likely "
-        f"blocked silently trying to lock {TPM_DIR} rather than erroring "
-        f"out{hint}")
+        f"swtpm did not create its control socket within 5s{hint}")
 
 
 def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
@@ -1022,7 +971,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                 "luns": luns, "seed": tc.seed, "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-        swtpm = start_swtpm(tpm_sock)
+        swtpm = start_swtpm(run_dir, tpm_sock)
         with qemu_log_path.open("wb") as qemu_log:
             proc = subprocess.Popen(argv, stdout=qemu_log, stderr=subprocess.STDOUT)
 
@@ -1032,11 +981,8 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
             swtpm_output = (swtpm_log_path.read_text(errors="replace").strip()
                             if swtpm_log_path.exists() else "")
             msg = (
-                f"QEMU exited early (code {proc.returncode}) {context} -- a "
-                f"common cause is another swtpm process (e.g. a leftover "
-                f"interactive setup-windows-inject-vm.sh session, or an "
-                f"orphan from a prior run) already holding the shared TPM "
-                f"state in {TPM_DIR}. QEMU output:\n{output}")
+                f"QEMU exited early (code {proc.returncode}) {context}. "
+                f"QEMU output:\n{output}")
             if swtpm_output:
                 msg += f"\nswtpm output:\n{swtpm_output}"
             return RuntimeError(msg)

@@ -39,6 +39,7 @@ import hashlib
 import json
 import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -477,20 +478,29 @@ def make_overlay(golden: Path, dest: Path) -> None:
                    check=True, capture_output=True)
 
 
-def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
+def clone_tpm_state(run_dir: Path) -> Path:
+    # TPM_DIR holds the persistent state matching the golden image's real
+    # TPM. Point swtpm at a per-run copy rather than TPM_DIR directly, so
+    # concurrent runs don't fight over swtpm's exclusive state-dir lock (a
+    # second swtpm sharing TPM_DIR fails CMD_INIT and kills QEMU with "TPM
+    # result for CMD_INIT: 0x9").
+    local_dir = run_dir / "tpm"
+    shutil.copytree(TPM_DIR, local_dir, ignore=shutil.ignore_patterns(".lock"))
+    return local_dir
+
+
+def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
     # swtpm's unixio ctrl channel carries both control and TPM data over
     # the one connection from QEMU, and swtpm exits once that connection
     # closes -- regardless of '--terminate', whose doc text is specific
     # to a TCP data channel and doesn't keep a unixio ctrl channel alive
-    # across reconnects. So a fresh swtpm instance is required per VM
-    # launch; TPM_DIR (the persistent state) is still shared across runs,
-    # same as a real machine's TPM would be.
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
+    # across reconnects. So a fresh swtpm instance is required per VM launch.
+    local_tpm_dir = clone_tpm_state(run_dir)
     if tpm_sock.exists():
         tpm_sock.unlink()
     proc = subprocess.Popen([
         "swtpm", "socket",
-        "--tpmstate", f"dir={TPM_DIR}",
+        "--tpmstate", f"dir={local_tpm_dir}",
         "--ctrl", f"type=unixio,path={tpm_sock}",
         "--tpm2",
     ])
@@ -596,7 +606,7 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
             "actions": [dataclasses.asdict(a) for a in tc.actions], "argv": argv}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    swtpm = start_swtpm(tpm_sock)
+    swtpm = start_swtpm(run_dir, tpm_sock)
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     qmp = None

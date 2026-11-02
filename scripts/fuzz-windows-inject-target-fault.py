@@ -2328,7 +2328,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-        swtpm = start_swtpm(tpm_sock)
+        swtpm = start_swtpm(run_dir, tpm_sock)
         with qemu_log_path.open("wb") as qemu_log:
             proc = subprocess.Popen(argv, stdout=qemu_log, stderr=subprocess.STDOUT)
 

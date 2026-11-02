@@ -14,7 +14,6 @@ import argparse
 import base64
 import collections
 import dataclasses
-import fcntl
 import hashlib
 import itertools
 import json
@@ -42,7 +41,7 @@ BOOT_DISK = VM_DIR / "boot.qcow2"
 OVMF_CODE = Path(os.environ.get(
     "OVMF_CODE", "/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2"))
 OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TPM_DIR = VM_DIR / "tpm"  # shared, persistent -- same TPM state the golden image was installed with
+TPM_DIR = VM_DIR / "tpm"  # golden, read-only source cloned per run -- see clone_tpm_state()
 
 PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
@@ -1171,44 +1170,29 @@ def other_swtpm_pids(exclude_pid: int) -> list:
     return [pid for pid in out.stdout.split() if pid != exclude]
 
 
-def check_tpm_dir_lockable() -> None:
-    # See fuzz-windows-inject-scsi-reset.py's check_tpm_dir_lockable for why
-    # this pre-check matters: swtpm's own lock is lazy (taken at CMD_INIT,
-    # not startup), so waiting for its control socket to appear proves
-    # nothing about contention on the shared, persistent TPM_DIR.
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = TPM_DIR / ".lock"
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o640)
-    except OSError:
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            holders = other_swtpm_pids(os.getpid())
-            raise RuntimeError(
-                f"the shared TPM state dir {TPM_DIR} is already locked by "
-                f"another process -- swtpm here would fail CMD_INIT and QEMU "
-                f"would die with 'TPM result for CMD_INIT: 0x9'. swtpm "
-                f"process(es) currently running: "
-                f"{holders if holders else 'none visible via pgrep'}. Shut "
-                f"that VM down (or kill the stray swtpm) and retry.")
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+def clone_tpm_state(run_dir: Path) -> Path:
+    # TPM_DIR holds the persistent, shared state matching the golden image's
+    # enrolled TPM (secureboot/BitLocker keys). Running swtpm directly against
+    # it serializes all soaks on one exclusive flock, and a stray or
+    # still-running swtpm from another soak makes a fresh one fail CMD_INIT
+    # ("TPM result for CMD_INIT: 0x9 operation failed"), killing QEMU.
+    # Instead, give each run its own copy of that state (never written back),
+    # so concurrent soaks each get an independent TPM seeded from the same
+    # enrolled state.
+    local_dir = run_dir / "tpm"
+    shutil.copytree(TPM_DIR, local_dir, ignore=shutil.ignore_patterns(".lock"))
+    return local_dir
 
 
-def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
-    check_tpm_dir_lockable()
-    TPM_DIR.mkdir(parents=True, exist_ok=True)
+def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
+    local_tpm_dir = clone_tpm_state(run_dir)
     if tpm_sock.exists():
         tpm_sock.unlink()
     log_path = tpm_sock.parent / "swtpm-startup.log"
     log_file = log_path.open("wb")
     proc = subprocess.Popen([
         "swtpm", "socket",
-        "--tpmstate", f"dir={TPM_DIR}",
+        "--tpmstate", f"dir={local_tpm_dir}",
         "--ctrl", f"type=unixio,path={tpm_sock}",
         "--tpm2",
     ], stdout=log_file, stderr=subprocess.STDOUT)
@@ -1225,16 +1209,12 @@ def start_swtpm(tpm_sock: Path) -> subprocess.Popen:
         time.sleep(0.1)
     proc.kill()
     other_swtpm = other_swtpm_pids(proc.pid)
-    hint = (f" -- other swtpm process(es) currently running: {other_swtpm}; "
-            f"one of them likely already holds the exclusive lock on "
-            f"{TPM_DIR}" if other_swtpm else
-            f" -- no other swtpm process is currently visible, so this "
-            f"isn't the usual {TPM_DIR} lock contention; check the swtpm "
-            f"install and permissions on that directory")
+    hint = (f" -- other swtpm process(es) currently running: {other_swtpm}" if
+            other_swtpm else
+            f" -- no other swtpm process is currently visible; check the "
+            f"swtpm install and permissions on {local_tpm_dir}")
     raise RuntimeError(
-        f"swtpm did not create its control socket within 5s -- it likely "
-        f"blocked silently trying to lock {TPM_DIR} rather than erroring "
-        f"out{hint}")
+        f"swtpm did not create its control socket within 5s{hint}")
 
 
 # A delay rule is a plain dict matching InjectDelayRuleOptions in
@@ -2943,7 +2923,7 @@ def run_soak(soak_dir: Path,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-        swtpm = start_swtpm(tpm_sock)
+        swtpm = start_swtpm(run_dir, tpm_sock)
         with qemu_log_path.open("wb") as qemu_log:
             proc = subprocess.Popen(argv, stdout=qemu_log, stderr=subprocess.STDOUT)
 
