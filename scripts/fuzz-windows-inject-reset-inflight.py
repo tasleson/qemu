@@ -177,7 +177,8 @@ class ResetInflightStrategy(SoakStrategy):
         # shows up in the trace the drain has already emptied the hold, so
         # the depth that matters is the last one sampled before it. None
         # until there is such a sample: a reset seen then has no depth to
-        # report, which is not the same as a depth of zero.
+        # report, which is not the same as a depth of zero. Likewise an
+        # adapter maps to None for a tick its hold could not be queried.
         self.depth: Optional[dict] = None
         self.prev_depth: Optional[dict] = None
         self.max_depth: dict = {}
@@ -188,8 +189,8 @@ class ResetInflightStrategy(SoakStrategy):
         self.seen_tmfs: dict = {}
         self.cycle_log: list = []
         self.releases = 0
-        # Ticks where a hold query failed; a nonzero count means the
-        # recorded depths are floors, not measurements.
+        # Hold queries that failed; each leaves its adapter's depth
+        # unknown for that tick.
         self.sample_errors = 0
         # (due_monotonic, adapter) for --release-after-reset-ms.
         self.pending_releases: list = []
@@ -274,6 +275,7 @@ class ResetInflightStrategy(SoakStrategy):
         and a baseline hold inflates the total without being interesting.
         """
         depth: dict = {}
+        unsampled: set = set()
         for spec in ctx.lun_specs:
             try:
                 held = qmp_call(ctx.qmp, "x-inject-error-delay-inflight",
@@ -281,22 +283,28 @@ class ResetInflightStrategy(SoakStrategy):
             except Exception as exc:  # pylint: disable=broad-except
                 # A node can be momentarily unavailable (a dump removes the
                 # rules, the VM is paused at a break); losing one sample is
-                # not worth ending a multi-hour run over. But a query that
-                # fails every tick reads exactly like an empty hold, and
-                # then every cycle records a depth of zero and the run
-                # still looks healthy -- so say so the first time, and
-                # keep the tally in the result.
+                # not worth ending a multi-hour run over. A query that
+                # fails every tick leaves every cycle's depth unknown, so
+                # say so the first time, and keep the tally in the result.
                 self.sample_errors += 1
                 if self.sample_errors == 1:
                     print(f"    cannot sample the hold on {spec.err_node}: "
-                          f"{exc!r} -- in-flight depths will read low until "
-                          f"it recovers", file=sys.stderr)
+                          f"{exc!r} -- scsi{spec.adapter}'s in-flight depth "
+                          f"is unknown until it recovers", file=sys.stderr)
+                unsampled.add(spec.adapter)
                 continue
             cur = depth.setdefault(spec.adapter, {"held": 0, "stalled": 0})
             cur["held"] += len(held)
             cur["stalled"] += sum(1 for r in held if r.get("stalled"))
+        # An adapter missing even one of its LUNs has no depth this tick,
+        # rather than a partial sum or a zero that a reset next tick would
+        # report as measured.
+        for adapter in unsampled:
+            depth[adapter] = None
         self.prev_depth, self.depth = self.depth, depth
         for adapter, cur in depth.items():
+            if cur is None:
+                continue
             prev = self.max_depth.get(adapter, {"held": 0, "stalled": 0})
             self.max_depth[adapter] = {
                 "held": max(prev["held"], cur["held"]),
@@ -357,10 +365,9 @@ class ResetInflightStrategy(SoakStrategy):
         # They are still the right number to report -- how deep the
         # adapter was when the guest gave up -- but they are not a count
         # of what this one event woke.
-        if self.prev_depth is None:
-            before = {"held": None, "stalled": None}
-        else:
-            before = self.prev_depth.get(adapter, {"held": 0, "stalled": 0})
+        sample = (None if self.prev_depth is None else
+                  self.prev_depth.get(adapter, {"held": 0, "stalled": 0}))
+        before = sample or {"held": None, "stalled": None}
         now = time.monotonic()
         self.resets.setdefault(adapter, {})
         self.resets[adapter][kind] = self.resets[adapter].get(kind, 0) + 1
@@ -377,8 +384,8 @@ class ResetInflightStrategy(SoakStrategy):
                  "since_armed_s": round(now - (self.armed_at or ctx.start), 1)}
         self.cycle_log.append(cycle)
         depth = (f"{before['stalled']} stalled of {before['held']} held"
-                 if self.prev_depth is not None
-                 else "depth unknown (no earlier sample)")
+                 if sample is not None
+                 else "depth unknown (no usable earlier sample)")
         print(f"[{cycle['time']}] {kind} #{cycle['n']} on scsi{adapter}: "
               f"{depth}, "
               f"TMFs {tmfs or '{}'}, "
