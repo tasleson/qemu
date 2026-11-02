@@ -1268,6 +1268,28 @@ def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
         f"swtpm did not create its control socket within 5s{hint}")
 
 
+# The rule ops a harness's --ops accepts: InjectDelayOp in
+# qapi/block-core.json.
+INJECT_DELAY_OPS = ("read", "write", "flush", "discard", "write-zeroes")
+
+
+def parse_delay_ops(text: str) -> list:
+    """A comma-separated --ops as a list of InjectDelayOp names, or
+    ValueError saying what is wrong with it.
+
+    Checked here rather than left to QEMU: an empty list on '-blockdev'
+    silently means every op, and over QMP (--fill-wait) a bad name only
+    fails once the whole fill has been waited out."""
+    ops = [o.strip() for o in text.split(",") if o.strip()]
+    unknown = [o for o in ops if o not in INJECT_DELAY_OPS]
+    if not ops or unknown:
+        raise ValueError(f"--ops must name at least one of "
+                         f"{', '.join(INJECT_DELAY_OPS)}"
+                         + (f"; unknown: {', '.join(unknown)}" if unknown
+                            else ""))
+    return ops
+
+
 # A delay rule is a plain dict matching InjectDelayRuleOptions in
 # qapi/block-core.json: 'id' plus any of 'ops', 'sector', 'count',
 # 'probability', 'delay-ms', 'delay-max-ms', 'stall', 'errno' and

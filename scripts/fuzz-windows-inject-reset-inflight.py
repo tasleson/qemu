@@ -101,8 +101,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # pylint: disable=wrong-import-position
 from vioscsi_soak_common import (TMF_SUBTYPES, VM_DIR, SoakContext,
                                  SoakStrategy, add_common_args,
-                                 arm_delay_rules, qmp_call, run_soak_main,
-                                 usage_note, utc_now)
+                                 arm_delay_rules, parse_delay_ops, qmp_call,
+                                 run_soak_main, usage_note, utc_now)
 
 SOAK_DIR = VM_DIR / "soak-reset-inflight"
 
@@ -121,9 +121,6 @@ BASELINE_RULE_ID = "baseline"
 # Trace buses are named "scsi<N>.0" (see LunSpec.adapter); the adapter
 # number is all this harness reports.
 BUS_RE = re.compile(r"scsi(\d+)")
-
-# The rule ops --ops accepts: InjectDelayOp in qapi/block-core.json.
-INJECT_DELAY_OPS = ("read", "write", "flush", "discard", "write-zeroes")
 
 # How long the stalled set may sit before the guest is expected to have
 # reset the adapter, and the floor under max_hold_ms(). Storport's
@@ -542,16 +539,10 @@ def main() -> int:
         print("Error: --release-after-reset-ms must be >= 0.", file=sys.stderr)
         return 1
 
-    ops = [o.strip() for o in args.ops.split(",") if o.strip()]
-    # Checked here rather than left to QEMU: an empty list on '-blockdev'
-    # silently means every op, and over QMP (--fill-wait) a bad name only
-    # fails once the whole fill has been waited out.
-    unknown = [o for o in ops if o not in INJECT_DELAY_OPS]
-    if not ops or unknown:
-        print(f"Error: --ops must name at least one of "
-              f"{', '.join(INJECT_DELAY_OPS)}"
-              + (f"; unknown: {', '.join(unknown)}" if unknown else "")
-              + ".", file=sys.stderr)
+    try:
+        ops = parse_delay_ops(args.ops)
+    except ValueError as exc:
+        print(f"Error: {exc}.", file=sys.stderr)
         return 1
     total_luns = args.adapters * args.targets * args.luns_per_target
     stop = (f"{args.cycles} reset cycle(s)" if args.cycles
