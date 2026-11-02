@@ -93,10 +93,8 @@ import hashlib
 import itertools
 import json
 import os
-import random
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -115,15 +113,15 @@ from vioscsi_soak_common import (AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
                                  DUMP_POLL_INTERVAL_S, DUMP_START_TIMEOUT_S,
                                  DUMP_TIMEOUT_S, MIN_WRITE_OPS_PER_S,
                                  OVMF_CODE, OVMF_VARS, POLL_INTERVAL_S, PS_EXE,
-                                 QEMU_BIN, QEMU_IMG, QEMU_SRC, QGA_SENTINEL,
+                                 QEMU_BIN, QEMU_IMG, QEMU_SRC,
                                  QMP_CMD_TIMEOUT_S, STACK_CAPTURE_TIMEOUT_S,
                                  STATIC_SCREEN_THRESHOLD_S, VM_DIR,
                                  WRITER_BLOCK_BYTES, WRITER_QUEUE_DEPTH,
-                                 WRITER_THREADS, _qga_request, b64_text,
+                                 WRITER_THREADS, b64_text,
                                  build_writer_script, clone_tpm_state,
                                  connect_qmp, encode_ps, load_qmp_module,
-                                 make_overlay,
-                                 other_swtpm_pids, record_run_error)
+                                 make_overlay, other_swtpm_pids, qga_call,
+                                 qga_ping, record_run_error)
 
 FUZZ_DIR = VM_DIR / "fuzz-scsi-reset"
 # Outcomes that are a crash candidate: the guest, its disks or QEMU did not
@@ -193,72 +191,9 @@ Environment overrides for running on different machines:
 
 # ------------------------------------------------------------------
 # QEMU guest agent client (JSON lines over its own virtio-serial socket,
-# separate from the main QMP protocol/socket)
+# separate from the main QMP protocol/socket). These keep this harness's
+# None-on-failure contract over the shared, resyncing qga_call.
 # ------------------------------------------------------------------
-
-
-def _qga_replies(s: socket.socket, deadline: float):
-    """Yield each reply the agent sends on the socket until the deadline."""
-    buf = b""
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        s.settimeout(remaining)
-        try:
-            chunk = s.recv(65536)
-        except socket.timeout:
-            return
-        if not chunk:
-            return
-        # The sentinel only marks where a reply starts, so treating it as
-        # a line break also throws away any half-written stale reply.
-        buf += chunk.replace(QGA_SENTINEL, b"\n")
-        *lines, buf = buf.split(b"\n")
-        for line in lines:
-            try:
-                resp = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(resp, dict) and ("return" in resp or "error" in resp):
-                yield resp
-
-
-def qga_call(sock_path: Path, execute: str, arguments: Optional[dict] = None,
-             timeout: float = 5.0) -> Optional[dict]:
-    """Run one guest agent command and return its reply, or None.
-
-    The agent's virtio-serial channel outlives our connection: a reply to
-    a request whose client gave up -- timed out, or asked while the VM was
-    paused -- is still delivered, to whoever connects next, and would be
-    taken for the answer to the next command. So first synchronize with
-    guest-sync-delimited, as the agent's protocol asks, and drop
-    everything up to the echo of our own token. The agent answers in
-    order, so the next reply after that is ours.
-    """
-    deadline = time.monotonic() + timeout
-    token = random.getrandbits(63)
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(str(sock_path))
-            replies = _qga_replies(s, deadline)
-            s.sendall(QGA_SENTINEL +
-                      _qga_request("guest-sync-delimited", {"id": token}))
-            for resp in replies:
-                if resp.get("return") == token:
-                    break
-            else:
-                return None
-            s.sendall(_qga_request(execute, arguments))
-            return next(replies, None)
-    except (OSError, ConnectionError):
-        return None
-
-
-def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
-    resp = qga_call(sock_path, "guest-ping", timeout=timeout)
-    return resp is not None and "return" in resp
 
 
 def qga_exec(sock_path: Path, path: str, args: list, capture: bool,
