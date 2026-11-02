@@ -78,6 +78,11 @@ WRITER_IO_ERROR_SIGNATURES = ("io_u error", "input/output error",
 FAILURE_OUTCOMES = ("crash-suspected", "qemu-exited", "error",
                     "guest-panicked", "data-corruption", "io-error",
                     "writer-exited", "fill-failed")
+# Outcomes that are a clean finish: the run did what it set out to and
+# found nothing, so its overlays and LUN images are not worth keeping.
+# "cycles-complete" is a strategy stopping early on purpose (see
+# SoakStrategy.on_tick), not a failure.
+CLEAN_OUTCOMES = ("completed", "cycles-complete")
 DEFAULT_VIOSCSI_TELEMETRY_SCRIPT = r"C:\test\GetVioScsiTelemetry.ps1"
 VIOSCSI_TELEMETRY_TIMEOUT_S = 60
 WRITER_STOP_TIMEOUT_S = 30
@@ -3379,6 +3384,13 @@ def run_soak(soak_dir: Path,
             # below decides what to keep from this same dict.
             tick = strategy.on_tick(ctx)
             if tick is not None:
+                # As at the end of the full duration: writers are only
+                # checked at the heartbeat, and collect_vioscsi_telemetry()
+                # below stops them, so one that died since the last
+                # heartbeat would otherwise vanish behind the strategy's
+                # outcome.
+                if writers_failed(time.monotonic() - start):
+                    return result
                 result["elapsed_s"] = time.monotonic() - start
                 record_trace()
                 result["rule_hits"] = rule_hits(qmp, err_nodes)
@@ -3447,7 +3459,7 @@ def run_soak(soak_dir: Path,
 
         keep_debug_artifacts = (keep_all or result.get("telemetry_failure_screenshot")
                                  or result.get("telemetry_failure_dump"))
-        if result["outcome"] == "completed" and not keep_debug_artifacts:
+        if result["outcome"] in CLEAN_OUTCOMES and not keep_debug_artifacts:
             for f in [boot_overlay, vars_overlay, screenshot] + [s.image for s in lun_specs]:
                 f.unlink(missing_ok=True)
         else:
