@@ -521,7 +521,7 @@ def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
         try:
             qmp_call(qmp, "x-inject-error-delay-remove", node_name=node, id=node)
         except RuntimeError:
-            pass  # already removed after the cycle's release
+            pass  # already removed by this cycle
         except Exception as exc:
             # A QMP timeout or a dead monitor: QEMU is the thing in trouble,
             # so don't wait out the timeout once per node, and don't let it
@@ -1040,23 +1040,26 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
             cyc["hits_per_node"] = rule_hits(qmp, err_nodes)
 
             for spec in lun_specs:
-                try:
-                    qmp_call(qmp, "x-inject-error-delay-release", node_name=spec.err_node,
-                             disposition="complete")
-                except Exception as exc:
-                    print(f"    release on {spec.err_node} failed: {exc}", file=sys.stderr)
                 # release only completes the requests currently *held*; the
                 # named rule itself stays installed. Remove it too, so (a) the
-                # writers' new I/O during recovery/settle isn't immediately
-                # re-stalled by the still-armed rule, and (b) the next cycle's
-                # re-arm doesn't fail with "a delay rule ... already exists".
-                # Order matters: release first (wakes held requests), then
-                # remove (delay-remove leaves already-held requests untouched).
+                # writers' new I/O during recovery/settle isn't re-stalled by
+                # the still-armed rule, and (b) the next cycle's re-arm
+                # doesn't fail with "a delay rule ... already exists".
+                # Order matters: remove first, then release. delay-remove
+                # leaves already-held requests untouched, so releasing first
+                # would let the writers, woken by those completions, issue
+                # new I/O into the still-armed rule, and the remove would
+                # then strand it held with nothing left to release it.
                 try:
                     qmp_call(qmp, "x-inject-error-delay-remove", node_name=spec.err_node,
                              id=spec.err_node)
                 except Exception as exc:
                     print(f"    remove on {spec.err_node} failed: {exc}", file=sys.stderr)
+                try:
+                    qmp_call(qmp, "x-inject-error-delay-release", node_name=spec.err_node,
+                             disposition="complete")
+                except Exception as exc:
+                    print(f"    release on {spec.err_node} failed: {exc}", file=sys.stderr)
 
             # Recovery = the virtio-scsi disks actually resume completing writes,
             # not the guest agent responding. Poll the write counters until I/O
