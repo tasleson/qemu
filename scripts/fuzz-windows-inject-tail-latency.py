@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
 from vioscsi_soak_common import (VM_DIR, SoakStrategy, add_common_args,
-                                 run_soak_main, usage_note)
+                                 parse_delay_ops, run_soak_main, usage_note)
 
 SOAK_DIR = VM_DIR / "soak-tail-latency"
 
@@ -117,8 +117,21 @@ def main() -> int:
     if not (0.0 <= args.probability <= 1.0):
         print("Error: --probability must be between 0.0 and 1.0.", file=sys.stderr)
         return 1
+    # All checked up front: over QMP (--fill-wait) a bad rule only fails
+    # once the whole fill has been waited out.
+    if args.delay_ms < 0 or args.delay_max_ms < 0:
+        print("Error: --delay-ms and --delay-max-ms must be >= 0.",
+              file=sys.stderr)
+        return 1
+    if args.delay_max_ms < args.delay_ms:
+        print("Error: --delay-max-ms must be >= --delay-ms.", file=sys.stderr)
+        return 1
+    try:
+        ops = parse_delay_ops(args.ops)
+    except ValueError as exc:
+        print(f"Error: {exc}.", file=sys.stderr)
+        return 1
 
-    ops = [o.strip() for o in args.ops.split(",") if o.strip()]
     total_luns = args.adapters * args.targets * args.luns_per_target
     banner = (f"Starting {args.duration_hours:.1f}h tail-latency soak: "
               f"{args.probability * 100:.1f}% of {ops} ops on "
