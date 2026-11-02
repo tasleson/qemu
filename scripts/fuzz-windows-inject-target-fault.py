@@ -1525,7 +1525,6 @@ class FaultCycler:
                "adapter": adapter, "target": target,
                "device": f"scsi{adapter}", "fault_id": fault["id"],
                "fault": fault, "armed_at": utc_now(),
-               "armed_epoch": time.time(),
                "armed_s": round(now - self.start, 1),
                "armed_t": now, "end_t": now + sc.limit_s(self.settings)}
         trace = CycleTrace(f"scsi{adapter}.0", target, fault["id"],
@@ -1549,6 +1548,10 @@ class FaultCycler:
                                  f"in a row, last: {exc!r}")
                 raise FaultArmError(f"target faults: {self.disarmed}")
             return
+        # Taken on the reply, not before the call: a busy monitor can sit
+        # on the command for seconds before running it, while the reply
+        # lags the install only by its transit back to us.
+        cur["armed_epoch"] = time.time()
         self._arm_failures = 0
         self.current = cur
         # A baseline, in case the guest clears it before the next tick.
