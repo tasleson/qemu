@@ -1231,6 +1231,11 @@ def clone_tpm_state(run_dir: Path) -> Path:
 
 
 def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
+    # swtpm's unixio ctrl channel carries both control and TPM data over
+    # the one connection from QEMU, and swtpm exits once that connection
+    # closes -- regardless of '--terminate', whose doc text is specific
+    # to a TCP data channel and doesn't keep a unixio ctrl channel alive
+    # across reconnects. So a fresh swtpm instance is required per VM launch.
     local_tpm_dir = clone_tpm_state(run_dir)
     if tpm_sock.exists():
         tpm_sock.unlink()

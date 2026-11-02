@@ -39,13 +39,12 @@ import hashlib
 import json
 import random
 import re
-import socket
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 # The shared machinery lives next to this script, which is not necessarily
 # the directory the harness is run from.
@@ -53,19 +52,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
 from vioscsi_soak_common import (BOOT_DISK, OVMF_CODE, OVMF_VARS, QEMU_BIN,
-                                 QEMU_BUILD, QEMU_IMG, QMP_CMD_TIMEOUT_S,
-                                 VM_DIR, clone_tpm_state)
+                                 QEMU_BUILD, QEMU_IMG, VM_DIR, connect_qmp,
+                                 qga_ping, qmp_call, start_swtpm)
 
 FUZZ_DIR = VM_DIR / "fuzz"
-TPM_SOCK = VM_DIR / "swtpm-fuzz.sock"
 
 RAM = "8G"
 CPUS = "4"
-
-# Approximate I/O mix seen crossing the inject-error boot-disk node during
-# a full Windows 11 boot (267k-line trace, see ~/virtio_debug); used only
-# to size the per-rule 'max-hits' safety cap below, not to scope 'ops'.
-REQUEST_COUNTS = {"read": 33550, "write": 2917, "flush": 293}
 
 # How much *added* latency a single rule is allowed to contribute in the
 # worst case (max-hits * delay), independent of how many requests the
@@ -364,42 +357,6 @@ GENERATORS: dict = {
 }
 
 
-# ------------------------------------------------------------------
-# QEMU guest agent client (separate protocol/socket from QMP)
-# ------------------------------------------------------------------
-
-
-def qga_ping(sock_path: Path, timeout: float = 2.0) -> bool:
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(str(sock_path))
-            s.sendall(b'{"execute":"guest-ping"}\n')
-            buf = b""
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                try:
-                    chunk = s.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                for line in buf.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(msg, dict) and "return" in msg:
-                        return True
-    except (OSError, ConnectionError):
-        return False
-    return False
-
-
 class VirtioHandoffTracker:
     """Watches a '-trace virtio_set_status,file=...' log to detect the
     moment the boot disk's virtio device is taken over by the guest's own
@@ -473,28 +430,6 @@ def make_overlay(golden: Path, dest: Path) -> None:
                    check=True, capture_output=True)
 
 
-def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:
-    # swtpm's unixio ctrl channel carries both control and TPM data over
-    # the one connection from QEMU, and swtpm exits once that connection
-    # closes -- regardless of '--terminate', whose doc text is specific
-    # to a TCP data channel and doesn't keep a unixio ctrl channel alive
-    # across reconnects. So a fresh swtpm instance is required per VM launch.
-    local_tpm_dir = clone_tpm_state(run_dir)
-    if tpm_sock.exists():
-        tpm_sock.unlink()
-    proc = subprocess.Popen([
-        "swtpm", "socket",
-        "--tpmstate", f"dir={local_tpm_dir}",
-        "--ctrl", f"type=unixio,path={tpm_sock}",
-        "--tpm2",
-    ])
-    for _ in range(50):
-        if tpm_sock.exists():
-            return proc
-        time.sleep(0.1)
-    raise RuntimeError("swtpm did not create its control socket")
-
-
 def build_qemu_argv(boot_overlay: Path, vars_overlay: Path,
                      qmp_sock: Path, qga_sock: Path, serial_log: Path,
                      tpm_sock: Path, trace_path: Path, rule: dict, seed: int) -> list:
@@ -528,20 +463,6 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path,
         "-blockdev", inject_opts,
         "-device", "virtio-blk-pci,drive=err0,bootindex=0,id=disk0",
     ]
-
-
-def qmp_call(qmp, name: str, **kwargs) -> Any:
-    # QEMUMonitorProtocol.cmd() passes kwargs straight through as QMP
-    # argument names, but our QMP commands use hyphenated field names
-    # (e.g. 'node-name') that can't be spelled as Python keyword args.
-    args = {k.replace("_", "-"): v for k, v in kwargs.items()}
-    msg = {"execute": name}
-    if args:
-        msg["arguments"] = args
-    resp = qmp.cmd_obj(msg)
-    if "error" in resp:
-        raise RuntimeError(f"{name}: {resp['error']}")
-    return resp.get("return")
 
 
 def screendump_hash(qmp, path: Path) -> Optional[str]:
@@ -590,9 +511,8 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
             "actions": [dataclasses.asdict(a) for a in tc.actions], "argv": argv}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    swtpm = start_swtpm(run_dir, tpm_sock)
-    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+    swtpm: Optional[subprocess.Popen] = None
+    proc: Optional[subprocess.Popen] = None
     qmp = None
     result = {"category": tc.category, "label": tc.label, "outcome": "error",
               "elapsed_s": 0.0, "run_dir": str(run_dir)}
@@ -611,15 +531,20 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
     kernel_confirmed_t: Optional[float] = None
 
     try:
-        for _ in range(50):
-            if qmp_sock.exists():
-                break
-            time.sleep(0.1)
-        qmp = qmp_module.QEMUMonitorProtocol(str(qmp_sock))
-        qmp.connect()
-        qmp.settimeout(QMP_CMD_TIMEOUT_S)
+        try:
+            swtpm = start_swtpm(run_dir, tpm_sock)
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            qmp = connect_qmp(
+                qmp_module, qmp_sock, proc,
+                lambda context: RuntimeError(
+                    f"QEMU exited early (code {proc.returncode}) {context}"))
+        except Exception as exc:  # pylint: disable=broad-except
+            # One case that never got going is not worth the whole grid.
+            result["error"] = str(exc) or repr(exc)
+            result["elapsed_s"] = time.monotonic() - start
 
-        while True:
+        while qmp is not None:
             now = time.monotonic()
             elapsed = now - start
 
@@ -697,22 +622,24 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
                 qmp_call(qmp, "quit")
         except Exception:
             pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        if proc is not None:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         if qmp is not None:
             try:
                 qmp.close()
             except Exception:
                 pass
-        swtpm.terminate()
-        try:
-            swtpm.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            swtpm.kill()
-            swtpm.wait()
+        if swtpm is not None:
+            swtpm.terminate()
+            try:
+                swtpm.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                swtpm.kill()
+                swtpm.wait()
 
     if result["outcome"] == "boot-ok":
         for f in (boot_overlay, vars_overlay, screenshot, trace_path):
