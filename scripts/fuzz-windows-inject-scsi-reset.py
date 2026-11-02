@@ -671,6 +671,10 @@ _TMF_DELAY_RE = re.compile(
     r"virtio_scsi_tmf_delay target=(\d+) lun=(\d+) tag=(0x[0-9a-f]+) delay_ms=(\d+)")
 _TMF_RESP_RE = re.compile(
     r"virtio_scsi_tmf_resp (?:target=(\d+) )?lun=(\d+) tag=(0x[0-9a-f]+).*response=(\d+)")
+# A device reset drops every held TMF unanswered (virtio_scsi_drop_held_tmfs),
+# so it never gets a tmf_resp.
+_TMF_DROP_RE = re.compile(
+    r"virtio_scsi_tmf_drop target=(\d+) lun=(\d+) tag=(0x[0-9a-f]+)")
 
 
 def scan_reset_events(trace_path: Optional[Path]) -> Optional[dict]:
@@ -732,6 +736,11 @@ def scan_reset_events(trace_path: Optional[Path]) -> Optional[dict]:
                     resps_by_code[response] = resps_by_code.get(response, 0) + 1
                     if target_s is not None:
                         held_tags_by_target.get(target_s, set()).discard(tag)
+                    continue
+                m = _TMF_DROP_RE.search(line)
+                if m:
+                    target_s, _lun_s, tag = m.groups()
+                    held_tags_by_target.get(target_s, set()).discard(tag)
     except OSError:
         return None
     return {"tmf_reqs": total_reqs, "by_target": by_target,

@@ -26,6 +26,7 @@ virtio_scsi_cmd_resp
 virtio_scsi_tmf_req
 virtio_scsi_tmf_resp
 virtio_scsi_tmf_delay
+virtio_scsi_tmf_drop
 
 # Generic SCSI layer: every parsed command, including SYNCHRONIZE CACHE
 scsi_req_parsed
