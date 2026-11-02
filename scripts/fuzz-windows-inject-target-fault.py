@@ -74,7 +74,8 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  DEFAULT_HEARTBEAT_S, DEFAULT_RAM,
                                  DEFAULT_VIOSCSI_TELEMETRY_SCRIPT, DIAG_EVENTS,
                                  DUMP_POLL_INTERVAL_S, DUMP_START_TIMEOUT_S,
-                                 DUMP_TIMEOUT_S, GUEST_EXEC_TIMEOUT_S,
+                                 DUMP_TIMEOUT_S, FAILURE_OUTCOMES,
+                                 GUEST_EXEC_TIMEOUT_S,
                                  GuestExecError, IO_PROBE_ATTEMPTS,
                                  IO_STALL_MARGIN_S, LAUNCH_PROBE_INTERVAL_S,
                                  MIN_WRITE_OPS_PER_S, NoReplyError, OVMF_CODE,
@@ -101,6 +102,7 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  first_sight, load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
                                  qga_call, qga_exec, qga_exec_wait, qga_ping,
+                                 record_run_error,
                                  start_swtpm, utc_now, wall_time)
 
 SOAK_DIR = VM_DIR / "soak-target-fault"
@@ -2575,8 +2577,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         return result
 
     except Exception as exc:
-        result["outcome"] = "error"
-        result["error"] = str(exc)
+        record_run_error(result, exc)
         # A ring that breaks before the soak loop watches for it -- during
         # writer launch, say -- pauses the VM, and what fails is the agent
         # call stuck behind the pause. Dump it anyway: a paused guest is
@@ -2905,8 +2906,7 @@ def main() -> int:
     print()
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
     print(f"Result written to {results_path}")
-    if result["outcome"] in ("crash-suspected", "qemu-exited", "error",
-                             "data-corruption"):
+    if result["outcome"] in FAILURE_OUTCOMES:
         print(f"Artifacts in {result['run_dir']}")
         return 1
     return 0

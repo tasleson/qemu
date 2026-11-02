@@ -603,6 +603,11 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
     handoff_tracker = VirtioHandoffTracker(trace_path)
     handoff_t: Optional[float] = None
     rule_armed = tc.arm_rule_at != "handoff"
+    # The injection waits on the handoff if its rule is armed there or any
+    # action is timed from it; without a handoff nothing was injected.
+    needs_handoff = ((tc.arm_rule_at == "handoff" and bool(tc.rule))
+                     or any(a.relative_to == "handoff" for a in tc.actions))
+    inject_errors: list = []
     kernel_confirmed_t: Optional[float] = None
 
     try:
@@ -628,6 +633,7 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
                         qmp_call(qmp, "x-inject-error-delay-add", node_name="err0", rule=tc.rule)
                     except Exception as exc:
                         print(f"    delay-add failed: {exc}", file=sys.stderr)
+                        inject_errors.append(f"delay-add: {exc}")
                 rule_armed = True
 
             ready, still_pending = [], []
@@ -643,9 +649,24 @@ def run_case(tc: TestCase, run_id: int, qmp_module) -> dict:
                     dispatch_action(qmp, action)
                 except Exception as exc:
                     print(f"    action {action.kind} failed: {exc}", file=sys.stderr)
+                    inject_errors.append(f"{action.kind}: {exc}")
 
-            if qga_ping(qga_sock):
-                result["outcome"] = "boot-ok"
+            # A boot that never saw the injection it was meant to survive
+            # is not a pass: report it rather than deleting its artifacts.
+            if inject_errors:
+                result["outcome"] = "inject-failed"
+                result["inject_errors"] = inject_errors
+                result["elapsed_s"] = elapsed
+                break
+
+            # Hold the verdict until every scheduled action has run: one
+            # stalled write need not block boot, so the agent can answer
+            # before the release/reset race the case exists to test. A boot
+            # that answers before any handoff was seen can never arm, so
+            # settle that one at once rather than running out the clock.
+            missed_handoff = needs_handoff and handoff_t is None
+            if (not pending_actions or missed_handoff) and qga_ping(qga_sock):
+                result["outcome"] = "not-injected" if missed_handoff else "boot-ok"
                 result["elapsed_s"] = elapsed
                 break
 

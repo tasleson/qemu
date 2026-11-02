@@ -76,7 +76,8 @@ WRITER_IO_ERROR_SIGNATURES = ("io_u error", "input/output error",
 # outcomes matter.
 FAILURE_OUTCOMES = ("crash-suspected", "qemu-exited", "error",
                     "guest-panicked", "data-corruption", "io-error",
-                    "writer-exited", "fill-failed")
+                    "writer-exited", "fill-failed", "virtio-broken",
+                    "no-io", "boot-failed")
 # Outcomes that are a clean finish: the run did what it set out to and
 # found nothing, so its overlays and LUN images are not worth keeping.
 # "cycles-complete" is a strategy stopping early on purpose (see
@@ -1220,7 +1221,11 @@ def clone_tpm_state(run_dir: Path) -> Path:
     # Instead, give each run its own copy of that state (never written back),
     # so concurrent soaks each get an independent TPM seeded from the same
     # enrolled state.
+    # The grid harnesses reuse fixed run-NNNN directories across
+    # invocations, so drop any copy a previous run left behind: the state
+    # must start from TPM_DIR every time, never from what a past boot wrote.
     local_dir = run_dir / "tpm"
+    shutil.rmtree(local_dir, ignore_errors=True)
     shutil.copytree(TPM_DIR, local_dir, ignore=shutil.ignore_patterns(".lock"))
     return local_dir
 
@@ -1544,6 +1549,21 @@ def qmp_call(qmp, name: str, **kwargs) -> Any:
     return resp.get("return")
 
 
+def record_run_error(result: dict, exc: BaseException,
+                     findings: tuple = FAILURE_OUTCOMES) -> None:
+    """Record an exception that ended a run. If the run had already reached
+    a finding -- the exception came from the dump or diagnostics that
+    followed it, often a QMP timeout from the same wedged QEMU the finding
+    is about -- keep that verdict and note the error beside it."""
+    # asyncio's TimeoutError stringifies as "", which says nothing.
+    detail = str(exc) or repr(exc)
+    if result.get("outcome") != "error" and result.get("outcome") in findings:
+        result["post_verdict_error"] = detail
+    else:
+        result["outcome"] = "error"
+        result["error"] = detail
+
+
 def screendump_hash(qmp, path: Path) -> Optional[str]:
     try:
         qmp_call(qmp, "screendump", filename=str(path))
@@ -1619,18 +1639,35 @@ def capture_qemu_stacks(pid: int, out: Path) -> None:
     print(f"    QEMU thread stacks saved to {out}", file=sys.stderr)
 
 
+def remove_delay_rules(qmp, err_nodes: list) -> bool:
+    """Remove every delay rule on err_nodes, whatever its id (the
+    strategies name theirs, e.g. reset-inflight's "stall" and "baseline").
+    True if every node answered.
+
+    Never raises: this runs on the way to a dump, usually because QEMU is
+    already in trouble, and a QMP timeout here must not replace the verdict
+    the dump is for. A monitor that stops answering is not asked again."""
+    for node in err_nodes:
+        try:
+            qmp_call(qmp, "x-inject-error-delay-remove", node_name=node)
+        except Exception as exc:
+            print(f"    delay-remove on {node} failed: {exc!r}",
+                  file=sys.stderr)
+            return False
+    return True
+
+
 def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
-                          err_nodes: list) -> bool:
+                          err_nodes: list,
+                          notes: Optional[dict] = None) -> bool:
     # Remove (not release) any still-live delay rule first: stopping the VM
     # to dump drains every block node, which wakes held requests on its own,
     # but leaves the rule installed to catch the flush that follows -- see
     # fuzz-windows-inject-scsi-reset.py's try_dump_guest_memory for the full
     # rationale.
-    for node in err_nodes:
-        try:
-            qmp_call(qmp, "x-inject-error-delay-remove", node_name=node, id=node)
-        except RuntimeError:
-            pass
+    removed = remove_delay_rules(qmp, err_nodes)
+    if notes is not None:
+        notes["delay_rules_removed"] = removed
 
     path.unlink(missing_ok=True)
 
@@ -2257,10 +2294,10 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
         dump_path.unlink(missing_ok=True)
         try:
             diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid,
-                                                 err_nodes)
+                                                 err_nodes, diag)
         except Exception as exc:
-            # A QMP timeout gets through try_dump_guest_memory. The probe's
-            # pings don't need QMP, so don't lose them to it.
+            # Whatever still gets through try_dump_guest_memory, the
+            # probe's pings don't need QMP, so don't lose them to it.
             diag["dump"] = False
             diag["dump_error"] = repr(exc)
         # QEMU creates the file as the dump starts, and stops the VM for
@@ -2385,7 +2422,8 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
     diag["delay_rules_removed"] = True
     diag["dump_at"] = "end"
     persist()
-    diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid, err_nodes)
+    diag["dump"] = try_dump_guest_memory(qmp, dump_path, qemu_pid, err_nodes,
+                                         diag)
     persist()
     return (f"guest agent silent for the whole {probe_s:.0f}s probe; "
             f"{writes_phrase}; guest memory dump "
@@ -2636,9 +2674,8 @@ def run_soak(soak_dir: Path,
               f"guest memory to {break_dump_path}", file=sys.stderr)
         write_status({"elapsed_s": time.monotonic() - start})
         result["break_dump"] = try_dump_guest_memory(
-            qmp, break_dump_path, proc.pid, err_nodes)
+            qmp, break_dump_path, proc.pid, err_nodes, result)
         result["break_dump_path"] = str(break_dump_path)
-        result["delay_rules_removed"] = True
         try:
             qmp_call(qmp, "cont")
         except Exception as exc:
@@ -3438,8 +3475,7 @@ def run_soak(soak_dir: Path,
         return result
 
     except Exception as exc:
-        result["outcome"] = "error"
-        result["error"] = str(exc)
+        record_run_error(result, exc)
         # A ring that breaks before the soak loop watches for it -- during
         # writer launch, say -- pauses the VM, and what fails is the agent
         # call stuck behind the pause. Dump it anyway: a paused guest is

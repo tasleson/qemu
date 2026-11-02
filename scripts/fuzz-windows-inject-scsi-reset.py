@@ -123,9 +123,15 @@ from vioscsi_soak_common import (AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
                                  WRITER_THREADS, _qga_request, b64_text,
                                  build_writer_script, clone_tpm_state,
                                  encode_ps, load_qmp_module, make_overlay,
-                                 other_swtpm_pids)
+                                 other_swtpm_pids, record_run_error)
 
 FUZZ_DIR = VM_DIR / "fuzz-scsi-reset"
+# Outcomes that are a crash candidate: the guest, its disks or QEMU did not
+# come back from the reset race. "recovered" is the only pass; anything
+# else that is not listed here (error, boot-failed, no-io) means the trial
+# never tested the race, which is a failure of the run, not a finding.
+FINDING_OUTCOMES = ("crash-suspected", "qemu-exited",
+                    "recovered-unresponsive", "io-stuck")
 
 TRACE_EVENTS = QEMU_SRC / "scripts" / "windows-storage-trace-events"
 
@@ -581,6 +587,12 @@ def try_dump_guest_memory(qmp, path: Path, qemu_pid: int,
             qmp_call(qmp, "x-inject-error-delay-remove", node_name=node, id=node)
         except RuntimeError:
             pass  # already removed after the cycle's release
+        except Exception as exc:
+            # A QMP timeout or a dead monitor: QEMU is the thing in trouble,
+            # so don't wait out the timeout once per node, and don't let it
+            # replace the verdict this dump is for.
+            print(f"    delay-remove on {node} failed: {exc!r}", file=sys.stderr)
+            break
 
     # A stale dump from a prior run reusing this run dir can be left
     # read-only (observed mode 0400), which makes QEMU's open() for the
@@ -1189,8 +1201,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
         return result
 
     except Exception as exc:
-        result["outcome"] = "error"
-        result["error"] = str(exc)
+        record_run_error(result, exc, FINDING_OUTCOMES)
         result["elapsed_s"] = time.monotonic() - start
         return result
 
@@ -1426,6 +1437,7 @@ def main() -> int:
     print(f"Results: {results_path}")
 
     crashes = []
+    failed = []
     for i, tc in enumerate(cases):
         started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{started_at}] [{i + 1}/{len(cases)}] {tc.label} ... ",
@@ -1441,16 +1453,22 @@ def main() -> int:
         print("    " + telemetry_summary(result))
         with results_path.open("a") as f:
             f.write(json.dumps(result) + "\n")
-        if result["outcome"] in ("crash-suspected", "qemu-exited"):
+        if result["outcome"] in FINDING_OUTCOMES:
             crashes.append(result)
             if args.stop_on_first_crash:
                 break
+        elif result["outcome"] != "recovered":
+            failed.append(result)
 
     print()
-    print(f"Done. {len(crashes)} crash candidate(s) out of {len(cases)}.")
+    print(f"Done. {len(crashes)} crash candidate(s) and {len(failed)} "
+          f"failed trial(s) out of {len(cases)}.")
     for c in crashes:
-        print(f"  {c['label']} -> {c['run_dir']}")
-    return 0
+        print(f"  {c['outcome']}: {c['label']} -> {c['run_dir']}")
+    for c in failed:
+        print(f"  {c['outcome']} (did not test the race): {c['label']} -> "
+              f"{c['run_dir']}")
+    return 1 if crashes or failed else 0
 
 
 if __name__ == "__main__":
