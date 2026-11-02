@@ -85,26 +85,24 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  QMP_CMD_TIMEOUT_S, QTREE_NAME_RE,
                                  QTREE_PORT_RE, RESOLVE_REQUEST,
                                  STATIC_SCREEN_THRESHOLD_S,
-                                 STOP_ON_BROKEN_SETTLE_S, TASKKILL_EXE,
+                                 STOP_ON_BROKEN_SETTLE_S,
                                  TMF_RESPONSES, TMF_SUBTYPES, TMF_TRACE_EVENTS,
                                  TRACE_CONTEXT_LINES, TRACE_FIELD_RE,
                                  TRACE_LINE_RE, VIRTIO_BROKEN_PATTERNS,
                                  VIRTIO_SCSI_QUEUE_KINDS, VM_DIR, WARMUP_S,
                                  WRITER_BLOCK_BYTES, WRITER_DURATION_SLACK_S,
                                  WRITER_LAUNCH_TIMEOUT_S, WRITER_QUEUE_DEPTH,
-                                 WRITER_STDERR_TAIL_CHARS,
-                                 WRITER_STOP_TIMEOUT_S, WRITER_THREADS,
+                                 WRITER_THREADS,
                                  WRITER_WINDOW_BYTES, _covers_luns, _qga_call,
                                  b64_text, build_writer_script,
                                  capture_qemu_stacks,
                                  capture_vioscsi_telemetry, check_prereqs,
-                                 connect_qmp,
-                                 count_guest_processes, explain_break,
-                                 first_sight, load_qmp_module,
+                                 connect_qmp, count_guest_processes,
+                                 explain_break, first_sight, load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
-                                 qga_call, qga_exec, qga_exec_wait, qga_ping,
-                                 record_run_error,
-                                 start_swtpm, utc_now, wall_time)
+                                 qga_exec, qga_exec_wait, qga_ping,
+                                 record_run_error, start_swtpm, stop_writers,
+                                 utc_now, wall_time, writer_states)
 
 SOAK_DIR = VM_DIR / "soak-target-fault"
 
@@ -367,79 +365,6 @@ def fio_diagnostic(qga_sock: Path, fio_path: str, drive_number: int) -> str:
     err = b64_text(status.get("err-data")).strip()
     return (f"fio exitcode={status.get('exitcode')}; "
             f"stdout={out[:400]!r}; stderr={err[:400]!r}")
-
-
-def writer_states(qga_sock: Path, pids: list,
-                   seen: Optional[dict] = None) -> list:
-    """Each writer's exit state, newest poll first.
-
-    The agent answers guest-exec-status for an exited process once: it
-    hands back the exit code and whatever output was captured, then reaps
-    the pid, and every later poll of it fails. So the first poll that says
-    "exited" carries the only copy of that writer's stderr there will ever
-    be, and re-polling would turn a known exit back into an unknown one.
-
-    Pass @seen -- a pid -> state dict the caller keeps across calls -- to
-    make that stick: a pid already known to have exited is answered from
-    it instead of re-polled, and every fresh state is recorded in it.
-    That also spares the agent a round trip per dead writer, which is the
-    bulk of them once a run is failing.
-    """
-    states = []
-    for pid in pids:
-        if seen is not None and seen.get(pid, {}).get("exited"):
-            states.append(seen[pid])
-            continue
-        resp = qga_call(qga_sock, "guest-exec-status", {"pid": pid}, timeout=5.0)
-        ret = resp.get("return", {}) if resp and "return" in resp else {}
-        state = {"pid": pid, "exited": ret.get("exited"),
-                 "exitcode": ret.get("exitcode")}
-        # Only writers launched with captured output (fio) have any, and
-        # the agent hands it back only once the process exits.
-        err = b64_text(ret.get("err-data")).strip()
-        if err:
-            state["stderr_tail"] = err[-WRITER_STDERR_TAIL_CHARS:]
-        if seen is not None:
-            seen[pid] = state
-        states.append(state)
-    return states
-
-
-def wait_for_writers(qga_sock: Path, pids: list, timeout: float,
-                      seen: Optional[dict] = None) -> list:
-    deadline = time.monotonic() + timeout
-    states = writer_states(qga_sock, pids, seen)
-    while time.monotonic() < deadline and any(not s["exited"] for s in states):
-        time.sleep(1.0)
-        states = writer_states(qga_sock, pids, seen)
-    return states
-
-
-def stop_writers(qga_sock: Path, pids: list,
-                  timeout: float = WRITER_STOP_TIMEOUT_S,
-                  seen: Optional[dict] = None) -> list:
-    """Force-stop any writer still running and wait for it to exit.
-
-    Writers are launched with writer_duration, padded well past the
-    monitored test window by WRITER_DURATION_SLACK_S so a slow boot or
-    heartbeat can never starve the back half of a run -- see that constant.
-    Left alone they'd keep hammering the guest with I/O for up to another
-    ~10 minutes after the harness is done watching, which races vioscsi
-    telemetry collection (and anything else run post-test) against a guest
-    still under full write load.
-
-    Pass @seen through so a writer that already exited -- the one that
-    failed verification, say -- keeps the state and stderr it exited with
-    rather than having them replaced by a poll the agent can no longer
-    answer. See writer_states()."""
-    for st in writer_states(qga_sock, pids, seen):
-        if not st["exited"]:
-            try:
-                qga_exec(qga_sock, f"taskkill pid {st['pid']}", TASKKILL_EXE,
-                          ["/F", "/PID", str(st["pid"])], capture=False)
-            except GuestExecError:
-                pass  # best-effort; wait_for_writers reports what survived
-    return wait_for_writers(qga_sock, pids, timeout, seen)
 
 
 # ------------------------------------------------------------------
