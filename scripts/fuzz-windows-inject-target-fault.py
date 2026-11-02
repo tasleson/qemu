@@ -97,7 +97,8 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  b64_text, build_writer_script,
                                  capture_qemu_stacks,
                                  capture_vioscsi_telemetry, check_prereqs,
-                                 connect_qmp, count_guest_processes,
+                                 classify_writer_exit, connect_qmp,
+                                 count_guest_processes,
                                  explain_break, first_sight, load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
                                  qga_exec, qga_exec_wait, qga_ping,
@@ -1941,7 +1942,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # docstring), and leaving them running races the telemetry query
         # against a guest saturated with I/O.
         result["writer_states"] = stop_writers(qga_sock, writer_pids,
-                                                seen=writer_seen)
+                                                seen=writer_seen,
+                                                output_dir=run_dir)
         print(f"    collecting vioscsi telemetry via {vioscsi_telemetry_script}",
               file=sys.stderr)
         ok, msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
@@ -1955,10 +1957,17 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             capture_postmortem()
 
     def writers_failed(elapsed: float) -> bool:
-        """Whether a verifying writer has exited, i.e. read back data that
-        did not match what it wrote. Fills in the whole result -- outcome,
-        error and the evidence the writer left -- and returns True, so the
-        caller only has to return it.
+        """Whether a verifying writer has exited on its own, and why.
+        Fills in the whole result -- outcome, error and the evidence the
+        writer left -- and returns True, so the caller only has to return
+        it.
+
+        The outcome is not assumed: a writer can exit because it read back
+        data that did not match what it wrote, or because a request was
+        failed to it -- which a dead-target or not-recovered fault invites,
+        since storport fails what it gives up on back to fio --
+        and classify_writer_exit() decides which from the evidence. Both
+        end the run; only the first is a data-integrity finding.
 
         Not called on every 2s poll: a writer's exit status is its own
         guest-agent round trip per LUN, far too costly at high LUN counts.
@@ -1969,38 +1978,41 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         if io_driver not in VERIFYING_IO_DRIVERS:
             return False
         exited = [st for st in writer_states(qga_sock, writer_pids,
-                                             writer_seen)
+                                             writer_seen, run_dir)
                   if st["exited"]]
         if not exited:
             return False
-        result["outcome"] = "data-corruption"
+        outcome, why = classify_writer_exit(exited)
+        result["outcome"] = outcome
         result["elapsed_s"] = elapsed
-        # Survives the stop_writers() poll that collect_vioscsi_telemetry()
-        # does below, because writer_seen holds these states and that poll
-        # is answered from it rather than from an agent that has already
-        # reaped the pids. See writer_states().
+        # The writers that ended the run, as against the ones
+        # collect_vioscsi_telemetry() force-stops a moment later. Its
+        # stop_writers() sweep overwrites result["writer_states"] with
+        # every pid, and a killed writer is indistinguishable there from
+        # one that died on its own -- same "exited", same exit code -- so
+        # the set that actually failed has to be recorded under its own
+        # key before that happens.
         result["writer_states"] = exited
+        result["failed_writers"] = [st["pid"] for st in exited]
         # One writer per LUN, so the pids that exited name the LUNs that
-        # failed. The verify message and its offset are in each one's
-        # stderr_tail.
+        # failed. The verify message or the OS error and its offset are in
+        # each one's stderr_tail.
         lost = sorted(writer_luns.get(s["pid"], f"pid {s['pid']}")
                       for s in exited)
         codes = sorted({s["exitcode"] for s in exited},
                        key=lambda c: (c is None, c))
         print(f"    {io_driver} writer(s) exited early (exitcode={codes}) "
-              f"after {elapsed:.0f}s on {lost} -- likely data corruption",
-              file=sys.stderr)
+              f"after {elapsed:.0f}s on {lost} -- {why}", file=sys.stderr)
         result["error"] = (
-            f"{io_driver} writer(s) exited early with verification fatal "
-            f"on the first mismatch -- likely data corruption on: {lost}; "
-            f"see writer_states' stderr_tail for the failing offset(s)")
+            f"{io_driver} writer(s) exited early on {lost}: {why}; see "
+            f"writer_states' stderr_tail for the failing offset(s)")
         # Same postmortem the clean path records, and for more reason: the
         # trace fold and the fault tallies are how many commands the run
         # had held, and how the guest answered, when the data went wrong.
         # Taken over QMP before collect_vioscsi_telemetry(), which stops
         # the writers and may find the agent gone; the disarm is also what
         # lets the surviving writers finish being killed.
-        disarm("data corruption")
+        disarm(outcome)
         record_trace()
         write_status({"elapsed_s": elapsed})
         collect_vioscsi_telemetry()
