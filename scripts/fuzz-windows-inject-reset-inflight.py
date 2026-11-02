@@ -240,7 +240,10 @@ class ResetInflightStrategy(SoakStrategy):
         # before the sample above has already drained the hold, and would
         # be detected next tick with this drained sample as prev_depth.
         # Polling after the sample instead means every reset _new_resets
-        # sees happened after the previous sample.
+        # sees happened after the previous sample. The price is that a
+        # reset landing between this sample and the poll is credited with
+        # the previous one, a tick older: a depth from before the reset,
+        # but not the latest such.
         if ctx.qemu_stderr is not None:
             ctx.qemu_stderr.poll()
         self._do_pending_releases(ctx)
