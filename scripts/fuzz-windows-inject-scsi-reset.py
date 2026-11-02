@@ -116,13 +116,13 @@ from vioscsi_soak_common import (AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
                                  DUMP_TIMEOUT_S, MIN_WRITE_OPS_PER_S,
                                  OVMF_CODE, OVMF_VARS, POLL_INTERVAL_S, PS_EXE,
                                  QEMU_BIN, QEMU_IMG, QEMU_SRC, QGA_SENTINEL,
-                                 QMP_CMD_TIMEOUT_S, QMP_CONNECT_TIMEOUT_S,
-                                 STACK_CAPTURE_TIMEOUT_S,
+                                 QMP_CMD_TIMEOUT_S, STACK_CAPTURE_TIMEOUT_S,
                                  STATIC_SCREEN_THRESHOLD_S, VM_DIR,
                                  WRITER_BLOCK_BYTES, WRITER_QUEUE_DEPTH,
                                  WRITER_THREADS, _qga_request, b64_text,
                                  build_writer_script, clone_tpm_state,
-                                 encode_ps, load_qmp_module, make_overlay,
+                                 connect_qmp, encode_ps, load_qmp_module,
+                                 make_overlay,
                                  other_swtpm_pids, record_run_error)
 
 FUZZ_DIR = VM_DIR / "fuzz-scsi-reset"
@@ -961,46 +961,7 @@ def run_case(tc: ResetRaceCase, run_id: int, luns: int, run_timeout_s: int,
                 msg += f"\nswtpm output:\n{swtpm_output}"
             return RuntimeError(msg)
 
-        qmp_connect_deadline = time.monotonic() + QMP_CONNECT_TIMEOUT_S
-        qmp = qmp_module.QEMUMonitorProtocol(str(qmp_sock))
-        connected = False
-        last_connect_exc: Optional[Exception] = None
-        while time.monotonic() < qmp_connect_deadline:
-            if proc.poll() is not None:
-                raise qemu_died_error("before the QMP connection succeeded")
-            if not qmp_sock.exists():
-                time.sleep(0.1)
-                continue
-            try:
-                qmp.connect()
-                connected = True
-                break
-            except Exception as exc:
-                # QEUMonitorProtocol.connect() wraps the real cause (e.g. a
-                # raw ConnectionRefusedError) in its own qemu.qmp ConnectError
-                # rather than raising it directly, so unwrap via '.exc' (if
-                # present) before deciding whether this is worth retrying.
-                # Under back-to-back trial launches the host can be busy
-                # enough that a freshly-listening QMP socket isn't actually
-                # ready to accept yet -- retry instead of failing on the
-                # first attempt, rather than mistaking host load for a real
-                # QEMU crash. Anything that isn't a plain OSError (e.g. a
-                # genuine protocol/negotiation error) is not a timing issue
-                # and should fail immediately instead of being retried.
-                root_cause = getattr(exc, "exc", exc)
-                if not isinstance(root_cause, OSError):
-                    raise
-                last_connect_exc = exc
-                time.sleep(0.2)
-        if not connected:
-            if proc.poll() is not None:
-                raise qemu_died_error("right after opening the QMP socket")
-            raise RuntimeError(
-                f"could not connect to QMP within {QMP_CONNECT_TIMEOUT_S}s "
-                f"(host may be overloaded from back-to-back trial launches)"
-                + (f": {last_connect_exc}" if last_connect_exc else
-                   " -- QMP socket never appeared"))
-        qmp.settimeout(QMP_CMD_TIMEOUT_S)
+        qmp = connect_qmp(qmp_module, qmp_sock, proc, qemu_died_error)
 
         boot_deadline = start + BOOT_TIMEOUT_S
         booted = False

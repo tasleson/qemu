@@ -82,8 +82,8 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  OVMF_VARS, POLL_INTERVAL_S, QEMU_BIN,
                                  QGA_PORT_SILENCE_CAPTURES, QGA_TRACE_EVENTS,
                                  QGA_TRACE_FIELD_RE, QGA_TRACE_LINE_RE,
-                                 QMP_CMD_TIMEOUT_S, QMP_CONNECT_TIMEOUT_S,
-                                 QTREE_NAME_RE, QTREE_PORT_RE, RESOLVE_REQUEST,
+                                 QMP_CMD_TIMEOUT_S, QTREE_NAME_RE,
+                                 QTREE_PORT_RE, RESOLVE_REQUEST,
                                  STATIC_SCREEN_THRESHOLD_S,
                                  STOP_ON_BROKEN_SETTLE_S, TASKKILL_EXE,
                                  TMF_RESPONSES, TMF_SUBTYPES, TMF_TRACE_EVENTS,
@@ -98,6 +98,7 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  b64_text, build_writer_script,
                                  capture_qemu_stacks,
                                  capture_vioscsi_telemetry, check_prereqs,
+                                 connect_qmp,
                                  count_guest_processes, explain_break,
                                  first_sight, load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
@@ -2194,34 +2195,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 msg += f"\nswtpm output:\n{swtpm_output}"
             return RuntimeError(msg)
 
-        qmp_connect_deadline = time.monotonic() + QMP_CONNECT_TIMEOUT_S
-        qmp = qmp_module.QEMUMonitorProtocol(str(qmp_sock))
-        connected = False
-        last_connect_exc: Optional[Exception] = None
-        while time.monotonic() < qmp_connect_deadline:
-            if proc.poll() is not None:
-                raise qemu_died_error("before the QMP connection succeeded")
-            if not qmp_sock.exists():
-                time.sleep(0.1)
-                continue
-            try:
-                qmp.connect()
-                connected = True
-                break
-            except Exception as exc:
-                root_cause = getattr(exc, "exc", exc)
-                if not isinstance(root_cause, OSError):
-                    raise
-                last_connect_exc = exc
-                time.sleep(0.2)
-        if not connected:
-            if proc.poll() is not None:
-                raise qemu_died_error("right after opening the QMP socket")
-            raise RuntimeError(
-                f"could not connect to QMP within {QMP_CONNECT_TIMEOUT_S}s"
-                + (f": {last_connect_exc}" if last_connect_exc else
-                   " -- QMP socket never appeared"))
-        qmp.settimeout(QMP_CMD_TIMEOUT_S)
+        qmp = connect_qmp(qmp_module, qmp_sock, proc, qemu_died_error)
 
         boot_deadline = start + BOOT_TIMEOUT_S
         booted = False
