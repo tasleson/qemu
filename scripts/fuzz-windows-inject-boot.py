@@ -39,7 +39,6 @@ import hashlib
 import json
 import random
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -48,17 +47,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-QEMU_SRC = Path.home() / "projects/qemu"
-QEMU_BUILD = QEMU_SRC / "build"
-QEMU_BIN = QEMU_BUILD / "qemu-system-x86_64"
-QEMU_IMG = QEMU_BUILD / "qemu-img"
-VM_DIR = Path.home() / "VirtualMachines/qemu/windows_inject"
-FUZZ_DIR = VM_DIR / "fuzz"
+# The shared machinery lives next to this script, which is not necessarily
+# the directory the harness is run from.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BOOT_DISK = VM_DIR / "boot.qcow2"
-OVMF_CODE = Path("/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.qcow2")
-OVMF_VARS = VM_DIR / "OVMF_VARS.qcow2"
-TPM_DIR = VM_DIR / "tpm"
+# pylint: disable=wrong-import-position
+from vioscsi_soak_common import (BOOT_DISK, OVMF_CODE, OVMF_VARS, QEMU_BIN,
+                                 QEMU_BUILD, QEMU_IMG, QMP_CMD_TIMEOUT_S,
+                                 VM_DIR, clone_tpm_state)
+
+FUZZ_DIR = VM_DIR / "fuzz"
 TPM_SOCK = VM_DIR / "swtpm-fuzz.sock"
 
 RAM = "8G"
@@ -76,13 +74,6 @@ RULE_BUDGET_MS = 180_000  # 3 minutes
 
 RUN_TIMEOUT_S = 600  # hard per-run wall-clock cap (10 minutes)
 
-# QEMUMonitorProtocol.cmd_obj() blocks indefinitely by default. Without a
-# per-call timeout, a single hung QMP command (e.g. a screendump or
-# delay-release racing a wedged device under a stall/disconnect injection)
-# stalls the poll loop forever, and RUN_TIMEOUT_S below never gets a chance
-# to fire since that check only runs between QMP calls.
-QMP_CMD_TIMEOUT_S = 15
-
 # OVMF's own VirtioBlkDxe UEFI driver initializes and reads the boot disk
 # long before ntoskrnl.exe/viostor.sys ever run. A 'stall' or 'reset-race'
 # action scheduled off wall-clock time alone can land on that firmware
@@ -97,6 +88,10 @@ QMP_CMD_TIMEOUT_S = 15
 VIRTIO_STATUS_TRACE = "virtio-status.trace"
 VIRTIO_CONFIG_S_DRIVER_OK = 0x04
 
+# Both deliberately override the shared defaults: a boot sweep watches a
+# screen that firmware legitimately leaves static for minutes, so it needs
+# a far longer staleness threshold and no reason to poll as often.
+#
 # Must comfortably exceed RULE_BUDGET_MS: a single rule can legitimately
 # keep one boot screen (e.g. the OVMF/TianoCore "loading Windows Boot
 # Manager" splash, which doesn't animate while firmware slowly reads
@@ -476,17 +471,6 @@ def make_overlay(golden: Path, dest: Path) -> None:
     subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", "-F", "qcow2",
                     "-b", str(golden), str(dest)],
                    check=True, capture_output=True)
-
-
-def clone_tpm_state(run_dir: Path) -> Path:
-    # TPM_DIR holds the persistent state matching the golden image's real
-    # TPM. Point swtpm at a per-run copy rather than TPM_DIR directly, so
-    # concurrent runs don't fight over swtpm's exclusive state-dir lock (a
-    # second swtpm sharing TPM_DIR fails CMD_INIT and kills QEMU with "TPM
-    # result for CMD_INIT: 0x9").
-    local_dir = run_dir / "tpm"
-    shutil.copytree(TPM_DIR, local_dir, ignore=shutil.ignore_patterns(".lock"))
-    return local_dir
 
 
 def start_swtpm(run_dir: Path, tpm_sock: Path) -> subprocess.Popen:

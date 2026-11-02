@@ -128,6 +128,11 @@ GUEST_EXEC_TIMEOUT_S = 120
 WRITER_LAUNCH_TIMEOUT_S = 600
 WARMUP_S = 5.0  # just long enough for guest-exec to actually launch the
                 # writer before the pre-flight probe starts timing itself
+# QEMUMonitorProtocol.cmd_obj() blocks indefinitely by default. Without a
+# per-call timeout, a single hung QMP command (e.g. a screendump or
+# delay-release racing a wedged device under a stall/disconnect injection)
+# stalls the poll loop forever, and the harness's own wall-clock deadlines
+# never get a chance to fire, since they are only checked between QMP calls.
 QMP_CMD_TIMEOUT_S = 15
 QMP_CONNECT_TIMEOUT_S = 30  # generous: back-to-back trial launches can leave
                             # the host busy enough that a freshly-started
