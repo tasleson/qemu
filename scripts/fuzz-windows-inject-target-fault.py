@@ -660,17 +660,20 @@ FAULT_TRACE_EVENTS = ("scsi_fault_add", "scsi_fault_recovery",
                       "scsi_fault_clear")
 FAULT_TRACE_LINE_RE = re.compile(r"^(?:(\S+Z) )?scsi_fault_(\w+) ")
 
-# TMF tracepoints that name a target, and so can be pinned to a fault cycle
+# TMF tracepoints that name a target, and so can be pinned to a fault cycle,
+# plus the adapter reset, which names none but resets every target on the
+# bus -- the faulted one included, when the guest escalates that far
 CYCLE_TMF_EVENTS = ("tmf_req", "tmf_resp", "tmf_hang", "tmf_drop",
-                    "tmf_delay")
+                    "tmf_delay", "reset")
 
 
 class CycleTrace:
     """The trace lines that belong to one fault cycle: TMFs the guest sent
-    to the faulted target, and what the fault made of each recovery
-    attempt (scsi_fault_recovery's action). Fed by QemuStderr while the
-    cycle is watched; lines stamped before the fault was armed are
-    skipped, since QemuStderr only reads the log once per poll."""
+    to the faulted target, adapter resets on its bus, and what the fault
+    made of each recovery attempt (scsi_fault_recovery's action). Fed by
+    QemuStderr while the cycle is watched; lines stamped before the fault
+    was armed are skipped, since QemuStderr only reads the log once per
+    poll."""
 
     def __init__(self, bus: str, target: int, fault_id: str, since: str):
         self.bus = bus
@@ -689,7 +692,7 @@ class CycleTrace:
     def feed_tmf(self, ts: Optional[str], key: str, fields: dict,
                  line: str) -> None:
         if (fields.get("bus") != self.bus
-                or fields.get("target") != str(self.target)
+                or (key != "reset" and fields.get("target") != str(self.target))
                 or not self._current(ts)):
             return
         self.tmf_counts[key] = self.tmf_counts.get(key, 0) + 1
@@ -1696,10 +1699,12 @@ class FaultCycler:
         reqs = ({k.split(":", 1)[1]: n for k, n in tmfs.items()
                  if k.startswith("tmf_req:")}
                 if isinstance(tmfs, dict) else None)
+        resets = tmfs.get("reset") if isinstance(tmfs, dict) else None
         return (head + f"; {held}"
                 + (f", recovery attempts {actions}" if actions else
                    ", no recovery attempts")
-                + (f", TMFs {reqs}" if reqs else ""))
+                + (f", TMFs {reqs}" if reqs else "")
+                + (f", {resets} adapter reset(s)" if resets else ""))
 
     def status(self, now: float) -> dict:
         """For heartbeats."""
