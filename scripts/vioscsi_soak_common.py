@@ -780,9 +780,15 @@ def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
         return qga_exec(qga_sock, what, fio_path,
                          build_fio_args(drive_number, duration_s),
                          capture=True, resyncs=resyncs)
+    # Captured: the script has no steady-state output (nothing is written
+    # unless an iteration's own try/catch swallows a failed write), so
+    # this doesn't accumulate anything in the agent for the life of the
+    # run -- but an uncaught top-level exception (e.g. the initial
+    # File.Open failing) is otherwise a bare exit code with no evidence
+    # of why. See writer_states().
     return ps_exec(qga_sock, what,
                     build_writer_script(drive_number, duration_s),
-                    capture=False, resyncs=resyncs)
+                    capture=True, resyncs=resyncs)
 
 
 def paranoid_writer_name(drive_numbers: list) -> str:
@@ -1034,20 +1040,27 @@ WRITER_STDERR_TAIL_CHARS = 8000
 
 
 def writer_states(qga_sock: Path, pids: list,
-                   seen: Optional[dict] = None) -> list:
+                   seen: Optional[dict] = None,
+                   output_dir: Optional[Path] = None) -> list:
     """Each writer's exit state, newest poll first.
 
     The agent answers guest-exec-status for an exited process once: it
     hands back the exit code and whatever output was captured, then reaps
     the pid, and every later poll of it fails. So the first poll that says
-    "exited" carries the only copy of that writer's stderr there will ever
-    be, and re-polling would turn a known exit back into an unknown one.
+    "exited" carries the only copy of that writer's stdout/stderr there
+    will ever be, and re-polling would turn a known exit back into an
+    unknown one.
 
     Pass @seen -- a pid -> state dict the caller keeps across calls -- to
     make that stick: a pid already known to have exited is answered from
     it instead of re-polled, and every fresh state is recorded in it.
     That also spares the agent a round trip per dead writer, which is the
     bulk of them once a run is failing.
+
+    Pass @output_dir to also save each exited writer's full stdout/stderr
+    as 'writer-<pid>.{stdout,stderr}.log' under it, for a writer launched
+    with captured output. The result only keeps a truncated tail (see
+    WRITER_STDERR_TAIL_CHARS); the file is the whole thing.
     """
     states = []
     for pid in pids:
@@ -1058,10 +1071,17 @@ def writer_states(qga_sock: Path, pids: list,
         ret = resp.get("return", {}) if resp and "return" in resp else {}
         state = {"pid": pid, "exited": ret.get("exited"),
                  "exitcode": ret.get("exitcode")}
-        # Only writers launched with captured output (paranoid.exe, fio)
-        # have any, and the agent hands it back only once the process
-        # exits.
+        # Only writers launched with captured output (paranoid.exe, fio,
+        # powershell) have any, and the agent hands it back only once the
+        # process exits.
+        out = b64_text(ret.get("out-data")).strip()
         err = b64_text(ret.get("err-data")).strip()
+        if state["exited"] and output_dir is not None:
+            for stream_name, text in (("stdout", out), ("stderr", err)):
+                if text:
+                    log_path = output_dir / f"writer-{pid}.{stream_name}.log"
+                    log_path.write_text(text)
+                    state[f"{stream_name}_log"] = str(log_path)
         if err:
             state["stderr_tail"] = err[-WRITER_STDERR_TAIL_CHARS:]
         if seen is not None:
@@ -1097,18 +1117,20 @@ def classify_writer_exit(states: list) -> tuple:
 
 
 def wait_for_writers(qga_sock: Path, pids: list, timeout: float,
-                      seen: Optional[dict] = None) -> list:
+                      seen: Optional[dict] = None,
+                      output_dir: Optional[Path] = None) -> list:
     deadline = time.monotonic() + timeout
-    states = writer_states(qga_sock, pids, seen)
+    states = writer_states(qga_sock, pids, seen, output_dir)
     while time.monotonic() < deadline and any(not s["exited"] for s in states):
         time.sleep(1.0)
-        states = writer_states(qga_sock, pids, seen)
+        states = writer_states(qga_sock, pids, seen, output_dir)
     return states
 
 
 def stop_writers(qga_sock: Path, pids: list,
                   timeout: float = WRITER_STOP_TIMEOUT_S,
-                  seen: Optional[dict] = None) -> list:
+                  seen: Optional[dict] = None,
+                  output_dir: Optional[Path] = None) -> list:
     """Force-stop any writer still running and wait for it to exit.
 
     Writers are launched with writer_duration, padded well past the
@@ -1121,14 +1143,14 @@ def stop_writers(qga_sock: Path, pids: list,
     failed verification, say -- keeps the state and stderr it exited with
     rather than having them replaced by a poll the agent can no longer
     answer. See writer_states()."""
-    for st in writer_states(qga_sock, pids, seen):
+    for st in writer_states(qga_sock, pids, seen, output_dir):
         if not st["exited"]:
             try:
                 qga_exec(qga_sock, f"taskkill pid {st['pid']}", TASKKILL_EXE,
                           ["/F", "/PID", str(st["pid"])], capture=False)
             except GuestExecError:
                 pass  # best-effort; wait_for_writers reports what survived
-    return wait_for_writers(qga_sock, pids, timeout, seen)
+    return wait_for_writers(qga_sock, pids, timeout, seen, output_dir)
 
 
 # ------------------------------------------------------------------
@@ -1325,7 +1347,8 @@ def image_data_bytes(qmp, path: Path, node: str) -> Optional[int]:
 
 def wait_for_fill(qmp, lun_specs: list, target_bytes: int,
                   timeout_s: float, proc: subprocess.Popen, qga_sock: Path,
-                  writer_pids: list, seen: Optional[dict] = None) -> dict:
+                  writer_pids: list, seen: Optional[dict] = None,
+                  output_dir: Optional[Path] = None) -> dict:
     """Block until every LUN image has as many bytes allocated on the host
     as the disk's virtual size -- i.e. the writers' sequential initialize
     pass has touched every cluster -- or until that can no longer happen.
@@ -1364,7 +1387,7 @@ def wait_for_fill(qmp, lun_specs: list, target_bytes: int,
             info["status"] = "qemu-exited"
             return info
         if polls and polls % FILL_WRITER_CHECK_POLLS == 0:
-            states = writer_states(qga_sock, writer_pids, seen)
+            states = writer_states(qga_sock, writer_pids, seen, output_dir)
             if any(st["exited"] for st in states):
                 info["status"] = "writer-exited"
                 info["writer_states"] = states
@@ -2689,7 +2712,8 @@ def run_soak(soak_dir: Path,
         # docstring), and leaving them running races the telemetry query
         # against a guest saturated with I/O.
         result["writer_states"] = stop_writers(qga_sock, writer_pids,
-                                                seen=writer_seen)
+                                                seen=writer_seen,
+                                                output_dir=run_dir)
         print(f"    collecting vioscsi telemetry via {vioscsi_telemetry_script}",
               file=sys.stderr)
         ok, msg = capture_vioscsi_telemetry(qga_sock, vioscsi_telemetry_script,
@@ -2723,7 +2747,7 @@ def run_soak(soak_dir: Path,
         if io_driver not in VERIFYING_IO_DRIVERS:
             return False
         exited = [st for st in writer_states(qga_sock, writer_pids,
-                                             writer_seen)
+                                             writer_seen, run_dir)
                   if st["exited"]]
         if not exited:
             return False
@@ -3067,7 +3091,7 @@ def run_soak(soak_dir: Path,
                   file=sys.stderr)
             fill = wait_for_fill(qmp, lun_specs, target_bytes,
                                  fill_timeout_s, proc, qga_sock,
-                                 writer_pids, writer_seen)
+                                 writer_pids, writer_seen, run_dir)
             result["fill"] = fill
             if fill["status"] == "qemu-exited":
                 raise qemu_died_error("while waiting for the LUNs to fill")
@@ -3119,7 +3143,7 @@ def run_soak(soak_dir: Path,
                 print(f"    no write I/O seen yet (attempt {attempt + 1}/"
                       f"{IO_PROBE_ATTEMPTS}), retrying...", file=sys.stderr)
         result["writer_states"] = writer_states(qga_sock, writer_pids,
-                                                writer_seen)
+                                                writer_seen, run_dir)
         result["pre_test_write_ops_per_s"] = wps_per_lun
         result["pre_test_write_ops_per_s_total"] = round(total_wps, 1)
         if total_wps < MIN_WRITE_OPS_PER_S and not broke_in_preflight:
