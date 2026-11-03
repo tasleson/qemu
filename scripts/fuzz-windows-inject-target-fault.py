@@ -46,8 +46,19 @@
 # at about the same time -- the same burst-then-silence duty cycle the
 # tail-latency harness documents. The other targets carry on, which is what
 # the I/O-stall detector watches while a fault is armed.
+#
+# All of those drivers do raw-disk I/O from an application buffer. The
+# cached-read driver instead formats each LUN NTFS, writes one file bigger
+# than guest RAM to it before the soak, and reads it over and over through
+# the file cache: paging reads into physical pages the memory manager
+# recycles, which is where a read completing after the driver gave up on it
+# would land (see docs/devel/vioscsi-reset-race-investigation.md). Every
+# chunk of those files says which LUN and offset it belongs to, and the
+# readers check each one they read, so such a read is caught both ways: as
+# wrong data in someone else's page, or as a bugcheck.
 
 import argparse
+import base64
 import collections
 import dataclasses
 import hashlib
@@ -57,6 +68,7 @@ import math
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -78,6 +90,8 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  DEFAULT_VIOSCSI_TELEMETRY_SCRIPT, DIAG_EVENTS,
                                  DUMP_POLL_INTERVAL_S, DUMP_START_TIMEOUT_S,
                                  DUMP_TIMEOUT_S, FAILURE_OUTCOMES,
+                                 FILL_POLL_INTERVAL_S,
+                                 FILL_PROGRESS_INTERVAL_S, FILL_STALL_S,
                                  GUEST_EXEC_TIMEOUT_S,
                                  GuestExecError, IO_PROBE_ATTEMPTS,
                                  IO_STALL_MARGIN_S, LAUNCH_PROBE_INTERVAL_S,
@@ -103,7 +117,7 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  classify_writer_exit, connect_qmp,
                                  count_guest_processes,
                                  explain_break, first_sight, guest_panic_info,
-                                 load_qmp_module,
+                                 image_bytes_on_disk, load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
                                  qga_exec, qga_exec_wait, qga_ping,
                                  record_run_error, start_swtpm, stop_writers,
@@ -116,7 +130,11 @@ SOAK_DIR = VM_DIR / "soak-target-fault"
 # mean the data came back wrong rather than the writer merely dying, so
 # only those are polled for it during the soak (see writers_failed).
 # Deliberately narrower than the shared default: this harness does not
-# drive paranoid.exe.
+# drive paranoid.exe. The cached-read loop is not one either: it counts the
+# reads that fail to it, and the chunks that read back wrong, and carries
+# on, so it never exits early and is never classified
+# (classify_writer_exit); its counts are asked for instead
+# (cached_reads_corrupted).
 VERIFYING_IO_DRIVERS = ("fio",)
 # A dump the harness stopped the VM for can outlive DUMP_TIMEOUT_S, and
 # QEMU refuses 'cont' while it runs. How much longer to wait for it to end
@@ -160,6 +178,64 @@ SLOW_DELAY_MS = (5000, 15000)   # slow, but answering well within it
 # How many of a cycle's TMFs are kept verbatim in its record; the rest
 # are only counted.
 CYCLE_TMF_LINES = 40
+# --io-driver=cached-read: each LUN gets an NTFS volume, mounted on a
+# folder rather than a drive letter so any number of LUNs fit, holding one
+# file that is read over and over through the cache manager. The readers
+# report what they have done to a status file each on C:, the SATA boot
+# disk, which no fault can hold.
+CACHED_READ_ROOT = r"C:\vioscsi-soak"
+CACHED_READ_MOUNT_DIR = CACHED_READ_ROOT + r"\mnt"
+CACHED_READ_STATUS_DIR = CACHED_READ_ROOT + r"\status"
+CACHED_READ_FILE_NAME = "data.bin"
+CACHED_READ_CHUNK_BYTES = 1024 * 1024
+# The default file size, as a multiple of guest RAM: each LUN's file on its
+# own has to outgrow the cache, or once a fault holds one target the
+# readers left on the others are served from memory, issue no paging
+# reads, and look to the stall check like a guest gone dark.
+CACHED_READ_RAM_FACTOR = 1.25
+# --ram as QEMU's -m reads it (qemu_ram_bytes), to size the file by.
+QEMU_RAM_RE = re.compile(r"^\s*(\d+(?:\.\d*)?)\s*([BKMGTPE]?)\s*$", re.I)
+QEMU_SIZE_UNITS = {u: 1024**i for i, u in enumerate("BKMGTPE")}
+# The LUN image is the file plus room for NTFS and the partition table.
+CACHED_READ_IMAGE_SLACK_GIB = 1
+# How slowly the fill may go before the harness gives up on it: the
+# images may sit on NFS (see --disk-dir), so allow for a crawl.
+CACHED_READ_FILL_MIN_MIB_S = 4
+CACHED_READ_FILL_BASE_S = 600
+# Formatting goes one LUN at a time (build_cached_read_format_script):
+# how long it may take.
+CACHED_READ_FORMAT_BASE_S = 120
+CACHED_READ_FORMAT_PER_LUN_S = 120
+# Every chunk of a LUN's file says what it is, so a reader can check what
+# it read and, when that is wrong, tell where it came from: it starts with
+# CACHED_READ_HEADER -- magic, format, the run's seed, the LUN's index and
+# serial, and the chunk's index (little-endian) -- and the rest is the
+# LUN's own random template, rotated by CACHED_READ_BODY_STRIDE bytes per
+# chunk so that no two chunks of a file under a PiB hold the same bytes at
+# the same offset (build_cached_read_chunk_ps).
+CACHED_READ_HEADER = struct.Struct("<4sIIIQ32s8x")
+CACHED_READ_MAGIC = b"VSCR"
+CACHED_READ_FORMAT = 1
+CACHED_READ_SEED_AT = 8
+CACHED_READ_CHUNK_INDEX_AT = 16
+CACHED_READ_SERIAL_AT = 24
+CACHED_READ_SERIAL_BYTES = 32
+CACHED_READ_BODY_BYTES = CACHED_READ_CHUNK_BYTES - CACHED_READ_HEADER.size
+CACHED_READ_BODY_STRIDE = 4099  # prime, so it shares no factor with the body
+CACHED_READ_PAGE_BYTES = 4096
+# How often a reader rewrites its status file between errors.
+CACHED_READ_STATUS_EVERY_S = 5
+CACHED_READ_STATUS_TIMEOUT_S = 30
+CACHED_READ_STATUS_RE = re.compile(
+    r"^STATUS (\S+) reads=(\d+) errors=(\d+) mismatches=(\d+) "
+    r"passes=(\d+)\tlast_error=([^\t]*)\tlast_mismatch=([^\t]*)$")
+
+# query-blockstats counters that make up a LUN's I/O for the stall and
+# activity checks. Writes only, unless the workload only reads.
+WRITE_OPS = ("wr_operations",)
+READ_WRITE_OPS = ("rd_operations", "wr_operations")
+IO_DRIVER_OPS = {"cached-read": READ_WRITE_OPS}
+
 # Arming failures in a row before the run gives up: a QEMU without
 # x-scsi-fault-*, or adapters the faults can't find, fail every time.
 MAX_CONSECUTIVE_ARM_FAILURES = 3
@@ -187,10 +263,13 @@ fuzz-windows-inject-scsi-reset.py:
   6. For --io-driver=fio (optional, runs with data-integrity verification):
      copy a Windows fio.exe build into the guest at the path given by
      --fio-path (default: {DEFAULT_FIO_PATH}).
-  7. For vioscsi telemetry collection (optional, on by default): have the
+  7. For --io-driver=cached-read, nothing beyond the Storage cmdlets every
+     Windows has. The LUNs are formatted and the files written before the
+     soak; that takes a while on NFS (progress is printed).
+  8. For vioscsi telemetry collection (optional, on by default): have the
      script given by --vioscsi-telemetry-script (default:
      {DEFAULT_VIOSCSI_TELEMETRY_SCRIPT}) present in the guest.
-  8. Shut down cleanly.
+  9. Shut down cleanly.
 
 Fault scenarios (--scenarios), each armed on one whole target per cycle:
 {scenario_list()}
@@ -311,12 +390,485 @@ def resolve_drive_numbers(qga_sock: Path, serials: list,
     return mapping
 
 
+def qemu_ram_bytes(size: str) -> int:
+    """--ram in bytes, read the way QEMU reads -m: a bare number is MiB,
+    and a B, K, M, G, T, P or E suffix, in either case, says otherwise.
+    ValueError for anything else."""
+    m = QEMU_RAM_RE.match(size)
+    if not m:
+        raise ValueError(f"not a QEMU memory size: {size!r}")
+    return int(float(m.group(1)) * QEMU_SIZE_UNITS[(m.group(2) or "M").upper()])
+
+
+def cached_read_paths(serial: str) -> tuple:
+    """(mount folder, data file, status file) of a cached-read LUN."""
+    mount = f"{CACHED_READ_MOUNT_DIR}\\{serial}"
+    return (mount, f"{mount}\\{CACHED_READ_FILE_NAME}",
+            f"{CACHED_READ_STATUS_DIR}\\{serial}.txt")
+
+
+def cached_read_header(seed: int, lun_index: int, serial: str) -> bytes:
+    """The header every chunk of a LUN's file starts with, chunk index 0
+    (see CACHED_READ_HEADER)."""
+    raw = serial.encode("ascii")
+    if len(raw) > CACHED_READ_SERIAL_BYTES:
+        raise ValueError(f"serial {serial!r} is longer than "
+                         f"{CACHED_READ_SERIAL_BYTES} bytes")
+    return CACHED_READ_HEADER.pack(CACHED_READ_MAGIC, CACHED_READ_FORMAT,
+                                   seed, lun_index, 0, raw)
+
+
+def cached_read_template_seed(seed: int, lun_index: int) -> int:
+    """The System.Random seed of a LUN's chunk body template: the run's
+    seed and the LUN, so no two LUNs of a run, nor two runs, share it."""
+    return (seed ^ (lun_index * 0x9E3779B1)) & 0x7FFFFFFF
+
+
+def cached_read_rotation(chunk: int) -> int:
+    """Where in its LUN's template chunk number chunk's body starts."""
+    return chunk * CACHED_READ_BODY_STRIDE % CACHED_READ_BODY_BYTES
+
+
+def build_cached_read_chunk_ps(seed: int, lun_index: int, serial: str) -> str:
+    """PowerShell defining Build-Chunk $dst $i, which writes chunk $i of a
+    LUN's file into $dst: the LUN's header with $i patched in, then the
+    LUN's template rotated by cached_read_rotation($i). Two array copies
+    and a patch per chunk, so the fill and the reader's check stay cheap
+    in PowerShell; the template is made once, from System.Random seeded
+    with cached_read_template_seed, which the fill and the reader share."""
+    hdr = base64.b64encode(cached_read_header(seed, lun_index,
+                                              serial)).decode("ascii")
+    body = CACHED_READ_BODY_BYTES
+    head = CACHED_READ_HEADER.size
+    return f"""
+$hdr = [Convert]::FromBase64String('{hdr}')
+$tpl = New-Object byte[] {body}
+(New-Object System.Random -ArgumentList {cached_read_template_seed(seed, lun_index)}).NextBytes($tpl)
+function Build-Chunk([byte[]]$dst, [int64]$i) {{
+    [Array]::Copy($hdr, 0, $dst, 0, {head})
+    [Array]::Copy([BitConverter]::GetBytes($i), 0, $dst, {CACHED_READ_CHUNK_INDEX_AT}, 8)
+    $r = [int](($i * {CACHED_READ_BODY_STRIDE}) % {body})
+    [Array]::Copy($tpl, $r, $dst, {head}, {body} - $r)
+    if ($r -gt 0) {{ [Array]::Copy($tpl, 0, $dst, {head + body} - $r, $r) }}
+}}
+"""
+
+
+def build_cached_read_format_script(luns: list) -> str:
+    """Partition and format every cached-read LUN, one after another, and
+    mount each on its folder. luns is (drive number, serial) pairs. Prints
+    FORMATTED for each LUN done, and FAILED with the reason at the first
+    that fails. One at a time: the Storage cmdlets run concurrently on
+    several disks from separate PowerShells are asking for trouble, and
+    formatting is quick next to the fill that follows."""
+    # One ,@(...) per LUN: a lone @(...) inside @() would be flattened.
+    rows = "\n".join(f"$luns += ,@({n}, '{serial}', "
+                     f"'{cached_read_paths(serial)[0]}')"
+                     for n, serial in luns)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$luns = @()
+{rows}
+New-Item -ItemType Directory -Force -Path '{CACHED_READ_STATUS_DIR}' | Out-Null
+foreach ($l in $luns) {{
+    $n, $serial, $mount = $l
+    try {{
+        if ((Get-Disk -Number $n).PartitionStyle -eq 'RAW') {{
+            Initialize-Disk -Number $n -PartitionStyle GPT
+        }}
+        $p = New-Partition -DiskNumber $n -UseMaximumSize
+        Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel $serial -Confirm:$false -Force | Out-Null
+        New-Item -ItemType Directory -Force -Path $mount | Out-Null
+        Add-PartitionAccessPath -DiskNumber $n -PartitionNumber $p.PartitionNumber -AccessPath "$mount\\"
+        Write-Output "FORMATTED $serial"
+    }} catch {{
+        Write-Output "FAILED $serial $($_.Exception.Message)"
+        exit 1
+    }}
+}}
+"""
+
+
+def build_cached_read_fill_script(serial: str, file_bytes: int, seed: int,
+                                  lun_index: int) -> str:
+    """Write the file the reader will read to one formatted LUN, chunk by
+    chunk (build_cached_read_chunk_ps). Prints READY or FAILED with the
+    reason.
+
+    The file has to be written for real: a file only extended (SetLength,
+    fsutil createnew) reads back as zeros from NTFS without touching the
+    disk, past its valid data length, so the reader would never page
+    anything in."""
+    _, data, _ = cached_read_paths(serial)
+    chunks = -(-file_bytes // CACHED_READ_CHUNK_BYTES)
+    return f"""
+$ErrorActionPreference = 'Stop'
+try {{
+{build_cached_read_chunk_ps(seed, lun_index, serial)}
+    $buf = New-Object byte[] {CACHED_READ_CHUNK_BYTES}
+    $fs = New-Object System.IO.FileStream('{data}', [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read, 4096)
+    try {{
+        for ($i = [int64]0; $i -lt {chunks}; $i++) {{
+            Build-Chunk $buf $i
+            $fs.Write($buf, 0, $buf.Length)
+        }}
+        $fs.Flush($true)
+    }} finally {{
+        $fs.Close()
+    }}
+    Write-Output "READY {serial} $((Get-Item '{data}').Length)"
+}} catch {{
+    Write-Output "FAILED {serial} $($_.Exception.Message)"
+    exit 1
+}}
+"""
+
+
+def build_cached_read_script(serial: str, duration_s: float, seed: int,
+                             lun_index: int) -> str:
+    """Read one LUN's file end to end, over and over, through a buffered
+    FileStream: the handle is cached, so every read is the cache manager
+    paging the file in, into whatever physical pages the memory manager
+    hands it. A read that fails -- an in-page error after the driver
+    completed the request with a bus reset, say -- is counted and skipped,
+    never fatal: the loop is there to keep paging I/O going until the
+    harness stops it.
+
+    Each chunk read is checked against what the fill wrote there
+    (Build-Chunk), by comparing SHA-1s, which runs at native speed where
+    a byte loop in PowerShell would not. A chunk that differs is counted
+    as a mismatch, apart from the errors, and described: how many of its
+    pages differ, the first, whether that one is all zeros, and whose
+    chunk header page 0 holds if it isn't this chunk's own. Data from
+    another LUN, or another place in this one, says where a late transfer
+    came from.
+
+    The counts go to the LUN's status file soon after an error or a
+    mismatch and every CACHED_READ_STATUS_EVERY_S otherwise, written to a
+    temporary file and swapped in with File.Replace, so the harness never
+    reads a half-written one. A write that fails (the harness reading the
+    file at that moment, say) is retried on a later pass with the totals
+    as they are then, so no update is lost."""
+    _, data, status = cached_read_paths(serial)
+    tmp = status[:-len(".txt")] + ".tmp"
+    chunk = CACHED_READ_CHUNK_BYTES
+    page = CACHED_READ_PAGE_BYTES
+    pages = chunk // page
+    return f"""
+{build_cached_read_chunk_ps(seed, lun_index, serial)}
+$buf = New-Object byte[] {chunk}
+$exp = New-Object byte[] {chunk}
+$sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+$zeroHash = [BitConverter]::ToString($sha.ComputeHash((New-Object byte[] {page})))
+$reads = [int64]0
+$errors = [int64]0
+$mismatches = [int64]0
+$passes = [int64]0
+$lastError = ''
+$lastMismatch = ''
+$chunk = [int64]0
+$fs = $null
+function Hash-Of([byte[]]$a, [int]$off, [int]$len) {{
+    [BitConverter]::ToString($sha.ComputeHash($a, $off, $len))
+}}
+function Describe-Mismatch([int64]$i, [int]$got) {{
+    if ($got -ne {chunk}) {{
+        return "chunk $i at offset $($i * {chunk}): short read of $got bytes"
+    }}
+    $bad = 0
+    $first = -1
+    for ($p = 0; $p -lt {pages}; $p++) {{
+        if ((Hash-Of $buf ($p * {page}) {page}) -ne (Hash-Of $exp ($p * {page}) {page})) {{
+            $bad++
+            if ($first -lt 0) {{ $first = $p }}
+        }}
+    }}
+    $what = "chunk $i at offset $($i * {chunk}): $bad of {pages} pages differ, first page $first"
+    if ($first -ge 0 -and (Hash-Of $buf ($first * {page}) {page}) -eq $zeroHash) {{
+        $what += ' (all zeros)'
+    }}
+    if ($first -eq 0) {{
+        if ([Text.Encoding]::ASCII.GetString($buf, 0, 4) -eq '{CACHED_READ_MAGIC.decode()}') {{
+            $who = [Text.Encoding]::ASCII.GetString($buf, {CACHED_READ_SERIAL_AT}, {CACHED_READ_SERIAL_BYTES}).TrimEnd([char]0)
+            $what += "; page 0 holds the header of $who chunk $([BitConverter]::ToInt64($buf, {CACHED_READ_CHUNK_INDEX_AT})) seed $([BitConverter]::ToUInt32($buf, {CACHED_READ_SEED_AT}))"
+        }} else {{
+            $what += '; page 0 holds no chunk header'
+        }}
+    }}
+    return $what
+}}
+function Save-Status {{
+    try {{
+        [System.IO.File]::WriteAllText('{tmp}', "reads=$reads errors=$errors mismatches=$mismatches passes=$passes`tlast_error=$lastError`tlast_mismatch=$lastMismatch")
+        if ([System.IO.File]::Exists('{status}')) {{
+            [System.IO.File]::Replace('{tmp}', '{status}', [NullString]::Value)
+        }} else {{
+            [System.IO.File]::Move('{tmp}', '{status}')
+        }}
+        return $true
+    }} catch {{
+        return $false
+    }}
+}}
+$statusDue = -not (Save-Status)
+$lastStatus = Get-Date
+$lastTry = $lastStatus
+$deadline = (Get-Date).AddSeconds({duration_s})
+while ((Get-Date) -lt $deadline) {{
+    try {{
+        if ($fs -eq $null) {{
+            $fs = New-Object System.IO.FileStream('{data}', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::None)
+        }}
+        $fs.Position = $chunk * {chunk}
+        $got = 0
+        while ($got -lt {chunk}) {{
+            $n = $fs.Read($buf, $got, {chunk} - $got)
+            if ($n -le 0) {{ break }}
+            $got += $n
+        }}
+        if ($got -eq 0) {{
+            $chunk = [int64]0
+            $passes++
+        }} else {{
+            $reads++
+            Build-Chunk $exp $chunk
+            if ($got -ne {chunk} -or (Hash-Of $buf 0 {chunk}) -ne (Hash-Of $exp 0 {chunk})) {{
+                $mismatches++
+                $lastMismatch = (Describe-Mismatch $chunk $got) -replace '\\s+', ' '
+                $statusDue = $true
+            }}
+            $chunk++
+        }}
+    }} catch {{
+        $errors++
+        $lastError = $_.Exception.GetBaseException().Message -replace '\\s+', ' '
+        $chunk++
+        if ($fs -ne $null) {{ try {{ $fs.Dispose() }} catch {{ }}; $fs = $null }}
+        $statusDue = $true
+        Start-Sleep -Milliseconds 200
+    }}
+    $now = Get-Date
+    if (($statusDue -or ($now - $lastStatus).TotalSeconds -ge {CACHED_READ_STATUS_EVERY_S}) -and ($now - $lastTry).TotalSeconds -ge 1) {{
+        $lastTry = $now
+        if (Save-Status) {{
+            $statusDue = $false
+            $lastStatus = $now
+        }} else {{
+            $statusDue = $true
+        }}
+    }}
+}}
+if ($fs -ne $null) {{ $fs.Dispose() }}
+for ($try = 0; $try -lt 10 -and -not (Save-Status); $try++) {{ Start-Sleep -Milliseconds 500 }}
+"""
+
+
+def build_cached_read_status_script() -> str:
+    """Print every reader's status file. Opened sharing delete, so a
+    reader swapping in a new one is not refused for it; a file that can't
+    be read right now is left out (the harness keeps what it had)."""
+    return f"""
+Get-ChildItem -Path '{CACHED_READ_STATUS_DIR}' -Filter '*.txt' -ErrorAction SilentlyContinue | ForEach-Object {{
+    try {{
+        $fs = New-Object System.IO.FileStream($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]'ReadWrite, Delete'))
+        try {{
+            $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd()
+        }} finally {{
+            $fs.Dispose()
+        }}
+        Write-Output "STATUS $($_.BaseName) $text"
+    }} catch {{ }}
+}}
+"""
+
+
+def parse_cached_read_status(out: str) -> dict:
+    """serial -> what its reader last wrote to its status file. A line
+    that doesn't parse (an empty or cut-short file) is left out."""
+    status: dict = {}
+    for line in out.splitlines():
+        m = CACHED_READ_STATUS_RE.match(line.rstrip("\r\n"))
+        if m:
+            status[m.group(1)] = {"reads": int(m.group(2)),
+                                  "errors": int(m.group(3)),
+                                  "mismatches": int(m.group(4)),
+                                  "passes": int(m.group(5)),
+                                  "last_error": m.group(6) or None,
+                                  "last_mismatch": m.group(7) or None}
+    return status
+
+
+def read_cached_read_status(qga_sock: Path) -> Optional[dict]:
+    """Every cached-read LUN's status (parse_cached_read_status), or None
+    if the guest agent could not be asked. A reader whose file could not
+    be read is missing, not zero."""
+    try:
+        pid = ps_exec(qga_sock, "cached-read status",
+                      build_cached_read_status_script(), capture=True,
+                      timeout=CACHED_READ_STATUS_TIMEOUT_S)
+        st = qga_exec_wait(qga_sock, pid, timeout=CACHED_READ_STATUS_TIMEOUT_S)
+    except GuestExecError:
+        return None
+    if st is None:
+        return None
+    return parse_cached_read_status(b64_text(st.get("out-data")))
+
+
+class CachedReadStatus:
+    """The last status each cached-read LUN's reader reported. A poll
+    that misses a LUN -- its file being swapped in, or the agent busy --
+    keeps what that LUN said before rather than forgetting it."""
+
+    def __init__(self, qga_sock: Path):
+        self.qga_sock = qga_sock
+        self.luns: dict = {}
+
+    def poll(self) -> bool:
+        """Ask the guest again. False if it couldn't be asked."""
+        status = read_cached_read_status(self.qga_sock)
+        if status is None:
+            return False
+        self.luns.update(status)
+        return True
+
+    def mismatched(self) -> dict:
+        """serial -> (mismatches, the last one) for every LUN with any."""
+        return {serial: (st["mismatches"], st["last_mismatch"])
+                for serial, st in sorted(self.luns.items())
+                if st["mismatches"]}
+
+
+def cached_read_fill_timeout_s(total_bytes: int) -> float:
+    return (CACHED_READ_FILL_BASE_S
+            + total_bytes / (CACHED_READ_FILL_MIN_MIB_S * 1024 * 1024))
+
+
+def _guest_script_result(qga_sock: Path, pid: int) -> Optional[dict]:
+    """exitcode and the tail of the output of a guest script that has
+    exited, or None while it runs."""
+    resp, _, _ = _qga_call(qga_sock, "guest-exec-status", {"pid": pid}, 5.0)
+    ret = (resp or {}).get("return") or {}
+    if not ret.get("exited"):
+        return None
+    out = (b64_text(ret.get("out-data")).strip()
+           or b64_text(ret.get("err-data")).strip())
+    return {"exitcode": ret.get("exitcode"), "output": out[-400:]}
+
+
+def prepare_cached_read(qga_sock: Path, lun_specs: list, drive_numbers: dict,
+                        file_bytes: int, seed: int,
+                        abort: Callable[[], Optional[str]],
+                        resyncs: Optional[list] = None) -> dict:
+    """Format every LUN (build_cached_read_format_script, one LUN at a
+    time), then write every LUN's file at once
+    (build_cached_read_fill_script) and wait for all of them. abort() is
+    asked on every poll and ends the wait with its answer as the status
+    (QEMU gone, the guest bugchecked).
+
+    The fill is the slow part, and the guest only says how it went at the
+    end, so progress comes from the host: how much of the LUN images is
+    allocated, against the files' total. Returns a summary whose 'status'
+    is 'ready' on success, otherwise 'failed', 'stalled', 'timeout' or
+    abort()'s answer."""
+    t0 = time.monotonic()
+    info: dict = {"file_bytes": file_bytes, "seed": seed, "luns": {}}
+    fmt_pid = ps_exec(qga_sock, "cached-read format",
+                      build_cached_read_format_script(
+                          [(drive_numbers[s.serial], s.serial)
+                           for s in lun_specs]),
+                      capture=True, resyncs=resyncs)
+    fmt_deadline = t0 + CACHED_READ_FORMAT_BASE_S + (
+        CACHED_READ_FORMAT_PER_LUN_S * len(lun_specs))
+    while True:
+        fmt = _guest_script_result(qga_sock, fmt_pid)
+        now = time.monotonic()
+        info["elapsed_s"] = round(now - t0, 1)
+        if fmt is not None:
+            info["format"] = fmt
+            if fmt["exitcode"] != 0 or fmt["output"].count(
+                    "FORMATTED") != len(lun_specs):
+                info["status"] = "failed"
+                info["failed"] = {"format": fmt}
+                return info
+            break
+        why = abort()
+        if why is not None:
+            info["status"] = why
+            return info
+        if now >= fmt_deadline:
+            info["status"] = "timeout"
+            return info
+        time.sleep(FILL_POLL_INTERVAL_S)
+
+    pids: dict = {}
+    for index, spec in enumerate(lun_specs):
+        pids[spec.serial] = ps_exec(
+            qga_sock, f"cached-read fill for {spec.serial}",
+            build_cached_read_fill_script(spec.serial, file_bytes, seed,
+                                          index),
+            capture=True, resyncs=resyncs)
+    want = file_bytes * len(lun_specs)
+    t1 = time.monotonic()
+    timeout_s = cached_read_fill_timeout_s(want)
+    info["timeout_s"] = round(timeout_s)
+    last_report = last_growth = t1
+    prev_total = -1
+    while True:
+        for serial, pid in pids.items():
+            if serial not in info["luns"]:
+                done = _guest_script_result(qga_sock, pid)
+                if done is not None:
+                    info["luns"][serial] = done
+        now = time.monotonic()
+        info["elapsed_s"] = round(now - t0, 1)
+        failed = {s: v for s, v in info["luns"].items()
+                  if v["exitcode"] != 0 or "READY" not in v["output"]}
+        if failed:
+            info["status"] = "failed"
+            info["failed"] = failed
+            return info
+        if len(info["luns"]) == len(pids):
+            info["status"] = "ready"
+            return info
+        why = abort()
+        if why is not None:
+            info["status"] = why
+            return info
+        total = sum(image_bytes_on_disk(s.image) for s in lun_specs)
+        info["bytes_on_disk"] = total
+        if total > prev_total:
+            prev_total = total
+            last_growth = now
+        if now - last_growth >= FILL_STALL_S:
+            info["status"] = "stalled"
+            return info
+        if now - t1 >= timeout_s:
+            info["status"] = "timeout"
+            return info
+        if now - last_report >= FILL_PROGRESS_INTERVAL_S:
+            last_report = now
+            print(f"    preparing cached-read LUNs: {total / 1024**3:.1f} of "
+                  f"{want / 1024**3:.1f} GiB on disk, "
+                  f"{len(info['luns'])}/{len(pids)} LUN(s) ready, "
+                  f"{now - t0:.0f}s elapsed", file=sys.stderr)
+        time.sleep(FILL_POLL_INTERVAL_S)
+
+
 def launch_writer(qga_sock: Path, drive_number: int, duration_s: float,
                    io_driver: str = "powershell",
                    diskspd_path: str = DEFAULT_DISKSPD_PATH,
                    fio_path: str = DEFAULT_FIO_PATH,
-                   resyncs: Optional[list] = None) -> int:
+                   resyncs: Optional[list] = None,
+                   serial: Optional[str] = None,
+                   data_seed: int = 0, lun_index: int = 0) -> int:
+    """data_seed and lun_index are the cached-read reader's, which have to
+    match the fill's (prepare_cached_read) for its check to pass."""
     what = f"writer for PhysicalDrive{drive_number}"
+    if io_driver == "cached-read":
+        return ps_exec(qga_sock, f"cached reader for {serial}",
+                       build_cached_read_script(serial, duration_s,
+                                                data_seed, lun_index),
+                       capture=False, resyncs=resyncs)
     if io_driver == "diskspd":
         return qga_exec(qga_sock, what, diskspd_path,
                          build_diskspd_args(drive_number, duration_s),
@@ -959,8 +1511,10 @@ class QemuStderr:
         recent.append(line)
 
 
-def write_ops_by_node(qmp) -> dict:
-    """identifier -> cumulative completed write operations. See
+def write_ops_by_node(qmp, counted: tuple = WRITE_OPS) -> dict:
+    """identifier -> cumulative completed write operations, or the sum of
+    whichever query-blockstats counters counted names (IO_DRIVER_OPS: a
+    workload that only reads has to be judged by its reads). See
     fuzz-windows-inject-scsi-reset.py's write_ops_by_node for why both
     query-blockstats views (device/qdev accounting lives on the
     BlockBackend, not the per-node view) have to be merged."""
@@ -972,7 +1526,8 @@ def write_ops_by_node(qmp) -> dict:
         except Exception:
             continue
         for entry in stats:
-            wr = entry.get("stats", {}).get("wr_operations", 0)
+            st = entry.get("stats", {})
+            wr = sum(st.get(c, 0) for c in counted)
             for key in ("device", "qdev", "node-name"):
                 ident = entry.get(key)
                 if ident:
@@ -1005,6 +1560,9 @@ class IoProgress:
     left out for the one sample in which it does: what completes on it
     then is the commands the fault released, which QEMU runs whether or
     not the guest is alive.
+
+    With --io-driver=cached-read the samples count reads as well (see
+    IO_DRIVER_OPS), since that workload does nothing else.
 
     Only the data LUNs count, never the boot disk: it is SATA/AHCI and no
     fault can touch it, so Windows keeps writing to C: -- pagefile, event
@@ -1042,7 +1600,8 @@ class IoProgress:
         return now - self.last_progress_t
 
 
-def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float) -> dict:
+def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float,
+                            counted: tuple = WRITE_OPS) -> dict:
     """Per-adapter liveness, sampled over window_s.
 
     QEMU's virtio_error() messages don't say which device went broken,
@@ -1055,10 +1614,10 @@ def lun_activity_by_adapter(qmp, lun_specs: list, window_s: float) -> dict:
     Only meaningful with every fault removed: a target that is being held
     is quiet on a perfectly healthy adapter. Deciding which adapters are
     dead from these counts is adapters_without_io()'s job -- "zero writes"
-    is not the test."""
-    before = write_ops_by_node(qmp)
+    is not the test. "Writes" are whatever counted says (write_ops_by_node)."""
+    before = write_ops_by_node(qmp, counted)
     time.sleep(window_s)
-    after = write_ops_by_node(qmp)
+    after = write_ops_by_node(qmp, counted)
     out: dict = {}
     for spec in lun_specs:
         a = out.setdefault(f"scsi{spec.adapter}",
@@ -1126,8 +1685,8 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
                             qemu_pid: int, run_dir: Path, lun_specs: list,
                             launched: int, probe_s: float,
                             writer_exe: Optional[str], screenshot: Path,
-                            dump_path: Path, dump_at_failure: bool = False
-                            ) -> str:
+                            dump_path: Path, dump_at_failure: bool = False,
+                            counted: tuple = WRITE_OPS) -> str:
     """Record why the guest agent stopped answering a request before the
     soak -- resolving drives or launching a writer -- into diag, calling
     persist() after each step. Returns a one-line summary.
@@ -1200,7 +1759,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
     samples: list = []
     diag["probe"] = samples
     agent_back_s: Optional[float] = None
-    prev: Optional[dict] = write_ops_by_node(qmp)
+    prev: Optional[dict] = write_ops_by_node(qmp, counted)
     if not _covers_luns(prev, lun_specs):
         prev = None
     # From here, not t0: the stacks alone can take minutes, and probe_s is
@@ -1218,7 +1777,7 @@ def diagnose_launch_failure(diag: dict, persist, qmp, qga_sock: Path,
                                    AGENT_CHECK_TIMEOUT_S)
         agent = resp is not None
         rtt = round(time.monotonic() - ping_t, 2) if agent else None
-        cur = write_ops_by_node(qmp)
+        cur = write_ops_by_node(qmp, counted)
         sample: dict = {"t_s": round(time.monotonic() - t0, 1), "agent": agent,
                         "agent_rtt_s": rtt, "agent_stage": stage}
         if resp is not None and "error" in resp:
@@ -1815,7 +2374,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              ring_diag: bool = True,
              dump_on_agent_stall: bool = False,
              qga_trace: bool = True,
-             hv_crash: bool = True) -> dict:
+             hv_crash: bool = True,
+             cached_read_file_bytes: int = 0) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1823,6 +2383,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     lun_dir = disk_dir if disk_dir is not None else run_dir
     lun_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.json"
+    # What counts as a LUN doing I/O, and what to call its rate.
+    counted = IO_DRIVER_OPS.get(io_driver, WRITE_OPS)
+    ops_unit = "wps" if counted == WRITE_OPS else "ops/s"
 
     boot_overlay = run_dir / "boot.qcow2"
     vars_overlay = run_dir / "vars.qcow2"
@@ -2036,6 +2599,11 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             capture_qga_port("agent silent at the end")
             capture_postmortem()
             return
+        if io_driver == "cached-read":
+            # Before they are stopped: how many reads each reader got
+            # through, how many failed to it and how many read back wrong.
+            cached_read.poll()
+            result["cached_read_status"] = cached_read.luns
         # Stop the writers first: they're still live (see stop_writers'
         # docstring), and leaving them running races the telemetry query
         # against a guest saturated with I/O.
@@ -2072,7 +2640,12 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         Only the heartbeat and the end of the run ask. An exit is always a
         failure for these drivers, never a clean finish, since
         writer_duration outlasts duration_s.
+
+        The cached-read readers never exit early; what they find is asked
+        for instead (cached_reads_corrupted).
         """
+        if io_driver == "cached-read":
+            return cached_reads_corrupted(elapsed)
         if io_driver not in VERIFYING_IO_DRIVERS:
             return False
         exited = [st for st in writer_states(qga_sock, writer_pids,
@@ -2111,6 +2684,34 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # the writers and may find the agent gone; the disarm is also what
         # lets the surviving writers finish being killed.
         disarm(outcome)
+        record_trace()
+        write_status({"elapsed_s": elapsed})
+        collect_vioscsi_telemetry()
+        write_status({"elapsed_s": elapsed})
+        return True
+
+    def cached_reads_corrupted(elapsed: float) -> bool:
+        """Whether a cached-read reader has read back a chunk that is not
+        what the fill wrote there. Like writers_failed: fills in the result
+        as data-corruption and returns True. A failed read is not this --
+        it is counted, and is what a forced bus reset is expected to cause
+        -- but wrong data in a read that succeeded is a data-integrity
+        finding on any run."""
+        cached_read.poll()
+        bad = cached_read.mismatched()
+        if not bad:
+            return False
+        result["outcome"] = "data-corruption"
+        result["elapsed_s"] = elapsed
+        result["cached_read_mismatches"] = {
+            serial: {"mismatches": n, "last": last}
+            for serial, (n, last) in bad.items()}
+        result["error"] = (
+            "cached-read data read back wrong: "
+            + "; ".join(f"{serial}: {n} chunk(s), last {last}"
+                        for serial, (n, last) in bad.items()))
+        print(f"    {result['error']}", file=sys.stderr)
+        disarm("data-corruption")
         record_trace()
         write_status({"elapsed_s": elapsed})
         collect_vioscsi_telemetry()
@@ -2169,11 +2770,24 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             lambda: write_status({"elapsed_s": time.monotonic() - start}),
             qmp, qga_sock, proc.pid, run_dir, lun_specs,
             len(writer_pids), probe_s, writer_exe, screenshot, dump_path,
-            dump_now)
+            dump_now, counted)
         diag["summary"] = summary
         print(f"    {summary}", file=sys.stderr)
         if diag.get("vm_paused"):
             dump_if_stopped_on_broken()
+
+    # A cached-read LUN has to hold its file; otherwise the library's size.
+    lun_image_size: tuple = ()
+    # What the cached-read readers last said, and the seed their files'
+    # contents are made from (see CACHED_READ_HEADER): fresh every run, so
+    # a chunk can't pass for one written by another.
+    cached_read = CachedReadStatus(qga_sock)
+    data_seed = 0
+    if io_driver == "cached-read":
+        image_gib = (-(-cached_read_file_bytes // 1024**3)
+                     + CACHED_READ_IMAGE_SLACK_GIB)
+        lun_image_size = (f"{image_gib}G",)
+        data_seed = random.SystemRandom().randrange(1, 2**31)
 
     try:
         make_overlay(BOOT_DISK, boot_overlay)
@@ -2184,7 +2798,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 for l in range(luns_per_target):
                     tag = f"{a}-{t}-{l}"
                     img = lun_dir / f"lun{tag}-{run_dir.name}.qcow2"
-                    make_blank_image(img)
+                    make_blank_image(img, *lun_image_size)
                     lun_specs.append(LunSpec(
                         adapter=a, target=t, lun=l, image=img,
                         file_node=f"lfile{tag}", fmt_node=f"lraw{tag}",
@@ -2276,6 +2890,38 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                    request_sent_at, exc)
             raise
         result["drive_numbers"] = drive_numbers
+        if io_driver == "cached-read":
+            gib = cached_read_file_bytes / 1024**3
+            allow_s = cached_read_fill_timeout_s(cached_read_file_bytes
+                                                 * total_luns)
+            print(f"    preparing {total_luns} cached-read LUN(s): NTFS and a "
+                  f"{gib:.1f} GiB file on each (allowing up to "
+                  f"{allow_s / 60:.0f} min)", file=sys.stderr)
+
+            def prepare_abort() -> Optional[str]:
+                if proc.poll() is not None:
+                    return "qemu-exited"
+                return "guest-panicked" if guest_panicked() else None
+
+            prep = prepare_cached_read(qga_sock, lun_specs, drive_numbers,
+                                       cached_read_file_bytes, data_seed,
+                                       prepare_abort, qga_resyncs)
+            result["cached_read_prepare"] = prep
+            if prep["status"] == "guest-panicked":
+                return record_guest_panic(time.monotonic() - start)
+            if prep["status"] != "ready":
+                result["outcome"] = ("qemu-exited"
+                                     if prep["status"] == "qemu-exited"
+                                     else "fill-failed")
+                result["elapsed_s"] = time.monotonic() - start
+                result["error"] = (
+                    f"preparing the cached-read LUNs ended {prep['status']} "
+                    f"after {prep['elapsed_s']:.0f}s: "
+                    f"{prep.get('failed') or prep.get('bytes_on_disk')}")
+                print(f"    {result['error']}", file=sys.stderr)
+                return result
+            print(f"    cached-read LUNs ready after {prep['elapsed_s']:.0f}s",
+                  file=sys.stderr)
         launch_deadline = time.monotonic() + WRITER_LAUNCH_TIMEOUT_S
         for spec in lun_specs:
             drive_no = drive_numbers[spec.serial]
@@ -2290,7 +2936,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             try:
                 pid = launch_writer(qga_sock, drive_no, writer_duration,
                                      io_driver, diskspd_path, fio_path,
-                                     qga_resyncs)
+                                     qga_resyncs, spec.serial, data_seed,
+                                     lun_specs.index(spec))
                 writer_pids.append(pid)
                 writer_luns[pid] = spec.dev_id
             except NoReplyError as exc:
@@ -2309,9 +2956,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         wps_per_lun: dict = {}
         broke_in_preflight = False
         for attempt in range(IO_PROBE_ATTEMPTS):
-            w_before = write_ops_by_node(qmp)
+            w_before = write_ops_by_node(qmp, counted)
             time.sleep(IO_PROBE_WINDOW_S)
-            w_after = write_ops_by_node(qmp)
+            w_after = write_ops_by_node(qmp, counted)
             wps_per_lun = {s.serial: lun_write_delta(w_before, w_after, s) / IO_PROBE_WINDOW_S
                            for s in lun_specs}
             total_wps = sum(wps_per_lun.values())
@@ -2344,14 +2991,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                     qga_sock, fio_path, drive_numbers[lun_specs[0].serial])
                 diag = f" fio diagnostic: {result['fio_diagnostic']}"
             result["error"] = (
-                f"writers are not driving I/O: only {total_wps:.1f} write ops/s "
+                f"writers are not driving I/O: only {total_wps:.1f} {ops_unit} "
                 f"across all {total_luns} LUN(s) (need >= {MIN_WRITE_OPS_PER_S}). "
                 f"Check --io-driver / --diskspd-path / --fio-path; writer "
                 f"states: {result['writer_states']}.{diag}")
             collect_vioscsi_telemetry()
             return result
 
-        print(f"    soak running: {duration_s / 3600:.1f}h, {total_wps:.1f} wps "
+        print(f"    soak running: {duration_s / 3600:.1f}h, {total_wps:.1f} {ops_unit} "
               f"across {total_luns} LUN(s) ({adapters} adapter(s) x {targets} "
               f"target(s) x {luns_per_target} lun(s)), scenarios "
               f"{', '.join(sc.name for sc in scenarios)}, heartbeat every "
@@ -2360,7 +3007,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         test_start = time.monotonic()
         monitor_deadline = test_start + duration_s
         last_heartbeat = test_start
-        prev_wops = write_ops_by_node(qmp)
+        prev_wops = write_ops_by_node(qmp, counted)
 
         qemu_stderr = QemuStderr(qemu_log_path)
         qemu_stderr.poll()
@@ -2446,7 +3093,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                         "after the break dump")
                 else:
                     window_s = ADAPTER_ACTIVITY_WINDOW_S
-                    act = lun_activity_by_adapter(qmp, lun_specs, window_s)
+                    act = lun_activity_by_adapter(qmp, lun_specs, window_s,
+                                                  counted)
                     dead = adapters_without_io(act, held_at_break)
                     result["adapter_activity"] = act
                     result["activity_window_s"] = window_s
@@ -2530,7 +3178,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                     last_hash = h
                     last_change_t = now
 
-            io_progress.update(now, write_ops_by_node(qmp),
+            io_progress.update(now, write_ops_by_node(qmp, counted),
                                cycler.unfaulted(lun_specs))
 
             if (not agent_alive and agent_lost_t is not None
@@ -2555,7 +3203,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             if now - last_heartbeat >= heartbeat_s:
                 if writers_failed(elapsed):
                     return result
-                cur_wops = write_ops_by_node(qmp)
+                cur_wops = write_ops_by_node(qmp, counted)
                 sample_s = now - last_heartbeat
                 wps = sum(lun_write_delta(prev_wops, cur_wops, s) for s in lun_specs) / sample_s
                 prev_wops = cur_wops
@@ -2571,7 +3219,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                               f"holding {cur['held']}" if cur else
                               "no fault armed")
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                      f"{elapsed / 3600:.2f}h elapsed, {wps:.1f} wps, "
+                      f"{elapsed / 3600:.2f}h elapsed, {wps:.1f} {ops_unit}, "
                       f"{faults['cycles_done']} cycle(s) done, {now_phrase}, "
                       f"TMFs={qemu_stderr.tmf_requests()}")
                 write_status(hb)
@@ -2772,7 +3420,8 @@ def main() -> int:
                      default=DEFAULT_LATE_PROBABILITY,
                      help="fraction of commands late-completion holds "
                           "(default: %(default)s)")
-    ap.add_argument("--io-driver", choices=["powershell", "diskspd", "fio"],
+    ap.add_argument("--io-driver",
+                     choices=["powershell", "diskspd", "fio", "cached-read"],
                      default="powershell",
                      help="how to drive guest I/O: 'powershell' (default) runs "
                           "the built-in raw-write loop (writes only -- use "
@@ -2781,7 +3430,22 @@ def main() -> int:
                           "read/write mix against each LUN's PhysicalDriveN; "
                           "'fio' launches fio.exe with a 50/50 random "
                           "read/write mix and crc32c data-integrity "
-                          "verification against each LUN's PhysicalDriveN")
+                          "verification against each LUN's PhysicalDriveN; "
+                          "'cached-read' formats each LUN NTFS, writes one "
+                          "big file to it before the soak, then reads that "
+                          "file over and over through the file cache, so "
+                          "the LUN I/O is paging reads into pages the memory "
+                          "manager recycles (read-only; failed reads are "
+                          "counted, not fatal; every chunk read is checked, "
+                          "and one read back wrong ends the run as "
+                          "data-corruption)")
+    ap.add_argument("--cached-read-file-gib", type=float, default=None,
+                     help="size of each LUN's file for --io-driver="
+                          "cached-read (default: "
+                          f"{CACHED_READ_RAM_FACTOR}x --ram, so that even one "
+                          "LUN's file can't stay cached). Writing it is slow "
+                          "on NFS-backed images; lower --ram to make it "
+                          "smaller")
     ap.add_argument("--diskspd-path", default=DEFAULT_DISKSPD_PATH,
                      help="guest-side path to diskspd.exe, used when "
                           "--io-driver=diskspd (default: %(default)s)")
@@ -2829,8 +3493,9 @@ def main() -> int:
     # check below and then never let a cycle (or the run) end.
     for flag in ("duration_hours", "recovery_deadline_s", "window_s",
                  "dead_target_s", "cooldown_s", "late_probability",
-                 "heartbeat_seconds"):
-        if not math.isfinite(getattr(args, flag)):
+                 "heartbeat_seconds", "cached_read_file_gib"):
+        value = getattr(args, flag)
+        if value is not None and not math.isfinite(value):
             print(f"Error: --{flag.replace('_', '-')} must be a finite "
                   f"number.", file=sys.stderr)
             return 1
@@ -2898,6 +3563,31 @@ def main() -> int:
               "LUN is 16383).", file=sys.stderr)
         return 1
 
+    cached_read_file_bytes = 0
+    if args.io_driver == "cached-read":
+        gib = args.cached_read_file_gib
+        if gib is None:
+            try:
+                ram_gib = qemu_ram_bytes(args.ram) / 1024**3
+            except ValueError:
+                print(f"Error: can't size the cached-read file from --ram "
+                      f"{args.ram!r}; give --cached-read-file-gib.",
+                      file=sys.stderr)
+                return 1
+            gib = math.ceil(ram_gib * CACHED_READ_RAM_FACTOR)
+        if gib <= 0:
+            print("Error: --cached-read-file-gib must be > 0.",
+                  file=sys.stderr)
+            return 1
+        # Whole chunks, which is what the guest writes.
+        cached_read_file_bytes = (math.ceil(gib * 1024**3
+                                            / CACHED_READ_CHUNK_BYTES)
+                                  * CACHED_READ_CHUNK_BYTES)
+    elif args.cached_read_file_gib is not None:
+        print("Error: --cached-read-file-gib only applies to "
+              "--io-driver=cached-read.", file=sys.stderr)
+        return 1
+
     duration_s = args.duration_hours * 3600.0
 
     err = check_prereqs()
@@ -2928,7 +3618,7 @@ def main() -> int:
                        args.disk_dir, args.iothreads, args.tmf_trace,
                        args.stop_on_broken, args.ring_diag,
                        args.dump_on_agent_stall, args.qga_trace,
-                       args.hv_crash)
+                       args.hv_crash, cached_read_file_bytes)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
