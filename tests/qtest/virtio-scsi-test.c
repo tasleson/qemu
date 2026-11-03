@@ -547,6 +547,8 @@ static void test_shared_header_overlap(void *obj, void *data,
 
 #define FAULT_DEVICE "vs0"
 #define FAULT_MS (1000 * 1000LL)  /* in ns, for qtest_clock_step() */
+/* What a data-in buffer holds before the device writes to it */
+#define FAULT_DATA_FILL 0xa5
 
 /* A command or TMF that has been submitted but not waited for */
 typedef struct {
@@ -573,7 +575,12 @@ static void fault_cmd(QVirtioSCSIQueues *vs, FaultPending *p, uint8_t target,
     p->vq = vs->vq[2];
     p->req_addr = qvirtio_scsi_alloc(vs, sizeof(req), &req);
     p->resp_addr = qvirtio_scsi_alloc(vs, sizeof(resp), &resp);
-    p->data_addr = data_len ? qvirtio_scsi_alloc(vs, data_len, NULL) : 0;
+    p->data_addr = 0;
+    if (data_len) {
+        /* So that a test can tell whether a read transferred anything */
+        p->data_addr = guest_alloc(alloc, data_len);
+        qtest_memset(qts, p->data_addr, FAULT_DATA_FILL, data_len);
+    }
     p->head = qvirtqueue_add(qts, p->vq, p->req_addr, sizeof(req), false,
                              true);
     qvirtqueue_add(qts, p->vq, p->resp_addr, sizeof(resp), true, !!data_len);
@@ -1489,6 +1496,62 @@ static void test_fault_below_hang_recheck_early(void *obj, void *data,
 }
 
 /*
+ * A fault holding no commands (probability 0.0) still hangs a LUN reset.
+ * With a second fault holding a READ, removing that one lets the READ run
+ * and transfer its data while the reset stays hung, and the reset is only
+ * answered once the first fault goes too.
+ */
+static void test_fault_below_hang_holds_none(void *obj, void *data,
+                                             QGuestAllocator *t_alloc)
+{
+    QVirtioSCSIQueues *vs = fault_start(obj, t_alloc);
+    FaultPending cmd, tmf;
+    uint8_t buf[512];
+    size_t i;
+
+    fault_add("{'id': 'hang', 'target': 1, 'probability': 0.0,"
+              " 'clear-on': 'manual', 'below-clear': 'hang'}");
+    fault_add("{'id': 'hold', 'target': 1, 'clear-on': 'manual',"
+              " 'below-clear': 'hang'}");
+    fault_read(vs, &cmd, 1, 0, 1);
+    fault_wait_held("hold", 1);
+    fault_wait_held("hang", 0);
+    fault_tmf(vs, &tmf, VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET, 1, 0, 0);
+    g_assert_cmpint(fault_attempts("hang", "lun-reset"), ==, 1);
+    g_assert_cmpint(fault_attempts("hold", "lun-reset"), ==, 1);
+    fault_assert_idle(vs);
+
+    qtest_qmp_assert_success(global_qtest,
+                             "{'execute': 'x-scsi-fault-remove',"
+                             " 'arguments': {'device': %s, 'id': 'hold'}}",
+                             FAULT_DEVICE);
+    fault_wait_cleared("hold", "manual", 1);
+    fault_wait1(&cmd);
+    g_assert_cmpint(fault_response(&cmd), ==, VIRTIO_SCSI_S_OK);
+    g_assert_cmpint(fault_status(&cmd), ==, GOOD);
+    memread(cmd.data_addr, buf, sizeof(buf));
+    for (i = 0; i < sizeof(buf); i++) {
+        g_assert_cmpuint(buf[i], ==, 0);
+    }
+
+    /* Nothing times the reset out: it waits for the other fault */
+    qtest_clock_step(global_qtest, 10000 * FAULT_MS);
+    fault_assert_idle(vs);
+
+    qtest_qmp_assert_success(global_qtest,
+                             "{'execute': 'x-scsi-fault-remove',"
+                             " 'arguments': {'device': %s, 'id': 'hang'}}",
+                             FAULT_DEVICE);
+    fault_wait_cleared("hang", "manual", 0);
+    fault_wait1(&tmf);
+    g_assert_cmpint(fault_response(&tmf), ==, VIRTIO_SCSI_S_OK);
+
+    fault_free(&cmd);
+    fault_free(&tmf);
+    fault_end(vs);
+}
+
+/*
  * A hung TMF keeps the wait it got when it came.  A hanging fault added
  * afterwards doesn't stretch it: not when an unrelated TMF finishes, and not
  * when another fault goes away and the TMF is looked at again.
@@ -1941,6 +2004,8 @@ static void register_virtio_scsi_test(void)
             { "fault-below-hang-recheck", test_fault_below_hang_recheck },
             { "fault-below-hang-recheck-early",
               test_fault_below_hang_recheck_early },
+            { "fault-below-hang-holds-none",
+              test_fault_below_hang_holds_none },
             { "fault-below-hang-added", test_fault_below_hang_added },
             { "fault-release-order", test_fault_release_order },
             { "fault-delay-remove", test_fault_delay_remove },

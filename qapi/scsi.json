@@ -205,7 +205,10 @@
 #     At most 86400000.
 #
 # @probability: fraction of matching commands to hold, between 0.0
-#     and 1.0 (default: 1.0)
+#     and 1.0 (default: 1.0).  It only decides which commands are
+#     held: a recovery below @clear-on hangs or is rejected the same
+#     whatever it is, so with 0.0 the fault holds nothing but can
+#     still hang a recovery.
 #
 # @max-hits: stop holding new commands once this many, at least 1,
 #     have been held.  The fault stays until it clears.  If absent, no
