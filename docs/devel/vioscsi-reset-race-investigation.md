@@ -183,7 +183,8 @@ reported BSODs. Two things would nail it down:
    QEMU's `GUEST_PANICKED` event carries the bugcheck code and arguments.
 2. **An A/B on the same recipe.** The upstream driver should bugcheck,
    and the `reset_via_tmf` driver should survive. `--bsod` in the
-   target-fault harness is that recipe (see below). A bugcheck from a lab
+   target-fault harness is that recipe, and `--action-on-reset` runs both
+   arms on the one `reset_via_tmf` binary (see below). A bugcheck from a lab
    recipe shows the fix closes that path. It does not show that #1014 or
    #877 were that path; only a reporter's dump can.
 
@@ -230,6 +231,48 @@ and offset it is, and the readers check what they read, so a late
 transfer that lands somewhere harmless still shows: surviving
 `--bsod-cycles` cycles ends the run as `data-corruption` if a reader read
 back wrong data, and as `cycles-complete` only if none did.
+
+The A/B needs only one driver build. `reset_via_tmf` picks what a reset
+does from `VioscsiActionOnReset` (a `REG_DWORD` under
+`HKLM\SYSTEM\CurrentControlSet\Services\vioscsi\Parameters\Device`,
+read once per adapter in `VioScsiFindAdapter`): 0 is
+`VioscsiResetCompleteRequests`, the upstream behaviour, and 2 (or no
+value) is `VioscsiResetSendTmf`. Every run boots from a fresh overlay of
+the golden image, so `--action-on-reset` sets the value in the run's own
+guest after boot, disables and re-enables every vioscsi controller so the
+driver reads it, and waits for every LUN to come back before the LUNs are
+prepared. With the `reset_via_tmf` build installed in the golden image:
+
+```
+scripts/fuzz-windows-inject-target-fault.py --bsod --action-on-reset complete-requests
+scripts/fuzz-windows-inject-target-fault.py --bsod --action-on-reset send-tmf --vioscsi-sha256 <HEX>
+```
+
+`<HEX>` is the SHA-256 of that `vioscsi.sys`; every run prints it and
+records it in the result's `vioscsi_driver`, with the driver version and
+date and the registry value it found. The harness needs it for any arm
+but `complete-requests` because nothing the driver reports says which
+values it knows, and writing one it doesn't is not harmless. Released
+drivers since eff7b430, which added the value, know 0, 1 and
+`0xDEADDEAD` only, and their reset switch has no default, so 2 falls
+through into the `SRB_FUNCTION_WMI` case with the reset SRB. Drivers
+before eff7b430 ignore the value and always call
+`CompletePendingRequests` on a reset, so `complete-requests` is what
+every build does and is the one arm written to an unnamed driver. To test
+a released driver, run without `--action-on-reset`: its arm is whatever
+that release does, and `vioscsi_driver` says which release it was.
+
+The result's `action_on_reset` records the arm asked for, what the
+registry read back and which controllers were restarted. What the driver
+itself took can't be read from a running guest: the telemetry IOCTL's
+`STOR_TELEMETRY` has no field for it. The event ring does, in every reset
+request it records, so `Tools/debug/evring.py events panic.dmp` in the
+driver repo shows "action on reset 0x0" on the `complete-requests` arm.
+That arm can also end `virtio-broken` before it bugchecks: completing
+requests the device still holds lets Storport reuse SRB extensions whose
+descriptor tables the device has not read yet. That is most likely
+the same bug, though a ring can break for other reasons; the dump taken
+at the break is what tells.
 
 None of this has been run against Windows yet. The trigger in particular
 rests on an assumption about Windows, not an observation: that a read

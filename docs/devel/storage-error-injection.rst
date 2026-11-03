@@ -447,7 +447,10 @@ cleared it and how long that took, or that the guest never got there --
 and watches for a bugcheck or a broken ring.  Its ``--bsod`` option runs
 the last scenario instead, against cached file reads, to bugcheck a driver
 that completes requests the device still owns (see
-``docs/devel/vioscsi-reset-race-investigation.md``).  See its ``--help``.
+``docs/devel/vioscsi-reset-race-investigation.md``), and
+``--action-on-reset`` sets the driver's ``VioscsiActionOnReset`` registry
+value in each run's guest, so one vioscsi build can be run both ways.
+See its ``--help``.
 
 
 SCSI Response Injection
