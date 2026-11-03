@@ -61,6 +61,14 @@
 # that completes requests the device still owns: the late-dma scenario
 # (see SCENARIOS) on the cached-read driver, with hv-crash so the bugcheck
 # is caught with its STOP code. It is not part of a normal soak.
+#
+# --action-on-reset makes that an A/B with one driver binary: the
+# reset_via_tmf vioscsi build picks what a reset does from the
+# VioscsiActionOnReset registry value, so each run sets it in its own
+# fresh guest and restarts the vioscsi controllers before the LUNs are
+# used. complete-requests is the old upstream behaviour, send-tmf the fix.
+# Every run records which vioscsi build it ran on, so a run on a released
+# driver, without the option, is labelled by its release.
 
 import argparse
 import base64
@@ -86,7 +94,8 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # pylint: disable=wrong-import-position
-from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
+from vioscsi_soak_common import (ACTION_ON_RESET_VALUE,
+                                 AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
                                  BOOT_TIMEOUT_S, CHR_EVENTS,
                                  CHR_SOCKET_LABEL_RE, CLEAN_OUTCOMES,
@@ -116,7 +125,11 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  WRITER_BLOCK_BYTES, WRITER_DURATION_SLACK_S,
                                  WRITER_LAUNCH_TIMEOUT_S, WRITER_QUEUE_DEPTH,
                                  WRITER_THREADS,
-                                 WRITER_WINDOW_BYTES, _covers_luns, _qga_call,
+                                 WRITER_WINDOW_BYTES, ActionOnResetError,
+                                 _covers_luns, _qga_call,
+                                 action_on_reset_label,
+                                 action_on_reset_refusal,
+                                 apply_action_on_reset,
                                  b64_text, build_writer_script,
                                  capture_qemu_stacks,
                                  capture_vioscsi_telemetry, check_prereqs,
@@ -124,7 +137,12 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  count_guest_processes,
                                  explain_break, first_sight, guest_panic_info,
                                  image_bytes_on_disk, load_qmp_module,
-                                 make_blank_image, make_overlay, ps_exec,
+                                 make_blank_image, make_overlay,
+                                 describe_vioscsi_identity,
+                                 parse_action_on_reset, parse_sha256, ps_exec,
+                                 read_vioscsi_identity,
+                                 VIOSCSI_IDENTITY_REQUEST,
+                                 preset_action_on_reset_warning,
                                  qga_exec, qga_exec_wait, qga_ping,
                                  record_run_error, start_swtpm, stop_writers,
                                  utc_now, wall_time, writer_states)
@@ -339,15 +357,43 @@ along with the commands it held, the recovery attempts it saw and the TMFs
 the guest sent the target. scenario_summary rolls those up per scenario.
 
 A/B for the reset race (docs/devel/vioscsi-reset-race-investigation.md):
-run --bsod once with each driver build installed in the golden image. It
-formats the LUNs and writes their files first (several GiB per LUN; on
-NFS, expect a while), then runs late-dma cycles until the guest bugchecks
-(guest-panicked, the STOP code printed and in guest_panic, panic.dmp in
-the run directory) or survives --bsod-cycles of them: cycles-complete if
-every chunk the readers read back was what was written, data-corruption
-if late DMA left wrong data in the cache without crashing anything.
-The upstream driver is expected to bugcheck; one that waits for the TMF
-response before completing anything, to survive.
+run --bsod once per arm. It formats the LUNs and writes their files first
+(several GiB per LUN; on NFS, expect a while), then runs late-dma cycles
+until the guest bugchecks (guest-panicked, the STOP code printed and in
+guest_panic, panic.dmp in the run directory) or survives --bsod-cycles of
+them: cycles-complete if every chunk the readers read back was what was
+written, data-corruption if late DMA left wrong data in the cache without
+crashing anything. A driver that completes requests on a reset (upstream)
+is expected to bugcheck; one that waits for the TMF response before
+completing anything, to survive.
+
+With the reset_via_tmf vioscsi build in the golden image, both arms run
+on the one binary, picked by its VioscsiActionOnReset registry value
+(HEX is that vioscsi.sys's SHA-256, which every run prints and records):
+  {Path(__file__).name} --bsod --action-on-reset complete-requests
+  {Path(__file__).name} --bsod --action-on-reset send-tmf --vioscsi-sha256 HEX
+--action-on-reset sets the value in the run's guest after boot and
+disables and re-enables every vioscsi controller so the driver reads it
+(refusing if the boot disk is behind one, and failing the run as error if
+a controller won't restart or a LUN doesn't come back). Nothing the
+driver reports says which values it knows, and released drivers don't
+know send-tmf: their reset switch has no default, so 2 falls through
+into their WMI handler. So only complete-requests, what every vioscsi
+build does on a reset, is written to a driver --vioscsi-sha256 doesn't
+name. For a released driver, leave --action-on-reset out: its arm is
+whatever that release does, and the result's vioscsi_driver says which
+release it was (version, date, vioscsi.sys hash, the registry value).
+
+The result's action_on_reset has what was asked for, what the registry
+reads back and the controllers restarted; what the driver took can't be
+read from a running guest, so driver_confirmed is null. The event ring in
+panic.dmp says, per reset request (Tools/debug/evring.py events <dump> in
+the driver repo: "action on reset 0x0"). On the complete-requests arm a
+run can also end virtio-broken before it bugchecks: completing requests
+the device still holds lets Storport reuse SRB extensions holding
+descriptor tables the device has not read yet. That is most likely the
+same bug reproducing, though a break can have other causes; the dump
+taken at the break is what tells.
 
 Environment overrides for running on different machines:
   QEMU_SRC, QEMU_BUILD   default to this script's own checkout
@@ -2662,8 +2708,16 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              qga_trace: bool = True,
              hv_crash: bool = True,
              cached_read_file_bytes: int = 0,
-             bsod_cycles: Optional[int] = None) -> dict:
-    """bsod_cycles is --bsod: end the run once that many late-dma cycles
+             bsod_cycles: Optional[int] = None,
+             action_on_reset: Optional[str] = None,
+             vioscsi_sha256: Optional[list] = None) -> dict:
+    """action_on_reset is --action-on-reset: set VioscsiActionOnReset and
+    restart the vioscsi controllers after boot (apply_action_on_reset), if
+    the loaded driver is known to take that value (action_on_reset_refusal,
+    with vioscsi_sha256 as --vioscsi-sha256), or leave the guest alone for
+    None. Either way the loaded driver is identified, for the result.
+
+    bsod_cycles is --bsod: end the run once that many late-dma cycles
     have run their course (LATE_DMA_DONE_OUTCOMES) with no bugcheck, and
     treat a writer exiting or a chunk read back wrong as something to note
     rather than the end of the run, since either can come before the
@@ -2701,7 +2755,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     result: dict = {"outcome": "error", "elapsed_s": 0.0, "run_dir": str(run_dir),
                     "duration_s": duration_s,
                     "scenarios": [sc.name for sc in scenarios],
-                    "fault_settings": dataclasses.asdict(settings)}
+                    "fault_settings": dataclasses.asdict(settings),
+                    # None: the registry was left as the golden image has it.
+                    "action_on_reset": None}
     start = time.monotonic()
     # Created when the soak starts (it needs the log reader); until then no
     # fault is armed and there is nothing to remove.
@@ -3167,6 +3223,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "hv_crash": hv_crash,
                 "cached_read_file_bytes": cached_read_file_bytes,
                 "bsod_cycles": bsod_cycles,
+                "action_on_reset": action_on_reset,
+                "vioscsi_sha256": vioscsi_sha256 or [],
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -3218,13 +3276,82 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         writer_seen: dict = {}
 
         serials = [s.serial for s in lun_specs]
+        # Which build this run tested, released or not, and what its
+        # registry value said before anything touched it.
+        request_sent_at = utc_now()
+        try:
+            ident = read_vioscsi_identity(qga_sock, qga_resyncs)
+        except NoReplyError as exc:
+            # The first guest-exec after the boot ping, with nothing else
+            # running yet. run-1791557706 lost the agent on its first
+            # guest-exec, which back then was the resolve.
+            diagnose_failed_launch("no-reply", VIOSCSI_IDENTITY_REQUEST,
+                                   request_sent_at, exc)
+            raise
+        result["vioscsi_driver"] = ident
+        print(f"    vioscsi driver: {describe_vioscsi_identity(ident)}",
+              file=sys.stderr)
+        if action_on_reset is None:
+            preset = preset_action_on_reset_warning(ident)
+            if preset is not None:
+                ident["warning"] = preset
+                print(f"    warning: {preset}", file=sys.stderr)
+        # Before the disk numbers are looked up: restarting the adapters
+        # can renumber the disks.
+        if action_on_reset is not None:
+            aor: dict = {"requested": action_on_reset}
+            result["action_on_reset"] = aor
+            refusal = action_on_reset_refusal(action_on_reset, ident,
+                                              vioscsi_sha256 or [])
+            if refusal is not None:
+                aor["refused"] = refusal
+                result["outcome"] = "error"
+                result["elapsed_s"] = time.monotonic() - start
+                result["error"] = refusal
+                print(f"    {refusal}", file=sys.stderr)
+                return result
+            # action_on_reset_refusal let it through on one of these.
+            aor["driver_known"] = (
+                "reset_via_tmf build, by --vioscsi-sha256" if vioscsi_sha256
+                else "not identified as any particular build; "
+                     "complete-requests is what every vioscsi build does on "
+                     "a reset, whether it reads the value or predates it")
+            label = action_on_reset_label(action_on_reset)
+            print(f"    setting {label} and restarting the vioscsi "
+                  f"controller(s)", file=sys.stderr)
+            try:
+                apply_action_on_reset(qga_sock, action_on_reset, serials,
+                                      aor, qga_resyncs)
+            except (ActionOnResetError, NoReplyError) as exc:
+                if guest_panicked():
+                    record_guest_panic(time.monotonic() - start)
+                    result["error"] = (f"the guest bugchecked while setting "
+                                       f"{label}: {exc}")
+                    if bsod_cycles:
+                        result["bsod_verdict"] = (
+                            "no answer: the guest bugchecked restarting the "
+                            "vioscsi controllers, before any cycle")
+                    return result
+                if isinstance(exc, NoReplyError):
+                    raise
+                result["outcome"] = "error"
+                result["elapsed_s"] = time.monotonic() - start
+                result["error"] = str(exc)
+                print(f"    {exc}", file=sys.stderr)
+                return result
+            readback = aor["registry_readback"]
+            print(f"    {ACTION_ON_RESET_VALUE} reads back "
+                  f"{'absent' if readback is None else readback}; restarted "
+                  f"{len(aor['controllers_restarted'])} vioscsi "
+                  f"controller(s), all {total_luns} LUN(s) back after "
+                  f"{aor['luns_back_s']}s", file=sys.stderr)
+            print(f"    note: {aor['driver_confirmed_note']}",
+                  file=sys.stderr)
         request_sent_at = utc_now()
         try:
             drive_numbers = resolve_drive_numbers(qga_sock, serials,
                                                   qga_resyncs)
         except NoReplyError as exc:
-            # The first guest-exec after the boot ping, with nothing else
-            # running yet: run-1791557706 lost the agent right here.
             diagnose_failed_launch("no-reply", RESOLVE_REQUEST,
                                    request_sent_at, exc)
             raise
@@ -3732,6 +3859,13 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             result["dump"] = str(dump_path) if dump_path.exists() else None
 
 
+# Why the complete-requests arm can break a ring before it bugchecks (the
+# ACTION_ON_RESET comment in the reset_via_tmf driver's vioscsi.h).
+COMPLETE_REQUESTS_BREAK = (
+    "completing requests the device still holds lets Storport reuse SRB "
+    "extensions holding descriptor tables the device has not read yet")
+
+
 def bsod_banner(args) -> str:
     """What --bsod does and how to read its result, for the start."""
     trigger = LATE_DMA_TRIGGERS[args.late_dma_release_after]
@@ -3751,7 +3885,38 @@ adapter(s) are what put something there. Up to {args.bsod_cycles} cycle(s).
                    from a driver that waits for the TMF response
                    (reset_via_tmf)
 Any other outcome means the recipe never got to an answer; see the
-result."""
+result.
+{bsod_arm_note(args.action_on_reset)}"""
+
+
+def bsod_arm_note(action: Optional[str]) -> str:
+    """Which arm of the A/B a --bsod run is, and what to expect of it."""
+    if action is None:
+        return ("Arm: whatever the golden image's vioscsi does on a reset "
+                "(no --action-on-reset; the driver is identified in the "
+                "result's vioscsi_driver).")
+    label = action_on_reset_label(action)
+    if action == "complete-requests":
+        return (f"A/B arm: {label}. Expect guest-panicked; virtio-broken "
+                f"first is most likely the same bug: "
+                f"{COMPLETE_REQUESTS_BREAK}.")
+    if action == "do-nothing":
+        return (f"A/B arm: {label}. Not one of the A/B's two arms: the "
+                f"reset neither completes nor cancels anything.")
+    return f"A/B arm: {label}. Expect cycles-complete."
+
+
+def bsod_arm_verdict(verdict: str, outcome: str,
+                     action: Optional[str]) -> str:
+    """--bsod's verdict with the A/B arm it came from in front."""
+    if action is None:
+        return verdict
+    text = f"[{action_on_reset_label(action)}] {verdict}"
+    if action == "complete-requests" and outcome == "virtio-broken":
+        text += (f"; on this arm a broken ring is most likely the bug "
+                 f"reproducing ({COMPLETE_REQUESTS_BREAK}), but check the "
+                 f"dump")
+    return text
 
 
 def apply_bsod(args) -> Optional[str]:
@@ -3965,6 +4130,26 @@ def main() -> int:
                           f"--targets to {BSOD_ADAPTERS} x {BSOD_TARGETS}; "
                           "options given explicitly win where they don't "
                           "defeat the recipe")
+    ap.add_argument("--action-on-reset", type=parse_action_on_reset,
+                    default=None, metavar="ACTION",
+                    help="after boot, set the guest's vioscsi "
+                         "VioscsiActionOnReset registry value (what a reset "
+                         "does) and restart every vioscsi controller so the "
+                         "driver reads it: complete-requests (0, what every "
+                         "released driver does), do-nothing (1), send-tmf "
+                         "(2, reset_via_tmf builds only) or default (delete "
+                         "the value). The bugcheck value is refused. Only "
+                         "complete-requests is written to a driver not "
+                         "named by --vioscsi-sha256; for a released driver, "
+                         "leave this out: its arm is whatever that release "
+                         "does. Default: leave the registry alone")
+    ap.add_argument("--vioscsi-sha256", type=parse_sha256, action="append",
+                    default=None, metavar="HEX",
+                    help="SHA-256 of a vioscsi.sys known to be a "
+                         "reset_via_tmf build (repeatable): with it loaded, "
+                         "every --action-on-reset is allowed; with another "
+                         "build loaded, none is. The driver reports nothing "
+                         "that says which values it knows")
     ap.add_argument("--bsod-cycles", type=int, default=None,
                      help="late-dma cycles a --bsod run gets to bugcheck the "
                           f"guest (default: {DEFAULT_BSOD_CYCLES})")
@@ -4055,6 +4240,10 @@ def main() -> int:
     err = apply_bsod(args)
     if err:
         print(f"Error: {err}", file=sys.stderr)
+        return 1
+    if args.vioscsi_sha256 and args.action_on_reset is None:
+        print("Error: --vioscsi-sha256 only applies with --action-on-reset.",
+              file=sys.stderr)
         return 1
 
     if args.host_pressure_cores and not shutil.which("taskset"):
@@ -4182,6 +4371,8 @@ def main() -> int:
           f"({args.adapters} adapter(s) x {args.targets} target(s) x "
           f"{args.luns_per_target} lun(s)), scenarios: "
           f"{', '.join(names)}.")
+    if args.action_on_reset is not None:
+        print(f"A/B arm: {action_on_reset_label(args.action_on_reset)}")
     if args.bsod:
         print(bsod_banner(args))
 
@@ -4196,7 +4387,12 @@ def main() -> int:
                        args.stop_on_broken, args.ring_diag,
                        args.dump_on_agent_stall, args.qga_trace,
                        args.hv_crash, cached_read_file_bytes,
-                       args.bsod_cycles if args.bsod else None)
+                       args.bsod_cycles if args.bsod else None,
+                       action_on_reset=args.action_on_reset,
+                       vioscsi_sha256=args.vioscsi_sha256)
+    if "bsod_verdict" in result:
+        result["bsod_verdict"] = bsod_arm_verdict(
+            result["bsod_verdict"], result["outcome"], args.action_on_reset)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
