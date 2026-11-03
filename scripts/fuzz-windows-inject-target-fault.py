@@ -56,6 +56,11 @@
 # chunk of those files says which LUN and offset it belongs to, and the
 # readers check each one they read, so such a read is caught both ways: as
 # wrong data in someone else's page, or as a bugcheck.
+#
+# --bsod puts that together into one recipe meant to bugcheck a driver
+# that completes requests the device still owns: the late-dma scenario
+# (see SCENARIOS) on the cached-read driver, with hv-crash so the bugcheck
+# is caught with its STOP code. It is not part of a normal soak.
 
 import argparse
 import base64
@@ -84,7 +89,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  AGENT_SILENCE_THRESHOLD_S, BOOT_DISK,
                                  BOOT_TIMEOUT_S, CHR_EVENTS,
-                                 CHR_SOCKET_LABEL_RE, DEFAULT_CPUS,
+                                 CHR_SOCKET_LABEL_RE, CLEAN_OUTCOMES,
+                                 DEFAULT_CPUS,
                                  DEFAULT_DISKSPD_PATH, DEFAULT_FIO_PATH,
                                  DEFAULT_HEARTBEAT_S, DEFAULT_RAM,
                                  DEFAULT_VIOSCSI_TELEMETRY_SCRIPT, DIAG_EVENTS,
@@ -173,6 +179,52 @@ DEFAULT_DEAD_TARGET_S = 240.0
 DEFAULT_COOLDOWN_S = 60.0
 DEFAULT_TMF_HANG_MS = 30000
 DEFAULT_LATE_PROBABILITY = 0.05
+# late-dma: how long after its trigger (LATE_DMA_TRIGGERS) the held reads
+# are let go. Long enough for the memory manager to hand the pages of a
+# read that failed to someone else -- the readers on the other adapter
+# (BSOD_ADAPTERS) churn through more than RAM, so freed pages are reused
+# within seconds --
+# and well short of the guest's ~60s timeout, so the release lands before
+# the reads the guest reissued meanwhile time out and bring the next reset.
+DEFAULT_LATE_DMA_DELAY_S = 10.0
+# Between letting the held commands go and letting the hung LUN reset go:
+# long enough for the released reads to finish on their own, so their data
+# reaches guest memory as a normal completion rather than racing the reset
+# that would cancel them (see the late-dma scenario). Waited out across
+# ticks, not slept, so a bugcheck meanwhile is seen at once.
+LATE_DMA_SETTLE_S = 5.0
+# How a late-dma cycle ends having run its course, the held reads let go
+# with the LUN reset still hung: what --bsod-cycles counts. Not interrupted
+# (the harness removed everything at once, for a break, a dump or an
+# error) nor removed (someone else did, when they chose).
+LATE_DMA_DONE_OUTCOMES = ("released", "not-recovered")
+# How often a late-dma cycle waiting for a read error asks the readers.
+LATE_DMA_READ_POLL_S = 5.0
+LATE_DMA_TRIGGERS = {"read-error": "first read error on the target",
+                     "recovery": "first recovery attempt"}
+# --bsod defaults, where they differ from a soak's. Several of the guest's
+# 60s timeout-and-reset rounds can pass before Windows gives up retrying a
+# read and fails it to the reader, so a cycle waits that much longer for
+# it; 4G of guest RAM halves the cached-read files the soak first has to
+# write, and makes the memory manager reuse freed pages sooner.
+BSOD_RECOVERY_DEADLINE_S = 900.0
+BSOD_RAM = "4G"
+# The upstream driver's DeviceReset() pauses its whole adapter for up to
+# 60s (StorPortPause), so readers on the faulted adapter's other targets
+# stop with it, through the --late-dma-delay-s window when their churn is
+# what reuses the failed reads' pages. Under --bsod the churn comes from a
+# second adapter instead, and one target each is enough: more on the
+# faulted adapter would only add files to write.
+DEFAULT_ADAPTERS = 1
+DEFAULT_TARGETS = 2
+BSOD_ADAPTERS = 2
+BSOD_TARGETS = 1
+DEFAULT_BSOD_CYCLES = 3
+# After a ring breaks under --bsod, how long to keep watching for a
+# bugcheck before ending the run as virtio-broken. The faults are removed
+# at the break, which lets every held read go: a late completion like any
+# other, whose damage shows when the kernel next uses the page.
+BSOD_BREAK_WATCH_S = 300.0
 LATE_DELAY_MS = (61000, 65000)  # just past storport's ~60s timeout
 SLOW_DELAY_MS = (5000, 15000)   # slow, but answering well within it
 # How many of a cycle's TMFs are kept verbatim in its record; the rest
@@ -271,18 +323,31 @@ fuzz-windows-inject-scsi-reset.py:
      {DEFAULT_VIOSCSI_TELEMETRY_SCRIPT}) present in the guest.
   9. Shut down cleanly.
 
-Fault scenarios (--scenarios), each armed on one whole target per cycle:
+Fault scenarios (--scenarios), each armed on one whole target per cycle;
+all but late-dma rotate by default:
 {scenario_list()}
 
 Each cycle in the result records what ended it: recovered (with cleared_by,
 the recovery that did it, and time_to_clear_s), not-recovered (the guest
-never got there within --recovery-deadline-s), window-ended, replaced
-(dead-target), removed (someone else removed it over QMP), interrupted (the
-harness removed every fault: for a dump, a broken virtio ring, an error or
-the end of the run) or arm-failed (the run ends after
-{MAX_CONSECUTIVE_ARM_FAILURES} in a row); along with the commands it held,
-the recovery attempts it saw and the TMFs the guest sent the target.
-scenario_summary rolls those up per scenario.
+never got there within --recovery-deadline-s, or late-dma never saw its
+trigger), window-ended, replaced (dead-target), released (late-dma let its
+held commands run; its late_dma record says when and why), removed
+(someone else removed it over QMP), interrupted (the harness removed every
+fault: for a dump, a broken virtio ring, an error or the end of the run)
+or arm-failed (the run ends after {MAX_CONSECUTIVE_ARM_FAILURES} in a row);
+along with the commands it held, the recovery attempts it saw and the TMFs
+the guest sent the target. scenario_summary rolls those up per scenario.
+
+A/B for the reset race (docs/devel/vioscsi-reset-race-investigation.md):
+run --bsod once with each driver build installed in the golden image. It
+formats the LUNs and writes their files first (several GiB per LUN; on
+NFS, expect a while), then runs late-dma cycles until the guest bugchecks
+(guest-panicked, the STOP code printed and in guest_panic, panic.dmp in
+the run directory) or survives --bsod-cycles of them: cycles-complete if
+every chunk the readers read back was what was written, data-corruption
+if late DMA left wrong data in the cache without crashing anything.
+The upstream driver is expected to bugcheck; one that waits for the TMF
+response before completing anything, to survive.
 
 Environment overrides for running on different machines:
   QEMU_SRC, QEMU_BUILD   default to this script's own checkout
@@ -1362,6 +1427,10 @@ class QemuStderr:
             if any(pat.search(line) for pat in VIRTIO_BROKEN_PATTERNS):
                 self._pending_broken.append(line)
 
+    def has_broken(self) -> bool:
+        """Whether take_broken() has lines to return."""
+        return bool(self._pending_broken)
+
     def take_broken(self) -> list:
         """virtio_error() lines seen since the last call.
 
@@ -1875,6 +1944,8 @@ class FaultSettings:
     cooldown_s: float = DEFAULT_COOLDOWN_S
     tmf_hang_ms: int = DEFAULT_TMF_HANG_MS
     late_probability: float = DEFAULT_LATE_PROBABILITY
+    late_dma_delay_s: float = DEFAULT_LATE_DMA_DELAY_S
+    late_dma_release_after: str = "recovery"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1884,14 +1955,25 @@ class Scenario:
     ends says what ends a cycle: "recovery" waits for the guest's recovery
     to clear the fault and gives up after --recovery-deadline-s; "window"
     and "dead" faults only clear when removed, which the harness does after
-    --window-s or --dead-target-s."""
+    --window-s or --dead-target-s; "late-dma" is removed by the harness
+    --late-dma-delay-s after its trigger (LATE_DMA_TRIGGERS), and given up
+    on after --recovery-deadline-s without one.
+
+    companion is a second fault armed on the same target alongside the
+    first and removed after it; target pins the target instead of picking
+    one at random; in_default says whether the default --scenarios
+    rotation includes it."""
     name: str
     ends: str
     summary: str
     options: Callable[[FaultSettings], dict]
+    companion: Optional[Callable[[FaultSettings], dict]] = None
+    target: Optional[int] = None
+    in_default: bool = True
 
     def limit_s(self, settings: FaultSettings) -> float:
         return {"recovery": settings.recovery_deadline_s,
+                "late-dma": settings.recovery_deadline_s,
                 "window": settings.window_s,
                 "dead": settings.dead_target_s}[self.ends]
 
@@ -1904,10 +1986,64 @@ class Scenario:
 
 # Each cycle arms one of these on a whole target (every LUN behind it).
 # Outcomes per ends: "recovery" -> recovered (by the level in cleared_by)
-# or not-recovered; "window" -> window-ended; "dead" -> replaced. Any
-# cycle can also end removed (a manual clear the harness didn't make),
-# interrupted (the harness removed every fault: for a dump, a broken
-# virtio ring, an error or the end of the run) or arm-failed.
+# or not-recovered; "window" -> window-ended; "dead" -> replaced;
+# "late-dma" -> released or not-recovered. Any cycle can also end removed
+# (a manual clear the harness didn't make), interrupted (the harness
+# removed every fault: for a dump, a broken virtio ring, an error or the
+# end of the run) or arm-failed.
+#
+# late-dma is the one meant to bugcheck a driver that completes requests
+# the device still owns (docs/devel/vioscsi-reset-race-investigation.md):
+# the guest's reads are held before they run, the guest times them out and
+# resets the LUN, QEMU leaves the reset hanging, and a driver that does not
+# wait for it completes the reads to Windows with nothing transferred.
+# After the trigger, by default a read failing to the reader -- by which
+# point Windows should have stopped retrying it and freed its pages, though
+# that is an expectation about Windows that no run has confirmed yet --
+# the harness lets the held reads run, so their data lands in memory that
+# is no longer theirs. Which QEMU ordering makes that happen:
+#
+# - The fault has to hold the commands, not the TMF alone. Commands it
+#   holds have not been sent to the device (scsi-fault.c:scsi_fault_hold),
+#   and a LUN reset carried out while they are held cancels them before
+#   anything reaches the backend (virtio-scsi.c:virtio_scsi_run_tmf ->
+#   device_cold_reset -> scsi-bus.c:scsi_device_purge_requests, and
+#   scsi_req_dequeue's "Held, so it never ran" case).
+# - Removing the one fault that both holds the commands and hangs the
+#   reset does not let the reads complete. x-scsi-fault-remove schedules
+#   the release in each request's AioContext (scsi_fault_let_go ->
+#   scsi_fault_release_orphans) and, through virtio_scsi_fault_removed,
+#   the hung reset's recheck in the main loop (virtio_scsi_tmf_bh ->
+#   virtio_scsi_tmf_recheck_hung -> virtio_scsi_tmf_resume), and nothing
+#   orders the two. In a throwaway qtest of exactly that, 15 runs each,
+#   the read never came back GOOD. In the main loop it came back RESET
+#   every time, but its data had been transferred: BHs run newest first,
+#   so the reset's ran first, and blk_drain in scsi_device_purge_requests
+#   polls BHs itself, which ran the release before the purge, so the read
+#   was sent and only its completion cancelled. With an iothread (the
+#   harness's default) 13 came back RESET with nothing transferred and 2
+#   ABORTED with the data in. Either way the guest sees the read fail,
+#   never complete late. storage-error-injection.rst says as much: the
+#   held count in SCSI_FAULT_CLEARED is only an upper bound on what runs.
+# - So the reset is hung by a second fault, the companion, which holds no
+#   commands (probability 0; scsi_fault_recovery does not look at
+#   probability, so it still hangs the TMF). Removing the first fault then
+#   lets the held reads run with the reset still hung by the companion:
+#   virtio_scsi_tmf_recheck_hung finds it still hung and leaves it be. The
+#   reads complete normally, into guest memory, LATE_DMA_SETTLE_S before
+#   the companion goes and the reset is carried out. tests/qtest/
+#   virtio-scsi-test.c:test_fault_below_hang_holds_none pins exactly this,
+#   in the main loop and with an iothread: the held READ completes GOOD
+#   with its data in the buffer while the reset stays hung, and the reset
+#   is answered once the companion goes.
+#
+# Always target 0: the upstream driver's DeviceReset() addresses its LUN
+# reset to target 0 LUN 0 whatever timed out, and a LUN reset only reaches
+# a fault on the target it names (scsi_fault_in_scope). A fault elsewhere
+# would never see the upstream driver's reset, though it would still have
+# its reads completed under it. An adapter reset (bus-reset) cancels every
+# held command and drops the hung reset, which ruins the cycle; its
+# record says whether one came first.
 SCENARIOS = [
     Scenario("lun-reset-clears", "recovery",
              "hung until a LUN reset; aborts cancel what it holds but leave "
@@ -1949,11 +2085,26 @@ SCENARIOS = [
              "hung whatever the guest does, until the harness removes it "
              "after --dead-target-s (the drive being replaced)",
              lambda st: {"clear-on": "manual"}),
+    # Not in the default rotation: it is built to bugcheck the guest, and a
+    # soak that did so on its first late-dma cycle would test nothing else.
+    Scenario("late-dma", "late-dma",
+             "target 0 hung, and the LUN reset left hanging, until the "
+             "harness lets the held reads run --late-dma-delay-s after the "
+             "guest has given up on one (--late-dma-release-after); see "
+             "--bsod",
+             lambda st: {"clear-on": "manual", "below-clear": "hang"},
+             companion=lambda st: {"probability": 0.0, "clear-on": "manual",
+                                   "below-clear": "hang"},
+             target=0, in_default=False),
 ]
 SCENARIOS_BY_NAME = {sc.name: sc for sc in SCENARIOS}
+DEFAULT_SCENARIOS = [sc.name for sc in SCENARIOS if sc.in_default]
 
 CYCLE_END_OUTCOMES = {"recovery": "not-recovered", "window": "window-ended",
-                      "dead": "replaced"}
+                      "dead": "replaced", "late-dma": "not-recovered"}
+# Keys of a cycle in progress that only the cycler uses.
+CYCLE_PRIVATE_KEYS = ("trace", "armed_t", "armed_epoch", "end_t",
+                      "trigger_t", "read_poll_t")
 
 # QMP events worth a line on the console if one arrives during the soak:
 # the guest rebooting or crashing in a way QEMU sees.
@@ -1995,8 +2146,14 @@ class FaultCycler:
 
     def __init__(self, scenarios: list, settings: FaultSettings,
                  adapters: int, targets: int, seed: int, start: float,
-                 stderr: "QemuStderr", tmf_trace: bool):
+                 stderr: "QemuStderr", tmf_trace: bool,
+                 read_errors: Optional[Callable[[int, int],
+                                                Optional[int]]] = None):
+        """read_errors(adapter, target) is how many reads the guest's
+        readers on that target have seen fail so far, or None if that
+        can't be told right now; late-dma's read-error trigger needs it."""
         self.scenarios = scenarios
+        self.read_errors = read_errors
         self.settings = settings
         self.adapters = adapters
         self.targets = targets
@@ -2019,6 +2176,9 @@ class FaultCycler:
         # removed before the next one is armed.
         self._orphans: dict = {}
         self._arm_failures = 0
+        # The companion fault of the cycle that ended last, until it is
+        # removed: device, id, when (due_t) and the cycle's record.
+        self._companion: Optional[dict] = None
 
     def begin(self, qmp, now: float) -> None:
         """Start cycling. Events queued since QMP connected -- boot's own
@@ -2066,16 +2226,20 @@ class FaultCycler:
 
     def tick(self, qmp, now: float) -> None:
         self.pump_events(qmp)
+        self._remove_companion(qmp, now)
         cur = self.current
         if cur is not None:
             ev = self._cleared.pop((cur["device"], cur["fault_id"]), None)
             if ev is not None:
                 self._finish(cur, ev, now)
+            elif cur["ends"] == "late-dma":
+                self._late_dma_tick(qmp, cur, now)
             elif now >= cur["end_t"]:
                 self._remove(qmp, cur, CYCLE_END_OUTCOMES[cur["ends"]], now)
             else:
                 self._snapshot(qmp, cur)
-        elif (self.disarmed is None and self.next_arm_t is not None
+        elif (self.disarmed is None and self._companion is None
+              and self.next_arm_t is not None
               and now >= self.next_arm_t and self._remove_orphans(qmp)):
             self._arm(qmp, now)
 
@@ -2100,28 +2264,50 @@ class FaultCycler:
         sc = next(self._next)
         index = len(self.cycles)
         adapter = self.rng.randrange(self.adapters)
-        target = self.rng.randrange(self.targets)
+        target = (sc.target if sc.target is not None
+                  else self.rng.randrange(self.targets))
         fault = {"id": f"c{index}-{sc.name}", "target": target,
                  **sc.options(self.settings)}
+        companion = (None if sc.companion is None else
+                     {"id": f"{fault['id']}-tmf", "target": target,
+                      **sc.companion(self.settings)})
         cur = {"index": index, "scenario": sc.name, "ends": sc.ends,
                "adapter": adapter, "target": target,
                "device": f"scsi{adapter}", "fault_id": fault["id"],
                "fault": fault, "armed_at": utc_now(),
                "armed_s": round(now - self.start, 1),
                "armed_t": now, "end_t": now + sc.limit_s(self.settings)}
+        if companion is not None:
+            cur["companion"] = companion
+            cur["companion_id"] = companion["id"]
+            # Its own clearing is never a cycle's end; see _remove_companion.
+            self._done.add((cur["device"], companion["id"]))
+        if sc.ends == "late-dma":
+            cur["late_dma"] = {
+                "release_after": self.settings.late_dma_release_after,
+                "delay_s": self.settings.late_dma_delay_s,
+                "first_attempt_s": None, "first_attempt": None,
+                "first_read_error_s": None, "read_errors_before": None,
+                "released_s": None}
+            cur["read_poll_t"] = now
         trace = CycleTrace(f"scsi{adapter}.0", target, fault["id"],
                            cur["armed_at"])
         self.stderr.watch(trace)
         cur["trace"] = trace
+        added: list = []
         try:
-            qmp_call(qmp, "x-scsi-fault-add", device=cur["device"],
-                     fault=fault)
+            for f in [fault] + ([companion] if companion else []):
+                added.append(f["id"])
+                qmp_call(qmp, "x-scsi-fault-add", device=cur["device"],
+                         fault=f)
         except Exception as exc:
             self.stderr.unwatch(trace)
             del cur["trace"]
             cur["error"] = repr(exc)
-            # Unanswered rather than refused, it may be armed after all.
-            self._orphans[(cur["device"], fault["id"])] = repr(exc)
+            # Unanswered rather than refused, it may be armed after all;
+            # and a companion that failed leaves the first one armed.
+            for fault_id in added:
+                self._orphans[(cur["device"], fault_id)] = repr(exc)
             self._remove_orphans(qmp)
             self._record(cur, "arm-failed", now)
             self._arm_failures += 1
@@ -2180,6 +2366,88 @@ class FaultCycler:
             cur["held_at_clear"] = ev.get("held")
         self._record(cur, outcome, now)
 
+    def _schedule_companion(self, cur: dict, outcome: str,
+                            now: float) -> None:
+        """Have the companion fault of a cycle that just ended removed,
+        however it ended. For late-dma that lets the hung LUN reset go
+        ahead, so unless the harness is clearing up anyway (interrupted),
+        first give the commands the first fault's removal released
+        LATE_DMA_SETTLE_S to finish on their own (see the late-dma
+        scenario). Nothing is armed until it is gone."""
+        settle = 0.0 if outcome == "interrupted" else LATE_DMA_SETTLE_S
+        cur["companion_removed_s"] = None
+        self._companion = {"device": cur["device"], "id": cur["companion_id"],
+                           "due_t": now + settle, "cycle": cur}
+
+    def _remove_companion(self, qmp, now: float, force: bool = False) -> None:
+        """Remove the scheduled companion fault once it is due, or now if
+        force. A removal that gets no answer leaves it to _remove_orphans,
+        which the next arming waits for."""
+        comp = self._companion
+        if comp is None or (not force and now < comp["due_t"]):
+            return
+        self._companion = None
+        cycle = comp["cycle"]
+        try:
+            qmp_call(qmp, "x-scsi-fault-remove", device=comp["device"],
+                     id=comp["id"])
+        except Exception as exc:
+            if not _fault_gone(exc):
+                cycle["companion_remove_error"] = repr(exc)
+                self._orphans[(comp["device"], comp["id"])] = repr(exc)
+        cycle["companion_removed_s"] = round(now - self.start, 1)
+        self.pump_events(qmp)
+
+    def idle(self) -> bool:
+        """No cycle armed, and nothing of the last one left to remove."""
+        return self.current is None and self._companion is None
+
+    def _late_dma_tick(self, qmp, cur: dict, now: float) -> None:
+        """Watch a late-dma cycle for its trigger, release it
+        --late-dma-delay-s after, and give up on it at its deadline if the
+        trigger never came. The first recovery attempt comes from the
+        fault's own count of them (x-scsi-fault-list), so it is only as
+        exact as the loop's period; a read error from the readers' status
+        files, asked every LATE_DMA_READ_POLL_S."""
+        ld = cur["late_dma"]
+        self._snapshot(qmp, cur)
+        snap = cur.get("snapshot") or {}
+        if ld["first_attempt_s"] is None and any(
+                (snap.get("attempts") or {}).values()):
+            ld["first_attempt_s"] = round(now - cur["armed_t"], 1)
+            ld["first_attempt"] = snap.get("last-attempt")
+            if ld["release_after"] == "recovery":
+                cur["trigger_t"] = now
+        if (ld["release_after"] == "read-error" and "trigger_t" not in cur
+                and self.read_errors is not None
+                and now >= cur["read_poll_t"]):
+            cur["read_poll_t"] = now + LATE_DMA_READ_POLL_S
+            errors = self.read_errors(cur["adapter"], cur["target"])
+            if errors is not None:
+                # Errors from earlier cycles don't count. The baseline is
+                # the first answer, which may be a poll or two in.
+                if ld["read_errors_before"] is None:
+                    ld["read_errors_before"] = errors
+                elif errors > ld["read_errors_before"]:
+                    ld["first_read_error_s"] = round(now - cur["armed_t"], 1)
+                    cur["trigger_t"] = now
+        trigger_t = cur.get("trigger_t")
+        if trigger_t is not None and now >= trigger_t + ld["delay_s"]:
+            ld["released_s"] = round(now - cur["armed_t"], 1)
+            attempts = snap.get("attempts") or {}
+            ld["attempts_at_release"] = attempts
+            ld["adapter_reset_before_release"] = bool(
+                attempts.get("bus-reset"))
+            self._remove(qmp, cur, "released", now)
+        elif trigger_t is None and now >= cur["end_t"]:
+            self._remove(qmp, cur, CYCLE_END_OUTCOMES[cur["ends"]], now)
+
+    def late_dma_cycles(self) -> int:
+        """late-dma cycles that have run their course
+        (LATE_DMA_DONE_OUTCOMES)."""
+        return sum(1 for c in self.cycles if c["scenario"] == "late-dma"
+                   and c["outcome"] in LATE_DMA_DONE_OUTCOMES)
+
     def _finish(self, cur: dict, ev: dict, now: float) -> None:
         cur["cleared_by"] = ev.get("recovery")
         cur["held_at_clear"] = ev.get("held")
@@ -2199,11 +2467,14 @@ class FaultCycler:
         cur["ended_at"] = utc_now()
         cur["ended_s"] = round(now - self.start, 1)
         cur["duration_s"] = round(now - cur.pop("armed_t"), 1)
-        cur.pop("armed_epoch", None)
-        cur.pop("end_t", None)
+        for k in CYCLE_PRIVATE_KEYS:
+            cur.pop(k, None)
         self._done.add((cur["device"], cur["fault_id"]))
         self.cycles.append(cur)
         self.current = None
+        # A cycle that failed to arm left its faults to _remove_orphans.
+        if cur.get("companion_id") and outcome != "arm-failed":
+            self._schedule_companion(cur, outcome, now)
         self.next_arm_t = now + self.settings.cooldown_s
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
               f"{self.describe(cur)}")
@@ -2220,6 +2491,9 @@ class FaultCycler:
         if cur is not None:
             cur["interrupted_by"] = reason
             self._remove(qmp, cur, "interrupted", now)
+        # The last cycle's companion too, settling or not: the removal
+        # below takes it anyway, and this way its record says so.
+        self._remove_companion(qmp, now, force=True)
         for dev in adapter_ids(self.adapters):
             try:
                 qmp_call(qmp, "x-scsi-fault-remove", device=dev)
@@ -2244,8 +2518,7 @@ class FaultCycler:
         cur = self.current
         if cur is None:
             return None
-        return {k: v for k, v in cur.items()
-                if k not in ("trace", "armed_t", "armed_epoch", "end_t")}
+        return {k: v for k, v in cur.items() if k not in CYCLE_PRIVATE_KEYS}
 
     def panic_context(self, now: float) -> Optional[dict]:
         """Where the cycling was when the guest bugchecked: the cycle
@@ -2282,8 +2555,19 @@ class FaultCycler:
         elif outcome == "interrupted":
             head += (f"interrupted ({cur.get('interrupted_by')}) after "
                      f"{cur['duration_s']:.0f}s")
+        elif outcome == "released":
+            ld = cur["late_dma"]
+            head += (f"let {cur.get('held_at_clear', '?')} held command(s) "
+                     f"run {ld['delay_s']:.0f}s after the "
+                     f"{LATE_DMA_TRIGGERS[ld['release_after']]}, "
+                     f"{ld['released_s']:.0f}s after arming")
+            if ld.get("adapter_reset_before_release"):
+                head += " (an adapter reset came first, cancelling them)"
         else:
             head += f"{outcome} after {cur['duration_s']:.0f}s"
+            if "late_dma" in cur and outcome == "not-recovered":
+                trigger = LATE_DMA_TRIGGERS[cur["late_dma"]["release_after"]]
+                head += f", no {trigger} seen"
         # The snapshot is from the last tick, so for a fault the guest
         # cleared it may be a few seconds short; the trace lines are exact.
         snap = cur.get("snapshot") or {}
@@ -2318,6 +2602,8 @@ class FaultCycler:
                 "device": cur["device"], "target": cur["target"],
                 "age_s": round(now - cur["armed_t"], 0),
                 "held": (cur.get("snapshot") or {}).get("held")}
+        if self._companion is not None:
+            out["companion_pending"] = self._companion["id"]
         if self.disarmed:
             out["disarmed"] = self.disarmed
         if self._orphans:
@@ -2375,7 +2661,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              dump_on_agent_stall: bool = False,
              qga_trace: bool = True,
              hv_crash: bool = True,
-             cached_read_file_bytes: int = 0) -> dict:
+             cached_read_file_bytes: int = 0,
+             bsod_cycles: Optional[int] = None) -> dict:
+    """bsod_cycles is --bsod: end the run once that many late-dma cycles
+    have run their course (LATE_DMA_DONE_OUTCOMES) with no bugcheck, and
+    treat a writer exiting or a chunk read back wrong as something to note
+    rather than the end of the run, since either can come before the
+    bugcheck the run is waiting for. A broken ring is watched
+    BSOD_BREAK_WATCH_S for a bugcheck, then ends the run virtio-broken."""
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -2558,6 +2851,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         result["outcome"] = "guest-panicked"
         result["elapsed_s"] = elapsed
         result["guest_panic"] = panic
+        if bsod_cycles:
+            result["bsod_verdict"] = (f"bugcheck {panic['bugcheck']}"
+                                      f"{bsod_corruption_note()}")
         print(f"    guest bugchecked after {elapsed:.0f}s: "
               f"{panic['bugcheck']}; dumping guest memory to "
               f"{panic_dump_path}", file=sys.stderr)
@@ -2654,6 +2950,15 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         if not exited:
             return False
         outcome, why = classify_writer_exit(exited)
+        if bsod_cycles:
+            noted = {st["pid"] for st in result.get("writer_exits", [])}
+            new = [st for st in exited if st["pid"] not in noted]
+            if new:
+                result.setdefault("writer_exits", []).extend(new)
+                print(f"    {io_driver} writer(s) exited ({outcome}: {why}) "
+                      f"on {sorted(writer_luns.get(st['pid']) for st in new)}"
+                      f"; not the end of a --bsod run", file=sys.stderr)
+            return False
         result["outcome"] = outcome
         result["elapsed_s"] = elapsed
         # The writers that ended the run, as against the ones
@@ -2698,6 +3003,9 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         -- but wrong data in a read that succeeded is a data-integrity
         finding on any run."""
         cached_read.poll()
+        if bsod_cycles:
+            note_cached_read_corruption(elapsed)
+            return False
         bad = cached_read.mismatched()
         if not bad:
             return False
@@ -2717,6 +3025,35 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         collect_vioscsi_telemetry()
         write_status({"elapsed_s": elapsed})
         return True
+
+    def note_cached_read_corruption(elapsed: float) -> None:
+        """--bsod: record the chunks read back wrong so far, as
+        cached_read last saw them, without ending the run. Wrong data is
+        late DMA landing somewhere harmless enough; the run goes on for
+        the bugcheck, and the verdict says what was found."""
+        bad = cached_read.mismatched()
+        if not bad:
+            return
+        before = result.get("cached_read_mismatches") or {}
+        if not before:
+            result["cached_read_mismatch_first_s"] = round(elapsed, 1)
+        result["cached_read_mismatches"] = {
+            serial: {"mismatches": n, "last": last}
+            for serial, (n, last) in bad.items()}
+        if result["cached_read_mismatches"] != before:
+            print("    cached-read data read back wrong (not the end of a "
+                  "--bsod run): " + "; ".join(
+                      f"{serial}: {n} chunk(s), last {last}"
+                      for serial, (n, last) in bad.items()), file=sys.stderr)
+
+    def bsod_corruption_note() -> str:
+        bad = result.get("cached_read_mismatches")
+        if not bad:
+            return ""
+        luns = ", ".join(f"{serial} ({v['mismatches']} chunk(s))"
+                         for serial, v in bad.items())
+        return (f"; cached data read back wrong from "
+                f"{result['cached_read_mismatch_first_s']:.0f}s on, on {luns}")
 
     def diagnose_failed_launch(reason: str, request: Optional[str] = None,
                                request_sent_at: Optional[str] = None,
@@ -2828,6 +3165,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "dump_on_agent_stall": dump_on_agent_stall,
                 "qga_trace": qga_trace,
                 "hv_crash": hv_crash,
+                "cached_read_file_bytes": cached_read_file_bytes,
+                "bsod_cycles": bsod_cycles,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -3019,8 +3358,19 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         # pre-flight is just as broken.
         result["tmf_trace_pre_soak"] = qemu_stderr.take_counts()
 
+        def target_read_errors(adapter: int, target: int) -> Optional[int]:
+            """Reads failed so far on a target's cached-read LUNs."""
+            serials = [s.serial for s in lun_specs
+                       if (s.adapter, s.target) == (adapter, target)]
+            if not cached_read.poll() or any(sr not in cached_read.luns
+                                             for sr in serials):
+                return None
+            return sum(cached_read.luns[sr]["errors"] for sr in serials)
+
         cycler = FaultCycler(scenarios, settings, adapters, targets, seed,
-                             start, qemu_stderr, tmf_trace)
+                             start, qemu_stderr, tmf_trace,
+                             target_read_errors
+                             if io_driver == "cached-read" else None)
         cycler.begin(qmp, test_start)
 
         agent_alive = True
@@ -3047,18 +3397,40 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                 + IO_STALL_MARGIN_S)
         result["io_stall_threshold_s"] = io_stall_threshold_s
         io_progress = IoProgress(test_start, prev_wops, lun_specs)
+        # --bsod: a ring that broke, kept until BSOD_BREAK_WATCH_S has
+        # passed without a bugcheck.
+        broken_pending: list = []
+        broken_watch_end: Optional[float] = None
 
-        while time.monotonic() < monitor_deadline:
+        # A --bsod break watch outlasts --duration-hours: it only ends
+        # virtio-broken or guest-panicked, never completed.
+        while (time.monotonic() < monitor_deadline
+               or broken_watch_end is not None):
             now = time.monotonic()
             elapsed = now - start
 
             qemu_stderr.poll()
             broken_lines = qemu_stderr.take_broken()
+            if bsod_cycles and (broken_lines or broken_pending):
+                if broken_watch_end is None:
+                    broken_watch_end = now + BSOD_BREAK_WATCH_S
+                    result["faults_at_break"] = list_faults(qmp, adapters)
+                    result["broken_at_s"] = round(elapsed, 1)
+                    print(f"    virtio device broken after {elapsed:.0f}s: "
+                          f"{broken_lines[0]}; removing the faults and "
+                          f"watching {BSOD_BREAK_WATCH_S:.0f}s for a "
+                          f"bugcheck", file=sys.stderr)
+                    disarm("virtio-broken")
+                    write_status({"elapsed_s": elapsed})
+                broken_pending += broken_lines
+                broken_lines = (broken_pending if now >= broken_watch_end
+                                else [])
             if broken_lines:
                 result["outcome"] = "virtio-broken"
                 result["elapsed_s"] = elapsed
                 result["qemu_stderr"] = qemu_stderr.lines
-                result["faults_at_break"] = list_faults(qmp, adapters)
+                if "faults_at_break" not in result:
+                    result["faults_at_break"] = list_faults(qmp, adapters)
                 held_at_break = fault_holds(result["faults_at_break"])
                 # Before anything that needs the guest: it may be paused.
                 dump_if_stopped_on_broken()
@@ -3129,6 +3501,14 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                           f"{result['req_overlaps']}", file=sys.stderr)
                 write_status({"elapsed_s": elapsed})
 
+                if bsod_cycles:
+                    result["bsod_verdict"] = (
+                        f"no answer: a virtio ring broke after "
+                        f"{result.get('broken_at_s', elapsed):.0f}s and the "
+                        f"guest did not bugcheck within "
+                        f"{BSOD_BREAK_WATCH_S:.0f}s of it"
+                        f"{bsod_corruption_note()}")
+                    print(f"    {result['bsod_verdict']}")
                 collect_vioscsi_telemetry()
                 # Adapters keep falling over while telemetry is collected.
                 record_trace()
@@ -3148,7 +3528,47 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             if guest_panicked():
                 return record_guest_panic(elapsed)
 
+            # Once the last late-dma cycle's cooldown has passed with no
+            # bugcheck, which is the guest's grace to crash in. Never with
+            # a ring broken: that run ends virtio-broken, or guest-panicked
+            # if the bugcheck comes in the watch, whenever it broke.
+            if (bsod_cycles and broken_watch_end is None and cycler.idle()
+                    and cycler.late_dma_cycles() >= bsod_cycles
+                    and cycler.next_arm_t is not None
+                    and now >= cycler.next_arm_t):
+                # A break since this pass's poll goes round again first.
+                qemu_stderr.poll()
+                if qemu_stderr.has_broken():
+                    continue
+                writers_failed(elapsed)  # only noted, under --bsod
+                result["elapsed_s"] = elapsed
+                released = sum(1 for c in cycler.cycles
+                               if c["outcome"] == "released")
+                if result.get("cached_read_mismatches"):
+                    result["outcome"] = "data-corruption"
+                    result["bsod_verdict"] = (
+                        f"late DMA corrupted cached data but no bugcheck: "
+                        f"{bsod_cycles} late-DMA cycle(s), {released} of them "
+                        f"with the held reads let go after the trigger"
+                        f"{bsod_corruption_note()}")
+                else:
+                    result["outcome"] = "cycles-complete"
+                    result["bsod_verdict"] = (
+                        f"no bugcheck: the guest survived {bsod_cycles} "
+                        f"late-DMA cycle(s), {released} of them with the held "
+                        f"reads let go after the trigger, and every chunk "
+                        f"read back as written")
+                print(f"    {result['bsod_verdict']}")
+                disarm("end of run")
+                record_trace()
+                collect_vioscsi_telemetry()
+                write_status({"elapsed_s": elapsed})
+                return result
+
             cycler.tick(qmp, now)
+            if bsod_cycles:
+                # What the late-dma trigger's polls saw, at no extra cost.
+                note_cached_read_corruption(elapsed)
 
             if qga_ping(qga_sock):
                 agent_alive = True
@@ -3234,6 +3654,17 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
         result["outcome"] = "completed"
         result["elapsed_s"] = time.monotonic() - start
+        if bsod_cycles:
+            if result.get("cached_read_mismatches"):
+                result["outcome"] = "data-corruption"
+                head = "late DMA corrupted cached data but no bugcheck"
+            else:
+                head = "no bugcheck"
+            result["bsod_verdict"] = (
+                f"{head}, and only {cycler.late_dma_cycles()} of "
+                f"{bsod_cycles} late-DMA cycle(s) ran their course before "
+                f"--duration-hours ran out{bsod_corruption_note()}")
+            print(f"    {result['bsod_verdict']}")
         # Before telemetry, which stops the writers: they can't finish
         # while a target holds their I/O.
         disarm("end of run")
@@ -3291,7 +3722,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
 
         keep_debug_artifacts = (keep_all or result.get("telemetry_failure_screenshot")
                                  or result.get("telemetry_failure_dump"))
-        if result["outcome"] == "completed" and not keep_debug_artifacts:
+        if result["outcome"] in CLEAN_OUTCOMES and not keep_debug_artifacts:
             for f in [boot_overlay, vars_overlay, screenshot] + [s.image for s in lun_specs]:
                 f.unlink(missing_ok=True)
         else:
@@ -3299,6 +3730,102 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             result["serial_log"] = str(serial_log)
             result["qemu_log"] = str(qemu_log_path)
             result["dump"] = str(dump_path) if dump_path.exists() else None
+
+
+def bsod_banner(args) -> str:
+    """What --bsod does and how to read its result, for the start."""
+    trigger = LATE_DMA_TRIGGERS[args.late_dma_release_after]
+    return f"""--bsod: each cycle holds every command sent to target 0 of one adapter
+(the target the upstream driver's LUN reset always names) and leaves the
+guest's LUN reset hanging. A driver that completes pending requests
+without waiting for that reset (upstream vioscsi) hands the held reads
+back to Windows with nothing read. {args.late_dma_delay_s:.0f}s after the {trigger},
+the harness lets the held reads run, and their data lands in whatever
+Windows has put in those pages since; the readers on the other
+adapter(s) are what put something there. Up to {args.bsod_cycles} cycle(s).
+  guest-panicked   a bugcheck, with its STOP code: expected from upstream
+  data-corruption  no bugcheck, but a reader read back a chunk that is not
+                   what was written there: late DMA landed in reused pages
+                   without crashing anything
+  cycles-complete  survived every cycle with every chunk intact: expected
+                   from a driver that waits for the TMF response
+                   (reset_via_tmf)
+Any other outcome means the recipe never got to an answer; see the
+result."""
+
+
+def apply_bsod(args) -> Optional[str]:
+    """Fill in the defaults that depend on --bsod, and refuse what
+    contradicts it. An error message, or None. Options given explicitly
+    are kept where the recipe still works with them (--ram, the
+    deadlines); the ones it can't work without are refused rather than
+    quietly overridden."""
+    if args.bsod:
+        if args.scenarios not in (None, "late-dma"):
+            return ("--bsod runs the late-dma scenario only; leave out "
+                    "--scenarios")
+        if args.io_driver not in (None, "cached-read"):
+            return ("--bsod needs --io-driver=cached-read: the raw-disk "
+                    "drivers put a late read into their own buffer, which "
+                    "can't bugcheck the guest")
+        if args.hv_crash is False:
+            return "--bsod needs --hv-crash to see the bugcheck it waits for"
+        if args.stop_on_broken:
+            return ("--bsod runs with --no-stop-on-broken: the break dump "
+                    "would remove the faults and end the cycling before a "
+                    "bugcheck could come")
+        args.scenarios = "late-dma"
+        args.io_driver = "cached-read"
+        args.stop_on_broken = False
+        if args.bsod_cycles is None:
+            args.bsod_cycles = DEFAULT_BSOD_CYCLES
+        if args.bsod_cycles < 1:
+            return "--bsod-cycles must be >= 1"
+        if args.recovery_deadline_s is None:
+            args.recovery_deadline_s = BSOD_RECOVERY_DEADLINE_S
+        if args.ram is None:
+            args.ram = BSOD_RAM
+        if args.adapters is None:
+            args.adapters = BSOD_ADAPTERS
+            if args.targets is None:
+                args.targets = BSOD_TARGETS
+        elif args.adapters == 1:
+            print("Warning: --bsod with --adapters 1: the upstream driver's "
+                  "LUN reset pauses the whole adapter (StorPortPause, up to "
+                  "60s), so the readers that should reuse the failed reads' "
+                  "pages may be paused with it until after the release. "
+                  f"Leave out --adapters for {BSOD_ADAPTERS}.",
+                  file=sys.stderr)
+    elif args.bsod_cycles is not None:
+        return "--bsod-cycles only applies to --bsod"
+    if args.adapters is None:
+        args.adapters = DEFAULT_ADAPTERS
+    if args.targets is None:
+        args.targets = DEFAULT_TARGETS
+    if args.scenarios is None:
+        args.scenarios = ",".join(DEFAULT_SCENARIOS)
+    if args.io_driver is None:
+        args.io_driver = "powershell"
+    if args.hv_crash is None:
+        args.hv_crash = True
+    if args.stop_on_broken is None:
+        args.stop_on_broken = True
+    if args.recovery_deadline_s is None:
+        args.recovery_deadline_s = DEFAULT_RECOVERY_DEADLINE_S
+    if args.ram is None:
+        args.ram = DEFAULT_RAM
+    if args.late_dma_release_after is None:
+        args.late_dma_release_after = ("read-error"
+                                       if args.io_driver == "cached-read"
+                                       else "recovery")
+    elif (args.late_dma_release_after == "read-error"
+          and args.io_driver != "cached-read"):
+        return ("--late-dma-release-after=read-error needs "
+                "--io-driver=cached-read, whose readers report the errors")
+    if not (math.isfinite(args.late_dma_delay_s)
+            and args.late_dma_delay_s >= 0):
+        return "--late-dma-delay-s must be a finite number >= 0"
+    return None
 
 
 def main() -> int:
@@ -3319,13 +3846,13 @@ def main() -> int:
                           "adapter's recent TMFs to the result when it "
                           "breaks (default: on)")
     ap.add_argument("--stop-on-broken", action=argparse.BooleanOptionalAction,
-                     default=True,
+                     default=None,
                      help="pause the VM the moment a virtio-scsi ring breaks "
                           "(x-stop-on-broken), dump guest memory to break.dmp "
                           "while the failing request is still where the "
                           "driver left it, then resume. The dump removes "
                           "every target fault and no more are armed "
-                          "(default: on)")
+                          "(default: on, off under --bsod)")
     ap.add_argument("--ring-diag", action=argparse.BooleanOptionalAction,
                      default=True,
                      help="virtio-scsi's healthy-path break diagnostics: "
@@ -3358,7 +3885,7 @@ def main() -> int:
                           "going dark, and an agent found silent when "
                           "telemetry is collected (default: on)")
     ap.add_argument("--hv-crash", action=argparse.BooleanOptionalAction,
-                     default=True,
+                     default=None,
                      help="give the guest the Hyper-V crash MSRs (hv-crash) "
                           "and pause the VM when it reports a bugcheck "
                           "(-action panic=pause). The run then ends as "
@@ -3367,20 +3894,23 @@ def main() -> int:
                           "win-dmp in panic.dmp, instead of being caught "
                           "later as crash-suspected once the agent, the "
                           "screen and the LUNs have all gone quiet "
-                          "(default: on)")
+                          "(default: on; --bsod needs it)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
                           "adapter). 0 leaves all adapter I/O in QEMU's main "
                           "loop, where it contends with the guest agent and "
                           "QMP -- useful only to reproduce an old run")
-    ap.add_argument("--adapters", type=int, default=1,
+    ap.add_argument("--adapters", type=int, default=None,
                      help="number of vioscsi (virtio-scsi-pci) adapters to "
-                          "create (default: %(default)s); --targets and "
+                          f"create (default: {DEFAULT_ADAPTERS}, "
+                          f"{BSOD_ADAPTERS} under --bsod); --targets and "
                           "--luns-per-target apply to each adapter")
-    ap.add_argument("--targets", type=int, default=2,
+    ap.add_argument("--targets", type=int, default=None,
                      help="number of SCSI targets per adapter (default: "
-                          "%(default)s). Faults are per target, and the "
+                          f"{DEFAULT_TARGETS}, or {BSOD_TARGETS} under --bsod "
+                          "when --adapters is left out too). Faults are per "
+                          "target, and the "
                           "VM needs at least two targets in all (--adapters "
                           "x --targets): the check for a guest gone dark "
                           "watches the LUNs no fault is holding, so with a "
@@ -3391,17 +3921,53 @@ def main() -> int:
                           "them (default: %(default)s)")
     ap.add_argument("--duration-hours", type=float, default=4.0,
                      help="how long to run the soak test (default: %(default)s)")
-    ap.add_argument("--scenarios", default=",".join(SCENARIOS_BY_NAME),
+    ap.add_argument("--scenarios", default=None,
                      help="comma list of fault scenarios to rotate through, "
-                          "in order (default: all of them; see the list "
-                          "below)")
-    ap.add_argument("--recovery-deadline-s", type=float,
-                     default=DEFAULT_RECOVERY_DEADLINE_S,
+                          "in order (default: all of them but late-dma; "
+                          "late-dma alone under --bsod; see the list below)")
+    ap.add_argument("--recovery-deadline-s", type=float, default=None,
                      help="how long a scenario that waits for the guest's "
                           "recovery gets before the harness removes the "
-                          "fault itself and records not-recovered (default: "
-                          "%(default)s). Allow for the guest's ~60s timeout "
-                          "and a few rounds of escalation")
+                          "fault itself and records not-recovered, and how "
+                          "long late-dma waits for its trigger (default: "
+                          f"{DEFAULT_RECOVERY_DEADLINE_S:.0f}, "
+                          f"{BSOD_RECOVERY_DEADLINE_S:.0f} under --bsod). "
+                          "Allow for the guest's ~60s timeout and a few "
+                          "rounds of escalation")
+    ap.add_argument("--late-dma-delay-s", type=float,
+                     default=DEFAULT_LATE_DMA_DELAY_S,
+                     help="how long after its trigger late-dma lets the "
+                          "held reads run (default: %(default)s)")
+    ap.add_argument("--late-dma-release-after",
+                     choices=sorted(LATE_DMA_TRIGGERS), default=None,
+                     help="late-dma's trigger: 'read-error', the first read "
+                          "the guest's readers on the faulted target see "
+                          "fail (by then Windows should have given up on it "
+                          "and freed its pages; needs --io-driver="
+                          "cached-read), or "
+                          "'recovery', the first recovery attempt the fault "
+                          "sees (Windows may still be retrying the read "
+                          "into the same pages then). Default: read-error "
+                          "with cached-read, otherwise recovery")
+    ap.add_argument("--bsod", action="store_true",
+                     help="run the recipe meant to bugcheck a vioscsi that "
+                          "completes requests the device still owns: "
+                          "late-dma cycles with the cached-read driver and "
+                          "hv-crash, stop-on-broken off, and neither a "
+                          "broken ring nor a writer exiting ending the run. "
+                          "It ends guest-panicked at the first bugcheck, "
+                          "data-corruption if --bsod-cycles late-dma cycles "
+                          "pass without one but a reader read back wrong "
+                          "data, or cycles-complete if they pass clean; a "
+                          "broken ring ends it virtio-broken. Also defaults "
+                          f"--ram to {BSOD_RAM}, --recovery-deadline-s to "
+                          f"{BSOD_RECOVERY_DEADLINE_S:.0f} and --adapters x "
+                          f"--targets to {BSOD_ADAPTERS} x {BSOD_TARGETS}; "
+                          "options given explicitly win where they don't "
+                          "defeat the recipe")
+    ap.add_argument("--bsod-cycles", type=int, default=None,
+                     help="late-dma cycles a --bsod run gets to bugcheck the "
+                          f"guest (default: {DEFAULT_BSOD_CYCLES})")
     ap.add_argument("--window-s", type=float, default=DEFAULT_WINDOW_S,
                      help="how long slow-target and late-completion stay "
                           "armed (default: %(default)s)")
@@ -3422,8 +3988,9 @@ def main() -> int:
                           "(default: %(default)s)")
     ap.add_argument("--io-driver",
                      choices=["powershell", "diskspd", "fio", "cached-read"],
-                     default="powershell",
-                     help="how to drive guest I/O: 'powershell' (default) runs "
+                     default=None,
+                     help="how to drive guest I/O: 'powershell' (default; "
+                          "cached-read under --bsod) runs "
                           "the built-in raw-write loop (writes only -- use "
                           "diskspd or fio to also exercise reads); 'diskspd' "
                           "launches Microsoft's diskspd.exe with a 50/50 "
@@ -3466,7 +4033,9 @@ def main() -> int:
                           "LUNs, so it swings with whatever fault happened to "
                           "be armed meanwhile; the per-cycle records, not "
                           "the heartbeats, say what each fault did")
-    ap.add_argument("--ram", default=DEFAULT_RAM)
+    ap.add_argument("--ram", default=None,
+                     help=f"guest RAM (default: {DEFAULT_RAM}, {BSOD_RAM} "
+                          f"under --bsod)")
     ap.add_argument("--cpus", default=DEFAULT_CPUS)
     ap.add_argument("--host-pressure-cores", default=None, metavar="CPULIST",
                      help="restrict QEMU to these host cores via taskset "
@@ -3483,6 +4052,10 @@ def main() -> int:
     ap.add_argument("--keep-all", action="store_true",
                      help="keep overlays/images even for a clean 'completed' run")
     args = ap.parse_args()
+    err = apply_bsod(args)
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        return 1
 
     if args.host_pressure_cores and not shutil.which("taskset"):
         print("Error: --host-pressure-cores given but 'taskset' not found in PATH.",
@@ -3531,7 +4104,9 @@ def main() -> int:
         recovery_deadline_s=args.recovery_deadline_s,
         window_s=args.window_s, dead_target_s=args.dead_target_s,
         cooldown_s=args.cooldown_s, tmf_hang_ms=args.tmf_hang_ms,
-        late_probability=args.late_probability)
+        late_probability=args.late_probability,
+        late_dma_delay_s=args.late_dma_delay_s,
+        late_dma_release_after=args.late_dma_release_after)
 
     if args.adapters < 1 or args.targets < 1 or args.luns_per_target < 1:
         print("Error: --adapters, --targets and --luns-per-target must all "
@@ -3607,6 +4182,8 @@ def main() -> int:
           f"({args.adapters} adapter(s) x {args.targets} target(s) x "
           f"{args.luns_per_target} lun(s)), scenarios: "
           f"{', '.join(names)}.")
+    if args.bsod:
+        print(bsod_banner(args))
 
     result = run_soak(args.adapters, args.targets, args.luns_per_target,
                        duration_s, args.ram, args.cpus,
@@ -3618,13 +4195,18 @@ def main() -> int:
                        args.disk_dir, args.iothreads, args.tmf_trace,
                        args.stop_on_broken, args.ring_diag,
                        args.dump_on_agent_stall, args.qga_trace,
-                       args.hv_crash, cached_read_file_bytes)
+                       args.hv_crash, cached_read_file_bytes,
+                       args.bsod_cycles if args.bsod else None)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
 
     print()
     print(f"Outcome: {result['outcome']} ({result['elapsed_s']:.0f}s)")
+    if "guest_panic" in result:
+        print(f"Bugcheck: {result['guest_panic'].get('bugcheck')}")
+    if "bsod_verdict" in result:
+        print(f"--bsod: {result['bsod_verdict']}")
     print(f"Result written to {results_path}")
     if result["outcome"] in FAILURE_OUTCOMES:
         print(f"Artifacts in {result['run_dir']}")
