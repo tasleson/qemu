@@ -1054,6 +1054,589 @@ def capture_vioscsi_telemetry(qga_sock: Path, script_path: str, out_path: Path,
     return ok, f"exitcode={status.get('exitcode')}, saved to {out_path}"
 
 
+# ------------------------------------------------------------------
+# vioscsi's reset behaviour (VioscsiActionOnReset)
+# ------------------------------------------------------------------
+
+# What a reset SRB does, per ACTION_ON_RESET in vioscsi.h. Released
+# drivers have read the value since eff7b430 (2023) and know 0, 1 and
+# 0xDEADDEAD; only reset_via_tmf builds know send-tmf (2), and only they
+# treat a value not listed here as send-tmf (a release falls through into
+# its SRB_FUNCTION_WMI case instead; see action_on_reset_refusal). The
+# driver reads it once per adapter, in VioScsiFindAdapter, from the
+# service-wide Parameters\Device key, so a new value only takes effect
+# once every vioscsi adapter has been restarted.
+VIOSCSI_SERVICE = "vioscsi"
+VIOSCSI_DEVICE_PARAMS_KEY = (r"HKLM:\SYSTEM\CurrentControlSet\Services"
+                             rf"\{VIOSCSI_SERVICE}\Parameters\Device")
+ACTION_ON_RESET_VALUE = "VioscsiActionOnReset"
+ACTION_ON_RESET_VALUES = {
+    "complete-requests": 0,  # VioscsiResetCompleteRequests, the old default
+    "do-nothing": 1,         # VioscsiResetDoNothing
+    "send-tmf": 2,           # VioscsiResetSendTmf, the current default
+}
+# Deletes the value, so the driver's own default applies.
+ACTION_ON_RESET_DEFAULT = "default"
+ACTION_ON_RESET_CHOICES = (*ACTION_ON_RESET_VALUES, ACTION_ON_RESET_DEFAULT)
+# VioscsiResetBugCheck: KeBugCheckEx(0xDEADDEAD, ...) on every reset.
+ACTION_ON_RESET_BUGCHECK = 0xDEADDEAD
+ACTION_ON_RESET_REQUEST = "set VioscsiActionOnReset and restart vioscsi"
+# Each of the guest's waits (controllers stopped, started, LUNs back)
+# gets this long.
+ACTION_ON_RESET_STAGE_TIMEOUT_S = 120
+ACTION_ON_RESET_STAGES = 3
+# The driver exports nothing that says which value an adapter read: the
+# telemetry IOCTL (VIOSCSI_IOCTL_QUERY_TELEMETRY) returns STOR_TELEMETRY,
+# which has no such field. Only the event ring records it, in Value2 of
+# every reset request, and only a memory dump shows the event ring.
+ACTION_ON_RESET_UNCONFIRMED = (
+    "the driver's live value is not confirmed: vioscsi reports it nowhere "
+    "a running guest can read (not in its telemetry IOCTL), only in the "
+    "event ring of a memory dump, where every reset request shows it. "
+    "Check a dump from the run with the driver repo's "
+    "Tools/debug/evring.py events <dump>: each reset request should say "
+    "'action on reset {expect}'")
+
+
+class ActionOnResetError(RuntimeError):
+    """Setting VioscsiActionOnReset, or restarting the adapters so the
+    driver reads it, failed in the guest. The run can't say which reset
+    behaviour it tested, so it must not start."""
+
+
+def parse_action_on_reset(text: str) -> str:
+    """argparse type for --action-on-reset: one of ACTION_ON_RESET_CHOICES.
+    The bugcheck value is refused by name and by number: a guest that
+    bugchecks on every reset makes a bugcheck say nothing about the driver
+    under test."""
+    name = text.strip().lower()
+    if name in ACTION_ON_RESET_CHOICES:
+        return name
+    number: Optional[int] = None
+    try:
+        number = int(name, 0)
+    except ValueError:
+        pass
+    if name in ("bugcheck", "bug-check") or number == ACTION_ON_RESET_BUGCHECK:
+        raise argparse.ArgumentTypeError(
+            f"refusing VioscsiResetBugCheck ({ACTION_ON_RESET_BUGCHECK:#X}): "
+            f"the driver bugchecks on every reset with it, so a bugcheck "
+            f"would say nothing about how it handles one")
+    names = ", ".join(f"{n} ({v})" for n, v in ACTION_ON_RESET_VALUES.items())
+    hint = next((f"; {number} is {n}" for n, v in ACTION_ON_RESET_VALUES.items()
+                 if v == number), "")
+    raise argparse.ArgumentTypeError(
+        f"unknown action {text!r}{hint}: give one of {names}, or "
+        f"{ACTION_ON_RESET_DEFAULT} to delete the value and get the "
+        f"driver's default")
+
+
+def action_on_reset_label(name: str) -> str:
+    """'complete-requests (VioscsiActionOnReset=0)' and the like."""
+    if name == ACTION_ON_RESET_DEFAULT:
+        return (f"{name} ({ACTION_ON_RESET_VALUE} deleted: the driver's "
+                f"own default, send-tmf in reset_via_tmf builds)")
+    return f"{name} ({ACTION_ON_RESET_VALUE}={ACTION_ON_RESET_VALUES[name]})"
+
+
+VIOSCSI_IDENTITY_REQUEST = "identify the vioscsi driver"
+SHA256_HEX_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
+
+
+def parse_sha256(text: str) -> str:
+    """argparse type for a SHA-256 in hex, upper-cased as Get-FileHash
+    prints it."""
+    if not SHA256_HEX_RE.match(text.strip()):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a SHA-256 (64 hex digits)")
+    return text.strip().upper()
+
+
+def build_vioscsi_identity_script() -> str:
+    """What vioscsi build the guest has loaded, and what its registry value
+    says, as one 'IDENTITY <json>' line: the vioscsi.sys the service runs
+    (path, file version, SHA-256), each device bound to the service (PnP
+    driver version, date, INF, provider) and VioscsiActionOnReset if set.
+    Each part fails on its own, into 'errors', so the rest still comes
+    back; the script itself always exits 0."""
+    return f"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$service = '{VIOSCSI_SERVICE}'
+$key = '{VIOSCSI_DEVICE_PARAMS_KEY}'
+$name = '{ACTION_ON_RESET_VALUE}'
+$id = [ordered]@{{ errors = @(); devices = @() }}
+function Note($what) {{ $id.errors += "$what" -replace '\\s+', ' ' }}
+try {{
+    $path = (Get-CimInstance Win32_SystemDriver -Filter "Name='$service'").PathName
+    if (-not $path) {{ throw "no $service system driver" }}
+    $path = $path -replace '^\\\\\\?\\?\\\\', '' -replace '^\\\\SystemRoot', $env:SystemRoot
+    $id.sys_path = $path
+    $id.file_version = (Get-Item -LiteralPath $path).VersionInfo.FileVersion
+    $id.sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+}} catch {{ Note "vioscsi.sys: $($_.Exception.Message)" }}
+try {{
+    foreach ($d in @(Get-PnpDevice -PresentOnly | Where-Object {{ $_.Service -eq $service }})) {{
+        $dev = [ordered]@{{ instance_id = $d.InstanceId; name = $d.FriendlyName; status = "$($d.Status)" }}
+        foreach ($p in 'DriverVersion', 'DriverDate', 'DriverInfPath', 'DriverProvider') {{
+            $v = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName "DEVPKEY_Device_$p").Data
+            if ($v -is [datetime]) {{ $v = $v.ToString('yyyy-MM-dd') }}
+            $dev[$p] = "$v"
+        }}
+        $id.devices += ,$dev
+    }}
+}} catch {{ Note "devices: $($_.Exception.Message)" }}
+try {{
+    $k = Get-Item -Path $key -ErrorAction SilentlyContinue
+    if ($k -and ($k.GetValueNames() -contains $name)) {{
+        $id.registry = [ordered]@{{ present = $true; kind = "$($k.GetValueKind($name))"; value = "$($k.GetValue($name))" }}
+    }} else {{
+        $id.registry = [ordered]@{{ present = $false }}
+    }}
+}} catch {{ Note "registry: $($_.Exception.Message)" }}
+Write-Output ("IDENTITY " + (ConvertTo-Json $id -Compress -Depth 4))
+"""
+
+
+def read_vioscsi_identity(qga_sock: Path,
+                          resyncs: Optional[list] = None) -> dict:
+    """build_vioscsi_identity_script's answer as a dict. A failure to ask,
+    or an answer that doesn't parse, is recorded as 'error' (and the parts
+    the guest couldn't read as 'errors'), so a run on a guest that can't
+    say still goes ahead. The exception is NoReplyError: an agent that has
+    stopped answering won't run anything after this either, so it is
+    raised for the caller to diagnose where it happened."""
+    try:
+        pid = ps_exec(qga_sock, VIOSCSI_IDENTITY_REQUEST,
+                      build_vioscsi_identity_script(), capture=True,
+                      resyncs=resyncs)
+        status = qga_exec_wait(qga_sock, pid, timeout=GUEST_EXEC_TIMEOUT_S,
+                               silent_raises=VIOSCSI_IDENTITY_REQUEST)
+    except NoReplyError:
+        raise
+    except GuestExecError as exc:
+        return {"error": str(exc)}
+    if status is None:
+        return {"error": f"the identity script was still running after "
+                         f"{GUEST_EXEC_TIMEOUT_S}s"}
+    out = b64_text(status.get("out-data"))
+    for line in out.splitlines():
+        if line.startswith("IDENTITY "):
+            try:
+                ident = json.loads(line[len("IDENTITY "):])
+            except ValueError as exc:
+                return {"error": f"unparseable identity: {exc}",
+                        "output": out[-1000:]}
+            if isinstance(ident, dict):
+                return ident
+    err = b64_text(status.get("err-data")).strip()
+    return {"error": f"the identity script exited {status.get('exitcode')} "
+                     f"without an answer: {(err or out).strip()[-500:]}"}
+
+
+def describe_vioscsi_identity(ident: dict) -> str:
+    """One line for the console: version, date, hash and the value."""
+    if ident.get("error"):
+        return f"not identified ({ident['error']})"
+    devs = ident.get("devices") or [{}]
+    versions = sorted({f"{d.get('DriverVersion') or '?'} "
+                       f"({d.get('DriverDate') or '?'})" for d in devs})
+    reg = ident.get("registry") or {}
+    value = (f"{reg.get('kind')} {reg.get('value')}" if reg.get("present")
+             else "absent" if reg else "unread")
+    text = (f"{', '.join(versions)}, vioscsi.sys "
+            f"{ident.get('file_version') or '?'} sha256 "
+            f"{ident.get('sha256') or '?'}; {ACTION_ON_RESET_VALUE} {value}")
+    if ident.get("errors"):
+        text += f"; couldn't read: {'; '.join(ident['errors'])}"
+    return text
+
+
+def preset_action_on_reset_warning(ident: dict) -> Optional[str]:
+    """A warning when the guest already has VioscsiActionOnReset set and
+    the run was not asked to change it, or None. The value then decides
+    the arm the run tests, and some values make the result meaningless:
+    0xDEADDEAD bugchecks on every reset, and anything but 0 or 1 sends a
+    released driver's reset SRB into its SRB_FUNCTION_WMI case."""
+    reg = ident.get("registry") or {}
+    if not reg.get("present"):
+        return None
+    raw = str(reg.get("value"))
+    try:
+        value: Optional[int] = int(raw, 0)
+    except ValueError:
+        value = None
+    names = {v: n for n, v in ACTION_ON_RESET_VALUES.items()}
+    if value == ACTION_ON_RESET_BUGCHECK:
+        what = "the driver bugchecks on every reset, so a bugcheck proves nothing"
+    elif value in names:
+        what = f"this run tests {names[value]}, whatever the driver's default"
+        if value == ACTION_ON_RESET_VALUES["send-tmf"]:
+            what += ("; a released driver doesn't know that value and "
+                     "falls into its SRB_FUNCTION_WMI case on a reset")
+    else:
+        what = ("a reset_via_tmf build treats it as send-tmf; a released "
+                "driver falls into its SRB_FUNCTION_WMI case on a reset")
+    return (f"the guest image already has {ACTION_ON_RESET_VALUE} = "
+            f"{reg.get('kind')} {raw}: {what}. Remove it from the golden "
+            f"image, or set the arm with --action-on-reset")
+
+
+def action_on_reset_refusal(name: str, ident: dict,
+                            send_tmf_sha256: list) -> Optional[str]:
+    """Why --action-on-reset name must not be written to the driver ident
+    describes (read_vioscsi_identity), or None if it may.
+
+    Nothing the driver exports says which values it knows, so the
+    operator says it, by the SHA-256 of a vioscsi.sys known to be a
+    reset_via_tmf build (send_tmf_sha256). Writing a value the loaded
+    driver doesn't know is not a no-op: releases from eff7b430 (the
+    commit that added VioscsiActionOnReset) up to now know 0, 1 and
+    0xDEADDEAD only, and their reset switch has no default, so any other
+    value falls through into the SRB_FUNCTION_WMI case with the reset
+    SRB. Older drivers ignore the value, so it would only mislabel the
+    run. Hence:
+
+      - the driver can't be identified (no version or hash): refuse all;
+      - its hash is one of send_tmf_sha256: every arm;
+      - send_tmf_sha256 given and none matches: refuse all, the golden
+        image has some other build than the one meant;
+      - otherwise only complete-requests: every vioscsi build does that
+        on a reset, those that read 0 and those that predate the value
+        (they call CompletePendingRequests unconditionally)."""
+    sha = (ident.get("sha256") or "").upper()
+    versions = sorted({d.get("DriverVersion") or "?"
+                       for d in ident.get("devices") or []})
+    if ident.get("error") or not sha or not versions:
+        why = ident.get("error") or "; ".join(ident.get("errors") or [])
+        return (f"refusing --action-on-reset {name}: the loaded vioscsi "
+                f"driver could not be identified ({why or 'no version or hash'}"
+                f"), so there is no telling what writing "
+                f"{ACTION_ON_RESET_VALUE} would do")
+    loaded = (f"the loaded vioscsi is {', '.join(versions)}, vioscsi.sys "
+              f"{ident.get('file_version') or '?'} sha256 {sha}")
+    if sha in send_tmf_sha256:
+        return None
+    if send_tmf_sha256:
+        return (f"refusing --action-on-reset {name}: {loaded}, which is "
+                f"not the --vioscsi-sha256 given "
+                f"({', '.join(send_tmf_sha256)})")
+    if name == "complete-requests":
+        return None
+    return (f"refusing --action-on-reset {name}: {loaded}, and nothing it "
+            f"reports says whether it knows that value. Released drivers "
+            f"don't know send-tmf (2): it falls through their reset switch "
+            f"into the WMI handler with the reset SRB. Drivers before "
+            f"VioscsiActionOnReset ignore every value. If this is a "
+            f"reset_via_tmf build, say so with --vioscsi-sha256 {sha}; for "
+            f"a released driver, run without --action-on-reset: its arm is "
+            f"whatever that release does")
+
+
+def build_action_on_reset_script(value: Optional[int], serials: list,
+                                 stage_timeout_s: float
+                                 = ACTION_ON_RESET_STAGE_TIMEOUT_S) -> str:
+    """Set VioscsiActionOnReset to value (delete it for None), then disable
+    and re-enable every vioscsi controller so VioScsiFindAdapter reads it
+    again, and wait for every LUN serial to come back. Refuses, before
+    touching anything, if the boot or system disk is behind vioscsi.
+
+    Writes one line per step for parse_action_on_reset_output: CONTROLLER
+    <instance id> <name>, BOOTDISK <number> <parent>, REG <kind> <value> or
+    REG absent, DISABLED/ENABLED <instance id>, MISSING <serial>, LUNS
+    <seconds>, DONE; or FAIL <stage> <why>, with exit code 1."""
+    ps_value = "$null" if value is None else str(int(value))
+    serial_list = ",".join(f"'{s}'" for s in serials)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$service = '{VIOSCSI_SERVICE}'
+$key = '{VIOSCSI_DEVICE_PARAMS_KEY}'
+$name = '{ACTION_ON_RESET_VALUE}'
+$value = {ps_value}
+$serials = @({serial_list})
+$timeoutS = {int(stage_timeout_s)}
+# DN_STARTED, DN_NEED_RESTART (DN_LIAR) and DN_HAS_PROBLEM from cfg.h,
+# CM_PROB_DISABLED from cfgmgr32.h.
+$DN_STARTED = 0x8
+$DN_NEED_RESTART = 0x100
+$DN_HAS_PROBLEM = 0x400
+$CM_PROB_DISABLED = 22
+
+function Fail($stage, $why) {{
+    Write-Output "FAIL $stage $(($why | Out-String) -replace '\\s+', ' ')"
+    exit 1
+}}
+function NodeStatus($id) {{
+    [uint32](Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_DevNodeStatus).Data
+}}
+function ProblemCode($id) {{
+    $p = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_ProblemCode).Data
+    if ($null -eq $p) {{ 0 }} else {{ [uint32]$p }}
+}}
+function Describe($id) {{
+    $s = NodeStatus $id
+    "DevNodeStatus 0x$('{{0:X}}' -f $s), problem $(ProblemCode $id)"
+}}
+function PollState($id, $pollErr) {{
+    try {{ $d = Describe $id }} catch {{ $d = "state unreadable: $($_.Exception.Message)" }}
+    if ($pollErr) {{ $d += "; last poll error: $pollErr" }}
+    $d
+}}
+
+try {{
+    $ctrls = @(Get-PnpDevice -PresentOnly | Where-Object {{ $_.Service -eq $service }})
+}} catch {{ Fail 'find-controllers' $_.Exception.Message }}
+if ($ctrls.Count -eq 0) {{
+    Fail 'find-controllers' "no present PnP device is bound to the $service service"
+}}
+$ids = @($ctrls | ForEach-Object {{ $_.InstanceId }})
+foreach ($c in $ctrls) {{ Write-Output "CONTROLLER $($c.InstanceId) $($c.FriendlyName)" }}
+
+# Disabling the controller the guest boots from would take its own disk
+# away; the harnesses boot from SATA, but a golden image may not.
+$behind = $null
+try {{
+    $nums = @(Get-Disk | Where-Object {{ $_.IsBoot -or $_.IsSystem }} | ForEach-Object {{ $_.Number }})
+    $nums += (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))).DiskNumber
+    $nums = @($nums | Sort-Object -Unique)
+    foreach ($n in $nums) {{
+        $dd = Get-CimInstance Win32_DiskDrive -Filter "Index=$n"
+        if (-not $dd) {{ throw "no Win32_DiskDrive for disk $n" }}
+        $parent = (Get-PnpDeviceProperty -InstanceId $dd.PNPDeviceID -KeyName DEVPKEY_Device_Parent).Data
+        if (-not $parent) {{ throw "no parent device for disk $n ($($dd.PNPDeviceID))" }}
+        Write-Output "BOOTDISK $n $parent"
+        if ($ids -contains $parent) {{ $behind = "disk $n" }}
+    }}
+}} catch {{ Fail 'boot-disk' "can't tell whether the boot disk is behind $($service): $($_.Exception.Message)" }}
+if ($behind) {{
+    Fail 'boot-disk' "the boot/system $behind is behind a $service controller; restarting it would take the guest's own disk away"
+}}
+
+try {{
+    if ($null -eq $value) {{
+        if (Test-Path $key) {{ Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue }}
+    }} else {{
+        if (-not (Test-Path $key)) {{ New-Item -Path $key -Force | Out-Null }}
+        New-ItemProperty -Path $key -Name $name -PropertyType DWord -Value $value -Force | Out-Null
+    }}
+    $k = Get-Item -Path $key -ErrorAction SilentlyContinue
+    if ($k -and ($k.GetValueNames() -contains $name)) {{
+        $kind = $k.GetValueKind($name)
+        $got = [uint32]$k.GetValue($name)
+        Write-Output "REG $kind $got"
+    }} else {{
+        $kind = $null
+        $got = $null
+        Write-Output 'REG absent'
+    }}
+}} catch {{ Fail 'registry' $_.Exception.Message }}
+if ($null -eq $value) {{
+    if ($null -ne $got) {{ Fail 'registry' "$name is still there ($got) after deleting it" }}
+}} elseif ("$kind" -ne 'DWord' -or $got -ne $value) {{
+    Fail 'registry' "$name reads back as $kind $got, not DWord $value"
+}}
+
+# Every controller off before any comes back, so the driver itself is
+# unloaded and loaded again too.
+foreach ($c in $ctrls) {{
+    try {{ Disable-PnpDevice -InstanceId $c.InstanceId -Confirm:$false }}
+    catch {{ Fail 'disable' "$($c.InstanceId): $($_.Exception.Message)" }}
+}}
+$deadline = (Get-Date).AddSeconds($timeoutS)
+foreach ($c in $ctrls) {{
+    $pollErr = $null
+    while ($true) {{
+        # Device properties can fail to read for a moment while the device
+        # tree changes; keep trying until the deadline rather than dying on
+        # the first error.
+        try {{
+            $s = NodeStatus $c.InstanceId
+            if ($s -band $DN_NEED_RESTART) {{
+                Fail 'disable' "$($c.InstanceId) needs a reboot to stop ($(Describe $c.InstanceId))"
+            }}
+            if (-not ($s -band $DN_STARTED) -and (ProblemCode $c.InstanceId) -eq $CM_PROB_DISABLED) {{
+                Write-Output "DISABLED $($c.InstanceId)"
+                break
+            }}
+        }} catch {{ $pollErr = $_.Exception.Message }}
+        if ((Get-Date) -gt $deadline) {{
+            Fail 'disable' "$($c.InstanceId) not stopped after $($timeoutS)s ($(PollState $c.InstanceId $pollErr))"
+        }}
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+
+foreach ($c in $ctrls) {{
+    try {{ Enable-PnpDevice -InstanceId $c.InstanceId -Confirm:$false }}
+    catch {{ Fail 'enable' "$($c.InstanceId): $($_.Exception.Message)" }}
+}}
+$deadline = (Get-Date).AddSeconds($timeoutS)
+foreach ($c in $ctrls) {{
+    $pollErr = $null
+    while ($true) {{
+        try {{
+            $s = NodeStatus $c.InstanceId
+            if ($s -band $DN_NEED_RESTART) {{
+                Fail 'enable' "$($c.InstanceId) needs a reboot to start ($(Describe $c.InstanceId))"
+            }}
+            if (($s -band $DN_STARTED) -and -not ($s -band $DN_HAS_PROBLEM)) {{
+                Write-Output "ENABLED $($c.InstanceId)"
+                break
+            }}
+        }} catch {{ $pollErr = $_.Exception.Message }}
+        if ((Get-Date) -gt $deadline) {{
+            Fail 'enable' "$($c.InstanceId) not started after $($timeoutS)s ($(PollState $c.InstanceId $pollErr))"
+        }}
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+
+$t0 = Get-Date
+$deadline = $t0.AddSeconds($timeoutS)
+$pollErr = $null
+$missing = @($serials)
+while ($true) {{
+    # Storage WMI can throw while the disks are re-enumerating; that is a
+    # poll to retry, not a failure.
+    try {{
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+        $seen = @(Get-Disk | ForEach-Object {{ $_.SerialNumber }})
+        $missing = @($serials | Where-Object {{ $seen -notcontains $_ }})
+        if ($missing.Count -eq 0) {{ break }}
+    }} catch {{ $pollErr = $_.Exception.Message }}
+    if ((Get-Date) -gt $deadline) {{
+        foreach ($m in $missing) {{ Write-Output "MISSING $m" }}
+        $why = "$($missing.Count) of $($serials.Count) LUN(s) not back $($timeoutS)s after the restart"
+        if ($pollErr) {{ $why += "; last Get-Disk error: $pollErr" }}
+        Fail 'luns' $why
+    }}
+    Start-Sleep -Seconds 1
+}}
+Write-Output "LUNS $([int]((Get-Date) - $t0).TotalSeconds)"
+Write-Output 'DONE'
+"""
+
+
+def parse_action_on_reset_output(out: str) -> dict:
+    """What build_action_on_reset_script's lines say, as a dict."""
+    parsed: dict = {"controllers": [], "boot_disks": [], "registry": None,
+                    "disabled": [], "enabled": [], "missing": [],
+                    "luns_back_s": None, "fail": None, "done": False}
+    for line in out.splitlines():
+        word, _, rest = line.strip().partition(" ")
+        if word == "CONTROLLER":
+            instance_id, _, friendly = rest.partition(" ")
+            parsed["controllers"].append({"instance_id": instance_id,
+                                          "name": friendly})
+        elif word == "BOOTDISK":
+            number, _, parent = rest.partition(" ")
+            parsed["boot_disks"].append({"disk": number, "parent": parent})
+        elif word == "REG":
+            kind, _, value = rest.partition(" ")
+            parsed["registry"] = ({"present": False} if kind == "absent"
+                                  else {"present": True, "kind": kind,
+                                        "value": value})
+        elif word in ("DISABLED", "ENABLED"):
+            parsed[word.lower()].append(rest)
+        elif word == "MISSING":
+            parsed["missing"].append(rest)
+        elif word == "LUNS":
+            parsed["luns_back_s"] = int(rest) if rest.isdigit() else rest
+        elif word == "FAIL":
+            stage, _, why = rest.partition(" ")
+            parsed["fail"] = {"stage": stage, "why": why}
+        elif word == "DONE":
+            parsed["done"] = True
+    return parsed
+
+
+def apply_action_on_reset(qga_sock: Path, name: str, serials: list,
+                          record: dict,
+                          resyncs: Optional[list] = None) -> dict:
+    """Set VioscsiActionOnReset in the guest for name (one of
+    ACTION_ON_RESET_CHOICES) and restart every vioscsi controller so the
+    driver reads it (build_action_on_reset_script), then check the
+    registry reads back what was asked for and every serial is back.
+
+    record is filled in as it goes, so a caller that published it keeps
+    what was learnt when this raises: requested, requested_value (None
+    for default), registry_readback (None if the value is absent),
+    controllers, controllers_restarted, driver_confirmed (always None: see
+    ACTION_ON_RESET_UNCONFIRMED) and, on failure, failed_stage and
+    guest_output. Raises ActionOnResetError if any of it failed, and
+    NoReplyError if the agent stopped answering. Disk numbers can change
+    across the restart, so resolve them after this, not before."""
+    value = ACTION_ON_RESET_VALUES.get(name)
+    # What evring.py prints for it; deleted means the default, send-tmf.
+    expect = f"{ACTION_ON_RESET_VALUES['send-tmf'] if value is None else value:#x}"
+    record.update({"requested": name, "requested_value": value,
+                   "registry_key": VIOSCSI_DEVICE_PARAMS_KEY,
+                   "registry_value": ACTION_ON_RESET_VALUE,
+                   "registry_readback": None, "controllers": [],
+                   "controllers_restarted": [], "driver_confirmed": None,
+                   "driver_confirmed_note": ACTION_ON_RESET_UNCONFIRMED.format(
+                       expect=expect)})
+    timeout = (ACTION_ON_RESET_STAGES * ACTION_ON_RESET_STAGE_TIMEOUT_S
+               + GUEST_EXEC_TIMEOUT_S)
+    pid = ps_exec(qga_sock, ACTION_ON_RESET_REQUEST,
+                  build_action_on_reset_script(value, serials),
+                  capture=True, resyncs=resyncs)
+    status = qga_exec_wait(qga_sock, pid, timeout=timeout,
+                           silent_raises=ACTION_ON_RESET_REQUEST)
+    what = f"{ACTION_ON_RESET_VALUE} for {action_on_reset_label(name)}"
+    if status is None:
+        record["failed_stage"] = "timeout"
+        raise ActionOnResetError(
+            f"setting {what}: the guest script was still running after "
+            f"{timeout:.0f}s")
+    out = b64_text(status.get("out-data"))
+    err = b64_text(status.get("err-data")).strip()
+    parsed = parse_action_on_reset_output(out)
+    # {} if the script never got as far as reading it back.
+    reg: dict = parsed["registry"] or {}
+    if reg.get("present"):
+        raw = reg.get("value", "")
+        record["registry_readback"] = int(raw) if raw.isdigit() else raw
+        if reg.get("kind") != "DWord":
+            record["registry_kind"] = reg.get("kind")
+    record["controllers"] = parsed["controllers"]
+    record["boot_disks"] = parsed["boot_disks"]
+    record["controllers_restarted"] = [i for i in parsed["enabled"]
+                                       if i in parsed["disabled"]]
+    record["luns_back_s"] = parsed["luns_back_s"]
+
+    fail = parsed["fail"]
+    if fail is not None or status.get("exitcode") != 0 or not parsed["done"]:
+        record["failed_stage"] = fail["stage"] if fail else "script"
+        record["guest_output"] = (out.strip() + (f"\n{err}" if err else ""))[-2000:]
+        if fail is None:
+            why = (f"the guest script exited {status.get('exitcode')} "
+                   f"without saying why: {err or out.strip() or 'no output'}")
+        else:
+            why = f"{fail['stage']}: {fail['why']}"
+        if parsed["missing"]:
+            why += f"; missing serial(s): {', '.join(parsed['missing'])}"
+        left = [i for i in parsed["disabled"] if i not in parsed["enabled"]]
+        if left:
+            why += f"; left disabled: {', '.join(left)}"
+        raise ActionOnResetError(f"setting {what} failed at {why}")
+    # The script checks this too; a parse that disagrees is a bug here.
+    if (not reg or reg.get("present") != (value is not None)
+            or (value is not None and record["registry_readback"] != value)):
+        record["failed_stage"] = "registry"
+        raise ActionOnResetError(
+            f"setting {what}: the registry reads back as {reg or 'nothing'}, "
+            f"not {'absent' if value is None else value}")
+    if len(record["controllers_restarted"]) != len(parsed["controllers"]):
+        record["failed_stage"] = "restart"
+        raise ActionOnResetError(
+            f"setting {what}: only {len(record['controllers_restarted'])} "
+            f"of {len(parsed['controllers'])} vioscsi controller(s) were "
+            f"seen to stop and start again")
+    return record
+
+
 # Enough of a writer's stderr to keep in the result: paranoid.exe's
 # timeout warnings are rate-limited, so this covers many minutes of them.
 WRITER_STDERR_TAIL_CHARS = 8000
