@@ -1635,6 +1635,33 @@ def record_run_error(result: dict, exc: BaseException,
         result["error"] = detail
 
 
+def guest_panic_info(event: Optional[dict]) -> dict:
+    """The bugcheck a GUEST_PANICKED event reports, for the result.
+
+    With hv-crash, Windows writes its STOP code and four parameters to the
+    Hyper-V crash MSRs, which QEMU hands back as the event's 'info' (type
+    'hyper-v', arg1 the code, arg2-arg5 the parameters; see
+    GuestPanicInformationHyperV in qapi/run-state.json). Without the event,
+    or with another info type, only what is there is recorded and
+    'bugcheck' says why there is no code."""
+    data = (event or {}).get("data") or {}
+    info = data.get("info") or {}
+    out: dict = {"action": data.get("action"), "info": info or None}
+    args = [info.get(f"arg{i}") for i in range(1, 6)]
+    if info.get("type") != "hyper-v" or not all(isinstance(a, int)
+                                                 for a in args):
+        out["bugcheck"] = ("no GUEST_PANICKED event seen" if event is None
+                           else "the event carries no Hyper-V crash "
+                                "parameters")
+        return out
+    out["bugcheck_code"] = args[0]
+    out["bugcheck_code_hex"] = f"0x{args[0]:08X}"
+    out["bugcheck_params_hex"] = [f"0x{a:016X}" for a in args[1:]]
+    out["bugcheck"] = (f"{out['bugcheck_code_hex']} "
+                       f"({', '.join(out['bugcheck_params_hex'])})")
+    return out
+
+
 def screendump_hash(qmp, path: Path) -> Optional[str]:
     try:
         qmp_call(qmp, "screendump", filename=str(path))

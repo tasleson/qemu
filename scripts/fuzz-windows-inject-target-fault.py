@@ -29,6 +29,9 @@
 # signal, and for virtio-scsi rings QEMU has marked broken, capturing a
 # win-dmp crash dump via '-device vmcoreinfo' + QMP 'dump-guest-memory'
 # (requires the fwcfg driver in the guest for a fully symbolized dump).
+# With --hv-crash (the default) a bugcheck needs no guessing: Windows
+# reports it through the Hyper-V crash MSRs, QEMU pauses the VM in
+# guest-panicked, and the run ends there with the STOP code in the result.
 #
 # Prerequisites: identical to fuzz-windows-inject-scsi-reset.py -- see that
 # script's usage_note() / module docstring, or run this one with --help.
@@ -99,7 +102,8 @@ from vioscsi_soak_common import (AGENT_CHECK_ATTEMPTS, AGENT_CHECK_TIMEOUT_S,
                                  capture_vioscsi_telemetry, check_prereqs,
                                  classify_writer_exit, connect_qmp,
                                  count_guest_processes,
-                                 explain_break, first_sight, load_qmp_module,
+                                 explain_break, first_sight, guest_panic_info,
+                                 load_qmp_module,
                                  make_blank_image, make_overlay, ps_exec,
                                  qga_exec, qga_exec_wait, qga_ping,
                                  record_run_error, start_swtpm, stop_writers,
@@ -393,7 +397,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
                      tmf_trace: bool = True,
                      stop_on_broken: bool = True,
                      ring_diag: bool = True,
-                     qga_trace: bool = True) -> list:
+                     qga_trace: bool = True,
+                     hv_crash: bool = True) -> list:
     argv: list = []
     if taskset_cores:
         argv += ["taskset", "-c", taskset_cores]
@@ -403,7 +408,8 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-machine", "q35,accel=kvm,smm=on",
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-cpu", "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,"
-                "hv-synic,hv-stimer,hv-time,hv-ipi,hv-tlbflush",
+                "hv-synic,hv-stimer,hv-time,hv-ipi,hv-tlbflush"
+                + (",hv-crash" if hv_crash else ""),
         "-smp", cpus,
         "-m", ram,
         "-device", "vmcoreinfo",
@@ -431,6 +437,12 @@ def build_qemu_argv(boot_overlay: Path, vars_overlay: Path, qmp_sock: Path,
         "-blockdev", "driver=inject-error,image=raw0,node-name=err0",
         "-device", "ide-hd,bus=ahci0.0,drive=err0,bootindex=0,id=disk0",
     ]
+
+    if hv_crash:
+        # A bugcheck then parks the VM in guest-panicked, with the STOP code
+        # in the GUEST_PANICKED event, instead of QEMU's default of powering
+        # it off and taking the crashed guest's memory with it.
+        argv += ["-action", "panic=pause"]
 
     # The faults' own add/recovery/clear lines: a few per cycle, on the same
     # clock as the TMFs, so qemu.log shows what each TMF did to the fault
@@ -1415,7 +1427,8 @@ class FaultCycler:
 
     tick() is called from the soak loop on every pass. It drains QMP
     events without waiting -- SCSI_FAULT_CLEARED is the only one it acts
-    on; the harness uses no others -- and either ends the current cycle
+    on, and it keeps the first GUEST_PANICKED for the harness, which
+    reads no events itself -- and either ends the current cycle
     (cleared, or out of time), refreshes its x-scsi-fault-list snapshot,
     or arms the next one once the cooldown is over. So cycle times are
     only as fine as the loop's period (a few seconds), except
@@ -1438,6 +1451,8 @@ class FaultCycler:
         self.disarmed: Optional[str] = None
         self.other_events: collections.Counter = collections.Counter()
         self.pre_soak_events: collections.Counter = collections.Counter()
+        # The first GUEST_PANICKED, for the bugcheck code (hv-crash).
+        self.panic_event: Optional[dict] = None
         self._next = itertools.cycle(scenarios)
         self._cleared: dict = {}
         self._done: set = set()
@@ -1454,7 +1469,14 @@ class FaultCycler:
         except Exception:
             events = []
         self.pre_soak_events.update(ev.get("event", "?") for ev in events)
+        self._keep_panic(events)
         self.next_arm_t = now
+
+    def _keep_panic(self, events: list) -> None:
+        if self.panic_event is None:
+            self.panic_event = next((ev for ev in events
+                                     if ev.get("event") == "GUEST_PANICKED"),
+                                    None)
 
     # -- event handling -------------------------------------------------
 
@@ -1464,6 +1486,7 @@ class FaultCycler:
         except Exception as exc:
             print(f"    reading QMP events failed: {exc!r}", file=sys.stderr)
             return
+        self._keep_panic(events)
         for ev in events:
             if ev.get("event") != "SCSI_FAULT_CLEARED":
                 name = ev.get("event", "?")
@@ -1665,6 +1688,21 @@ class FaultCycler:
         return {k: v for k, v in cur.items()
                 if k not in ("trace", "armed_t", "armed_epoch", "end_t")}
 
+    def panic_context(self, now: float) -> Optional[dict]:
+        """Where the cycling was when the guest bugchecked: the cycle
+        armed then, or else the last one to end and how long before."""
+        cur = self.current
+        if cur is not None:
+            return {"index": cur["index"], "scenario": cur["scenario"],
+                    "state": "armed",
+                    "armed_s_ago": round(now - cur["armed_t"], 1)}
+        if not self.cycles:
+            return None
+        last = self.cycles[-1]
+        return {"index": last["index"], "scenario": last["scenario"],
+                "state": f"ended {last['outcome']}",
+                "ended_s_ago": round(now - self.start - last["ended_s"], 1)}
+
     def unfaulted(self, lun_specs: list) -> list:
         """The LUNs no fault is holding right now."""
         cur = self.current
@@ -1776,7 +1814,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
              stop_on_broken: bool = True,
              ring_diag: bool = True,
              dump_on_agent_stall: bool = False,
-             qga_trace: bool = True) -> dict:
+             qga_trace: bool = True,
+             hv_crash: bool = True) -> dict:
     run_dir = SOAK_DIR / f"run-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     # LUN images (the disks under I/O test) may live on a different
@@ -1795,6 +1834,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
     screenshot = run_dir / "screen.ppm"
     dump_path = run_dir / "crash.dmp"
     break_dump_path = run_dir / "break.dmp"
+    panic_dump_path = run_dir / "panic.dmp"
+    panic_screenshot = run_dir / "panic.ppm"
     qemu_log_path = run_dir / "qemu.log"
 
     qmp = None
@@ -1920,6 +1961,55 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
             result["vm_left_paused"] = why
         write_status({"elapsed_s": time.monotonic() - start})
         return True
+
+    def guest_panicked() -> bool:
+        """Whether hv-crash has parked the VM in guest-panicked."""
+        if not hv_crash:
+            return False
+        try:
+            return (qmp_call(qmp, "query-status") or {}).get(
+                "status") == "guest-panicked"
+        except Exception:
+            return False
+
+    def record_guest_panic(elapsed: float) -> dict:
+        """Fill in the result for a guest that bugchecked: the STOP code
+        and parameters from GUEST_PANICKED, a screenshot and a win-dmp,
+        taken with the VM still panicked, so it shows the guest as it
+        crashed. The dump removes every target fault first; with the VM
+        not running, what they held stays where it was (see
+        try_dump_guest_memory). Nothing goes through the guest agent
+        afterwards: the guest is gone, and telemetry would only wait out
+        its timeouts and take a second dump."""
+        event = cycler.panic_event if cycler is not None else None
+        if event is None:
+            # Before the soak, nothing else reads QMP events.
+            try:
+                event = next((ev for ev in qmp.get_events(wait=False)
+                              if ev.get("event") == "GUEST_PANICKED"), None)
+            except Exception:
+                event = None
+        panic = guest_panic_info(event)
+        if cycler is not None:
+            panic["cycle"] = cycler.panic_context(time.monotonic())
+        result["outcome"] = "guest-panicked"
+        result["elapsed_s"] = elapsed
+        result["guest_panic"] = panic
+        print(f"    guest bugchecked after {elapsed:.0f}s: "
+              f"{panic['bugcheck']}; dumping guest memory to "
+              f"{panic_dump_path}", file=sys.stderr)
+        write_status({"elapsed_s": elapsed})
+        panic["screenshot"] = (str(panic_screenshot)
+                               if screendump_hash(qmp, panic_screenshot)
+                               else None)
+        panic["dump"] = try_dump_guest_memory(
+            qmp, panic_dump_path, proc.pid, lambda: disarm("guest panicked"),
+            result)
+        panic["dump_path"] = str(panic_dump_path)
+        record_cycles()
+        record_trace()
+        write_status({"elapsed_s": elapsed})
+        return result
 
     def capture_postmortem() -> None:
         result["telemetry_failure_screenshot"] = (
@@ -2108,7 +2198,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
         argv = build_qemu_argv(boot_overlay, vars_overlay, qmp_sock, qga_sock,
                                 serial_log, tpm_sock, adapters, lun_specs,
                                 ram, cpus, taskset_cores, iothreads, tmf_trace,
-                                stop_on_broken, ring_diag, qga_trace)
+                                stop_on_broken, ring_diag, qga_trace,
+                                hv_crash)
 
         meta = {"adapters": adapters, "targets": targets,
                 "luns_per_target": luns_per_target, "total_luns": total_luns,
@@ -2122,6 +2213,7 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 "ring_diag": ring_diag,
                 "dump_on_agent_stall": dump_on_agent_stall,
                 "qga_trace": qga_trace,
+                "hv_crash": hv_crash,
                 "argv": argv}
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -2237,6 +2329,8 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                                                 writer_seen)
         result["pre_test_write_ops_per_s"] = wps_per_lun
         result["pre_test_write_ops_per_s_total"] = round(total_wps, 1)
+        if total_wps < MIN_WRITE_OPS_PER_S and guest_panicked():
+            return record_guest_panic(time.monotonic() - start)
         if total_wps < MIN_WRITE_OPS_PER_S and not broke_in_preflight:
             result["outcome"] = "no-io"
             result["elapsed_s"] = time.monotonic() - start
@@ -2400,6 +2494,11 @@ def run_soak(adapters: int, targets: int, luns_per_target: int, duration_s: floa
                 record_cycles()
                 write_status({"elapsed_s": elapsed})
                 return result
+
+            # Ahead of everything that takes a bugcheck for a guest gone
+            # dark: hv-crash says so outright, with the STOP code.
+            if guest_panicked():
+                return record_guest_panic(elapsed)
 
             cycler.tick(qmp, now)
 
@@ -2610,6 +2709,17 @@ def main() -> int:
                           "pre-soak request it never answers, the guest "
                           "going dark, and an agent found silent when "
                           "telemetry is collected (default: on)")
+    ap.add_argument("--hv-crash", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="give the guest the Hyper-V crash MSRs (hv-crash) "
+                          "and pause the VM when it reports a bugcheck "
+                          "(-action panic=pause). The run then ends as "
+                          "guest-panicked with the STOP code and its "
+                          "parameters in the result, a screenshot and a "
+                          "win-dmp in panic.dmp, instead of being caught "
+                          "later as crash-suspected once the agent, the "
+                          "screen and the LUNs have all gone quiet "
+                          "(default: on)")
     ap.add_argument("--iothreads", type=int, default=None,
                      help="number of QEMU iothreads to create, assigned "
                           "round-robin to the adapters (default: one per "
@@ -2817,7 +2927,8 @@ def main() -> int:
                        args.vioscsi_telemetry_script,
                        args.disk_dir, args.iothreads, args.tmf_trace,
                        args.stop_on_broken, args.ring_diag,
-                       args.dump_on_agent_stall, args.qga_trace)
+                       args.dump_on_agent_stall, args.qga_trace,
+                       args.hv_crash)
 
     results_path = SOAK_DIR / f"result-{int(time.time())}.json"
     results_path.write_text(json.dumps(result, indent=2))
