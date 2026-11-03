@@ -420,13 +420,34 @@ Slow target                     ``delay-ms`` and ``delay-max-ms``, with
                                 ``probability`` for tail latency and
                                 ``clear-on`` ``manual`` so it outlasts
                                 recovery
+Commands that run after the     ``clear-on`` ``manual``, ``below-clear``
+guest gave up on them           ``hang``, plus a second such fault with
+                                ``probability`` 0.0; remove the first, then
+                                the second
 =============================== ===============================================
+
+The last one needs the second fault because removing a fault that both
+holds commands and hangs a LUN reset doesn't let the commands complete:
+nothing orders their release against the reset going ahead, and in
+practice the reset wins and the guest sees them fail.  Whether their data
+was transferred first varies: with an iothread they are usually cancelled
+before they run, while in the main loop the release gets to send them and
+the reset then cancels only their completion.  A fault with
+``probability`` 0.0 holds nothing but still hangs the reset
+(``probability`` only decides which commands are held), so with it in
+place the first removal lets the held commands run and complete normally,
+and removing it then lets the reset go ahead.
+``fault-below-hang-holds-none`` in ``tests/qtest/virtio-scsi-test.c``
+checks that order, in the main loop and with an iothread.
 
 ``scripts/fuzz-windows-inject-target-fault.py`` runs these for hours
 against a Windows guest with the vioscsi driver: it faults one target at a
 time, in rotation, records what each cycle ended with -- which recovery
 cleared it and how long that took, or that the guest never got there --
-and watches for a bugcheck or a broken ring.  See its ``--help``.
+and watches for a bugcheck or a broken ring.  Its ``--bsod`` option runs
+the last scenario instead, against cached file reads, to bugcheck a driver
+that completes requests the device still owns (see
+``docs/devel/vioscsi-reset-race-investigation.md``).  See its ``--help``.
 
 
 SCSI Response Injection

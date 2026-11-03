@@ -158,9 +158,14 @@ Two QEMU knobs widen it on purpose:
   driver's reset in flight to race a second reset, but the data transfers
   have already happened by then.
 - `x-scsi-fault-add` with `below-clear: hang` holds a TMF *before* it is
-  carried out, and the commands the fault holds have not run yet. When
-  the fault is removed they run and transfer their data, as late as the
-  harness wants (see [storage-error-injection.rst](storage-error-injection.rst)).
+  carried out, and the commands the fault holds have not run yet. They
+  only complete normally if they are released while the TMF is still
+  held: removing a fault that does both lets the LUN reset fail them to
+  the guest, with an iothread usually before they run, in the main loop
+  after their data has gone in. A second fault with `probability: 0.0`
+  keeps the TMF hung while the first is removed, so the commands run and
+  complete as late as the harness wants (see
+  [storage-error-injection.rst](storage-error-injection.rst)).
   This is the one that can put a read's data into memory Windows has
   already reused.
 
@@ -177,7 +182,8 @@ reported BSODs. Two things would nail it down:
    `-action panic=pause`, a bugcheck parks the VM in `guest-panicked` and
    QEMU's `GUEST_PANICKED` event carries the bugcheck code and arguments.
 2. **An A/B on the same recipe.** The upstream driver should bugcheck,
-   and the `reset_via_tmf` driver should survive. A bugcheck from a lab
+   and the `reset_via_tmf` driver should survive. `--bsod` in the
+   target-fault harness is that recipe (see below). A bugcheck from a lab
    recipe shows the fix closes that path. It does not show that #1014 or
    #877 were that path; only a reporter's dump can.
 
@@ -193,15 +199,44 @@ attach scratch SCSI LUNs, drive I/O through `qemu-guest-agent` and share
 - `fuzz-windows-inject-tail-latency.py`: long soak with a probabilistic
   tail-latency rule across many adapters and targets.
 - `fuzz-windows-inject-target-fault.py`: soak with SCSI target faults,
-  checking how far up the escalation path the driver goes.
+  checking how far up the escalation path the driver goes. With `--bsod`
+  it runs the bugcheck recipe instead (below).
 - `fuzz-windows-inject-reset-inflight.py`: resets adapters under a deep
   queue.
 
 They have been run many times, and the reset path above has produced
-hangs, broken rings and data corruption. None of them is set up to see a
-bugcheck: their I/O goes to raw disks from application buffers, which
-(per the reasoning above) turns a late transfer into a verify failure rather than
-a crash, and they stop at the first such failure. `hv-crash` is only
-enabled with `--watch-after-break`, `x-stop-on-broken` pauses the VM at
-a ring break, and the scsi-reset harness decides a crash happened from
-guest-agent silence and a still screen.
+hangs, broken rings and data corruption, but never a bugcheck. Their I/O
+goes to raw disks from application buffers, which (per the reasoning
+above) turns a late transfer into a verify failure rather than a crash,
+and most of them stop at the first such failure. In the soak library
+`hv-crash` is only enabled with `--watch-after-break`, `x-stop-on-broken`
+pauses the VM at a ring break, and the scsi-reset harness decides a crash
+happened from guest-agent silence and a still screen.
+
+`fuzz-windows-inject-target-fault.py --bsod` is the run meant to see one.
+Its LUNs are NTFS volumes, each with a file bigger than guest RAM that is
+read in a loop through the file cache (`--io-driver=cached-read`), so the
+LUN reads are paging I/O. Each `late-dma` cycle holds every command to
+target 0 of one adapter (the target the upstream `DeviceReset()`
+addresses) and leaves the LUN reset hanging. Once a read on that target
+has failed to the reader, which is when Windows frees its pages, the
+harness waits `--late-dma-delay-s` and lets the held reads run, with the
+reset still hung by a second fault. Meanwhile the readers on a second
+adapter keep the memory manager reusing pages; `DeviceReset()` pauses
+its own adapter (`StorPortPause`), so readers there would not. The guest
+runs with `hv-crash`, so a bugcheck ends the run as `guest-panicked` with
+its STOP code and a `win-dmp`. Every chunk of the files says which LUN
+and offset it is, and the readers check what they read, so a late
+transfer that lands somewhere harmless still shows: surviving
+`--bsod-cycles` cycles ends the run as `data-corruption` if a reader read
+back wrong data, and as `cycles-complete` only if none did.
+
+None of this has been run against Windows yet. The trigger in particular
+rests on an assumption about Windows, not an observation: that a read
+completed with `SRB_STATUS_BUS_RESET` is retried into the same pages, so
+a late transfer only does harm once the retries have run out and the
+read has failed. `--late-dma-release-after=recovery` releases at the
+first reset instead, in case that turns out to be wrong. The QEMU side of
+the ordering, by contrast, is pinned by a qtest
+(`fault-below-hang-holds-none` in `tests/qtest/virtio-scsi-test.c`, run
+in the main loop and with an iothread).
