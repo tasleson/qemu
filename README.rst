@@ -1,54 +1,130 @@
-===========
-QEMU README
-===========
+================================================
+QEMU -- Storage Error Injection Branch
+================================================
 
-QEMU is a generic and open source machine & userspace emulator and
-virtualizer.
+This is an experimental fork/branch of `QEMU <https://www.qemu.org/>`_ for
+testing how guest operating systems and storage management software handle
+storage hardware errors and unusual device responses.
 
-QEMU is capable of emulating a complete machine in software without any
-need for hardware virtualization support. By using dynamic translation,
-it achieves very good performance. QEMU can also integrate with the Xen
-and KVM hypervisors to provide emulated hardware while allowing the
-hypervisor to manage the CPU. With hypervisor support, QEMU can achieve
-near native performance for CPUs. When QEMU emulates CPUs directly it is
-capable of running operating systems made for one machine (e.g. an ARMv7
-board) on a different machine (e.g. an x86_64 PC board).
+It adds these injection mechanisms, each controlled at runtime via QMP
+except where noted:
 
-QEMU is also capable of providing userspace API virtualization for Linux
-and BSD kernel interfaces. This allows binaries compiled against one
-architecture ABI (e.g. the Linux PPC64 ABI) to be run on a host using a
-different architecture ABI (e.g. the Linux x86_64 ABI). This does not
-involve any hardware emulation, simply CPU and syscall emulation.
+- **Block-layer I/O error and latency injection** -- a filter driver
+  (``inject-error``) that sits in front of any disk image.  It returns errors
+  (EIO, ENOSPC, etc.) for configurable sector ranges, simulating bad sectors
+  and media failures, and it can hold requests -- for a fixed time, a random
+  time, or indefinitely -- to simulate slow, stalled and timing-out storage.
 
-QEMU aims to fit into a variety of use cases. It can be invoked directly
-by users wishing to have full control over its behaviour and settings.
-It also aims to facilitate integration into higher level management
-layers, by providing a stable command line interface and monitor API.
-It is commonly invoked indirectly via the libvirt library when using
-open source applications such as oVirt, OpenStack and virt-manager.
+- **SCSI target faults** -- make a SCSI target, or one LUN of it, stop
+  answering on a virtio-scsi adapter until the guest performs the error
+  recovery that brings it back (an abort, a LUN reset, a target reset, an
+  adapter reset), with lesser recovery attempts going through, being
+  rejected, or left unanswered.
 
-QEMU as a whole is released under the GNU General Public License,
-version 2. For full licensing details, consult the LICENSE file.
+- **virtio-scsi TMF delay and broken-ring diagnostics** -- device
+  properties (``x-tmf-delay-ms``/``-count``, ``x-diag``,
+  ``x-stop-on-broken``) that hold back task management responses, and
+  record and explain what a request ring looked like when the device gave
+  up on it, optionally pausing the VM at that moment.
 
+- **SCSI response injection** -- overrides for INQUIRY and MODE SENSE
+  responses on emulated SCSI devices, allowing you to present arbitrary
+  vendor strings, serial numbers, VPD pages, and mode pages to the guest.
+
+- **NVMe response injection** -- overrides for Identify Controller and
+  Identify Namespace data, or an error status for those commands.
+
+- **ATA response injection** -- overrides for IDENTIFY DEVICE and SMART
+  data on IDE and SATA disks, or ATA errors for those commands.
+
+- **SD/MMC response injection** -- overrides for an SD or eMMC card's CID
+  and CSD registers, and error bits in the card status it reports.
+
+It also adds tracepoints for the requests and recovery these exercise,
+and helper scripts: command-line clients (``scripts/inject-error.py``,
+``scripts/scsi-inject.py``), Linux and Windows test VM setup scripts, and
+long-running harnesses for the Windows ``viostor`` and ``vioscsi`` drivers.
+
+Background
+==========
+
+This branch grew out of an earlier experiment, the `block_error_inject
+<https://github.com/tasleson/qemu/tree/block_error_inject>`_ branch, which
+I gave a talk on at the 2020 linux.conf.au titled `VM block error injection, a novel
+approach for testing Linux storage
+<https://www.youtube.com/watch?v=dgY6iIaqiOY>`_.  That branch added a QMP
+interface for marking block ranges bad, and had the emulated SCSI, NVMe and
+AHCI devices report media errors for them, so a guest's storage stack could
+be tested against a failing disk without failing hardware.
+
+The work here starts from the same idea and broadens it.  Errors come from a
+block filter driver that works under any disk device rather than from code in
+each device model; latency, stalls and late completions join hard errors;
+devices can be made to return arbitrary identification data; and a SCSI
+target can stop answering until the guest carries out the recovery that
+brings it back.
+
+What you can do with this
+=========================
+
+- Simulate bad sectors (persistent, transient, or fix-on-write) on any
+  virtual disk and observe how the guest kernel, filesystem, and userspace
+  tools react.
+
+- Inject arbitrarily long or malformed SCSI serial numbers, device
+  identifiers, and INQUIRY responses to fuzz tools like ``sg_inq``,
+  ``lsscsi``, ``udev``, ``multipathd``, and ``libstoragemgmt``.
+
+- Override MODE SENSE pages to test how guest drivers handle unexpected
+  caching, geometry, or device characteristic responses.
+
+- Feed malformed NVMe Identify, ATA IDENTIFY/SMART, or SD CID/CSD data to
+  ``nvme-cli``, ``hdparm``, ``smartctl``, the guest kernel's probing code
+  and anything else that parses them.
+
+- Hold I/O requests to reproduce the timing failures that guest storage
+  drivers are worst at: fixed and tail latency, complete stalls, completions
+  that arrive after the guest has already timed the request out, flush-only
+  latency, queue saturation, out-of-order completion, and completions racing
+  a device reset.  Requests are held asynchronously, so the guest keeps
+  running and takes its own recovery paths.
+
+- Exercise a SCSI driver's whole error escalation path against targets
+  that need a particular kind of reset to come back, and see which
+  recovery cleared each fault and how long it took.
+
+- Catch a guest driver handing a virtio-scsi device a request it no
+  longer owns, with the ring frozen at the moment of the break.
+
+- Spin up a ready-made Linux test VM with SCSI disks behind inject-error
+  filters, or one with a disk on every storage controller QEMU emulates on
+  x86, using the included setup scripts.
+
+- Run hours-long, unattended soak tests of the Windows ``vioscsi`` driver
+  under tail latency, stalls that only its resets end, and rotating target
+  faults, including a recipe that bugchecks a driver which completes
+  requests on reset that the device still owns.
 
 Documentation
 =============
 
-Documentation can be found hosted online at
-`<https://www.qemu.org/documentation/>`_. The documentation for the
-current development version that is available at
-`<https://www.qemu.org/docs/master/>`_ is generated from the ``docs/``
-folder in the source tree, and is built by `Sphinx
-<https://www.sphinx-doc.org/en/master/>`_.
+- `docs/devel/storage-error-injection.rst
+  <docs/devel/storage-error-injection.rst>`_ -- every mechanism: QMP
+  commands, device properties, tracepoints, the command-line clients, the
+  Linux test VMs, and an end-to-end walkthrough.
+
+- `docs/devel/storage-error-injection-harnesses.rst
+  <docs/devel/storage-error-injection-harnesses.rst>`_ -- the Windows guest
+  setup and the ``fuzz-windows-inject-*`` harnesses.
+
+All QMP commands added here carry an ``x-`` prefix and the ``unstable``
+feature, and none of the injected state is migrated.
 
 
 Building
 ========
 
-QEMU is multi-platform software intended to be buildable on all modern
-Linux platforms, OS-X, Win32 (via the Mingw64 toolchain) and a variety
-of other UNIX targets. The simple steps to build QEMU are:
-
+Standard QEMU build process:
 
 .. code-block:: shell
 
@@ -57,115 +133,19 @@ of other UNIX targets. The simple steps to build QEMU are:
   ../configure
   make
 
-Additional information can also be found online via the QEMU website:
-
-* `<https://wiki.qemu.org/Hosts/Linux>`_
-* `<https://wiki.qemu.org/Hosts/Mac>`_
-* `<https://wiki.qemu.org/Hosts/W32>`_
+See the `QEMU build documentation <https://wiki.qemu.org/Hosts/Linux>`_ for
+platform-specific details.
 
 
-Submitting patches
-==================
-
-The QEMU source code is maintained under the GIT version control system.
-
-.. code-block:: shell
-
-   git clone https://gitlab.com/qemu-project/qemu.git
-
-When submitting patches, one common approach is to use 'git
-format-patch' and/or 'git send-email' to format & send the mail to the
-qemu-devel@nongnu.org mailing list. All patches submitted must contain
-a 'Signed-off-by' line from the author. Patches should follow the
-guidelines set out in the `style section
-<https://www.qemu.org/docs/master/devel/style.html>`_ of
-the Developers Guide.
-
-Additional information on submitting patches can be found online via
-the QEMU website:
-
-* `<https://wiki.qemu.org/Contribute/SubmitAPatch>`_
-* `<https://wiki.qemu.org/Contribute/TrivialPatches>`_
-
-The QEMU website is also maintained under source control.
-
-.. code-block:: shell
-
-  git clone https://gitlab.com/qemu-project/qemu-web.git
-
-* `<https://www.qemu.org/2017/02/04/the-new-qemu-website-is-up/>`_
-
-A 'git-publish' utility was created to make above process less
-cumbersome, and is highly recommended for making regular contributions,
-or even just for sending consecutive patch series revisions. It also
-requires a working 'git send-email' setup, and by default doesn't
-automate everything, so you may want to go through the above steps
-manually for once.
-
-For installation instructions, please go to:
-
-*  `<https://github.com/stefanha/git-publish>`_
-
-The workflow with 'git-publish' is:
-
-.. code-block:: shell
-
-  $ git checkout master -b my-feature
-  $ # work on new commits, add your 'Signed-off-by' lines to each
-  $ git publish
-
-Your patch series will be sent and tagged as my-feature-v1 if you need to refer
-back to it in the future.
-
-Sending v2:
-
-.. code-block:: shell
-
-  $ git checkout my-feature # same topic branch
-  $ # making changes to the commits (using 'git rebase', for example)
-  $ git publish
-
-Your patch series will be sent with 'v2' tag in the subject and the git tip
-will be tagged as my-feature-v2.
-
-Bug reporting
+Upstream QEMU
 =============
 
-The QEMU project uses GitLab issues to track bugs. Bugs
-found when running code built from QEMU git or upstream released sources
-should be reported via:
+This branch is based on upstream QEMU.  For general QEMU documentation,
+bug tracking, and contribution guidelines, see:
 
-* `<https://gitlab.com/qemu-project/qemu/-/issues>`_
+* `QEMU website <https://www.qemu.org/>`_
+* `QEMU source <https://gitlab.com/qemu-project/qemu.git>`_
+* `QEMU documentation <https://www.qemu.org/docs/master/>`_
 
-If using QEMU via an operating system vendor pre-built binary package, it
-is preferable to report bugs to the vendor's own bug tracker first. If
-the bug is also known to affect latest upstream code, it can also be
-reported via GitLab.
-
-For additional information on bug reporting consult:
-
-* `<https://wiki.qemu.org/Contribute/ReportABug>`_
-
-
-ChangeLog
-=========
-
-For version history and release notes, please visit
-`<https://wiki.qemu.org/ChangeLog/>`_ or look at the git history for
-more detailed information.
-
-
-Contact
-=======
-
-The QEMU community can be contacted in a number of ways, with the two
-main methods being email and IRC:
-
-* `<mailto:qemu-devel@nongnu.org>`_
-* `<https://lists.nongnu.org/mailman/listinfo/qemu-devel>`_
-* #qemu on irc.oftc.net
-
-Information on additional methods of contacting the community can be
-found online via the QEMU website:
-
-* `<https://wiki.qemu.org/Contribute/StartHere>`_
+QEMU is released under the GNU General Public License, version 2.
+See the LICENSE file for details.
