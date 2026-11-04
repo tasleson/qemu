@@ -148,13 +148,27 @@ static void discard_vq_data(VirtQueue *vq, VirtIODevice *vdev)
     virtio_notify(vdev, vq);
 }
 
-static void discard_throttle_data(VirtIOSerialPort *port)
+/*
+ * Drop the element a throttled port was part way through writing out.
+ *
+ * On a device reset the ring is going away, so the element is only
+ * detached.  Otherwise the guest still owns the ring and its write is
+ * not complete until it gets the buffer back, so hand it back the way
+ * discard_vq_data() does with the ones not yet popped.  Callers follow
+ * up with discard_vq_data(), which notifies the guest.
+ */
+static void discard_throttle_data(VirtIOSerialPort *port, bool device_reset)
 {
-    if (port->elem) {
-        virtqueue_detach_element(port->ovq, port->elem, 0);
-        g_free(port->elem);
-        port->elem = NULL;
+    if (!port->elem) {
+        return;
     }
+    if (!device_reset && virtio_queue_ready(port->ovq)) {
+        virtqueue_push(port->ovq, port->elem, 0);
+    } else {
+        virtqueue_detach_element(port->ovq, port->elem, 0);
+    }
+    g_free(port->elem);
+    port->elem = NULL;
 }
 
 static void do_flush_queued_data(VirtIOSerialPort *port, VirtQueue *vq,
@@ -282,7 +296,7 @@ int virtio_serial_close(VirtIOSerialPort *port)
      * consume, reset the throttling flag and discard the data.
      */
     port->throttled = false;
-    discard_throttle_data(port);
+    discard_throttle_data(port, false);
     discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
 
     send_control_event(port->vser, port->id, VIRTIO_CONSOLE_PORT_OPEN, 0);
@@ -590,7 +604,7 @@ static void guest_reset(VirtIOSerial *vser)
     QTAILQ_FOREACH(port, &vser->ports, next) {
         vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
 
-        discard_throttle_data(port);
+        discard_throttle_data(port, true);
 
         if (port->guest_connected) {
             port->guest_connected = false;
@@ -900,7 +914,7 @@ static void remove_port(VirtIOSerial *vser, uint32_t port_id)
     assert(port);
 
     /* Flush out any unconsumed buffers first */
-    discard_throttle_data(port);
+    discard_throttle_data(port, false);
     discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
 
     send_control_event(vser, port->id, VIRTIO_CONSOLE_PORT_REMOVE, 1);
