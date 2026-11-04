@@ -12,6 +12,14 @@ or breaking a virtio ring.  They are host-side Python scripts that need
 nothing in the guest beyond the drivers, the guest agent, and optionally
 an I/O tool.
 
+=========================================== ======== ==========================
+Harness                                     Driver   What it injects
+=========================================== ======== ==========================
+``fuzz-windows-inject-boot.py``             viostor  a grid of latency rules on
+                                                     the boot disk, one boot per
+                                                     grid point
+=========================================== ======== ==========================
+
 The harnesses share their machinery, ``scripts/vioscsi_soak_common.py``,
 described once below.
 
@@ -146,6 +154,9 @@ Install Windows to the SATA disk, then, from the virtio-win CD:
    are now the golden image.  The harnesses never write to them: every
    run boots from overlays and a copy of the TPM state.
 
+``fuzz-windows-inject-boot.py`` boots the golden image from virtio-blk
+rather than SATA, so the installed Windows has to be able to start from
+a viostor disk.
 
 
 The shared soak library
@@ -438,3 +449,100 @@ The harnesses built on the library's soak driver take all of these.
 
 ``--disk-dir DIR``, ``--keep-all``
     Where the LUN images go, and whether to keep them after a clean run.
+
+
+fuzz-windows-inject-boot.py
+---------------------------
+
+Sweeps viostor's boot path through a grid of latency rules.  Each grid
+point boots a fresh overlay of the golden image from a virtio-blk disk
+behind inject-error node ``err0``, with one rule and possibly some timed
+actions, and waits for the guest to finish booting or crash.
+
+A rule armed when QEMU starts would mostly hit the firmware, which reads
+the boot disk with its own virtio-blk driver long before Windows does.
+So the harness traces ``virtio_set_status`` and arms rules, and times
+actions, from the moment Windows' driver takes the device over -- seen as
+the second reset and renegotiation of the same device -- where a grid
+point asks for that.
+
+Categories, each a family of grid points (``--dry-run`` lists them all;
+124 in total):
+
+======================= =======================================================
+Category                What the grid varies
+======================= =======================================================
+``baseline``            nothing injected
+``fixed-latency``       reads, writes or flushes delayed 50 ms to 10 s
+``tail-latency``        0.1% to 2% of requests delayed, over ranges from
+                        20-500 ms up to 200 ms-30 s
+``stall``               reads, writes or flushes stalled for 2 to 60 s, then
+                        ended by a release or by ``system_reset``
+``timeout-success``     reads or writes held 35 to 90 s, then completed
+``timeout-failure``     the same, then failed with EIO or ETIMEDOUT
+``backend-disconnect``  everything stalled; after 5 to 30 s the held requests
+                        are failed with EIO, 10 or 30 s later the rule is
+                        removed, and half a second after that whatever it
+                        held in between is completed
+``flush-latency``       flushes delayed 0.5 to 30 s
+``queue-saturation``    the first 4 to 256 reads, or requests of any kind,
+                        stalled so the queue fills behind them
+``out-of-order``        a random spread of hold times, up to 8 s
+``reset-race``          reads or writes held and released 25 to 65 s in,
+                        around the guest's timeout
+======================= =======================================================
+
+The sum of all delays one rule can add is capped at 3 minutes through
+``max-hits``, and every boot at 10 minutes.
+
+Options:
+
+``--categories LIST``
+    Comma-separated categories, or ``all`` (the default).
+
+``--limit N``
+    At most N grid points per category.
+
+``--shuffle``
+    Shuffle each category's grid points (before ``--limit``).
+
+``--stop-on-first-crash``
+    Stop at the first ``crash-suspected``.
+
+``--dry-run``
+    Print the grid and exit.
+
+The VM has 8G and 4 vCPUs; neither can be changed from the command line.
+
+Each grid point gets ``run-NNNN-<category>`` under ``$VM_DIR/fuzz``, with
+``meta.json`` (the case and the full QEMU command line), the overlays,
+``serial.log``, a screenshot and the ``virtio_set_status`` trace, all
+deleted after a ``boot-ok``.  One JSON line per grid point is appended to
+``results-<unix time>.jsonl`` in ``$VM_DIR/fuzz``; a grid point that
+booted also has `the vioscsi driver record`_ of the golden image.  The
+guest reads it off the boot disk, so the harness first removes the grid
+point's rule and completes any request the rule still holds; the read
+then neither waits out the rule's delays nor gets its error.  If that
+fails, the record says why in ``disarm_error``.
+
+======================= =======================================================
+Outcome                 Meaning
+======================= =======================================================
+``boot-ok``             the guest agent answered after every action had run
+``crash-suspected``     the screen stopped changing, without the agent
+                        answering, for 90 seconds more than the 3-minute
+                        cap on one rule's delays, which a slowed boot
+                        screen can legitimately sit through; the first 20
+                        seconds (the firmware splash) are not watched
+``timeout``             neither within 10 minutes
+``not-injected``        the guest booted before Windows' driver was seen
+                        taking over, so the injection never happened
+``inject-failed``       a QMP command to inject or act failed
+``error``               the grid point could not be run
+======================= =======================================================
+
+At the end it lists the crash candidates, then every other grid point
+that did not end in ``boot-ok``, each with its run directory.  The exit
+status is 1 if any grid point ended in anything but ``boot-ok``, else 0.
+A malformed command line exits with 2, from argparse; an unknown
+category or a missing prerequisite exits with 1.
