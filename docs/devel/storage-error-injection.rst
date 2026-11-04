@@ -1,17 +1,20 @@
 Storage Error and Response Injection
 =====================================
 
-This branch adds a mechanism for testing how guest software handles
-storage errors and slow or unresponsive storage:
+This branch adds several complementary mechanisms for testing how guest
+software handles storage errors, slow or unresponsive storage, and unusual
+hardware responses:
 
 - **inject-error** block filter driver -- injects I/O errors (bad sectors)
   and latency (slow, stalled and timing-out requests) at the block layer,
   under any emulated disk
+- **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
+  at the SCSI emulation layer
 
-It is controlled at runtime via QMP.  It is meant for fuzzing and for
-testing guest drivers and storage management software, not for
-production use: every command is marked ``unstable`` and carries an
-``x-`` prefix, and none of the injected state is migrated.
+They are controlled at runtime via QMP.  They are meant for fuzzing
+and for testing guest drivers and storage management software, not
+for production use: every command is marked ``unstable`` and carries
+an ``x-`` prefix, and none of the injected state is migrated.
 
 .. contents:: Contents
    :local:
@@ -322,8 +325,231 @@ Reset race                  a hold that straddles the guest's timeout, so
 =========================== ================================================
 
 
+SCSI Response Injection
+-----------------------
+
+While inject-error operates at the block I/O layer, SCSI response injection
+operates at the SCSI command emulation layer.  It replaces the data returned
+by INQUIRY (standard and VPD pages) and MODE SENSE commands with arbitrary
+bytes, allowing you to test how guest software handles malformed, oversized,
+truncated, or unexpected SCSI responses.
+
+This is useful for fuzzing software like ``sg_inq``, ``lsscsi``,
+``udev`` rules, ``multipathd``, ``libstoragemgmt``, and any other tool
+that queries SCSI device properties.
+
+Supported override types
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+``inquiry-standard``
+    Replaces the standard (non-VPD) INQUIRY response.  Controls the
+    vendor, product, version, device type, and all other fields that
+    guest software reads to identify a device.  It is returned for every
+    INQUIRY with EVPD clear, even one with a non-zero page code, which
+    QEMU would otherwise reject.
+
+``inquiry-vpd``
+    Replaces a specific VPD (Vital Product Data) page.  Each VPD page
+    is identified by a page code (0x00--0xFF).  Common pages:
+
+    - 0x00 -- Supported VPD Pages
+    - 0x80 -- Unit Serial Number
+    - 0x83 -- Device Identification
+    - 0xB0 -- Block Limits
+    - 0xB1 -- Block Device Characteristics
+
+``mode-sense-page``
+    Replaces the entire MODE SENSE response for a specific page code.
+    The override applies regardless of whether MODE SENSE(6) or MODE
+    SENSE(10) was used, and whatever the page control, DBD and subpage
+    fields say: only the 6-bit page code is compared, so a ``page``
+    above 0x3F never matches.  For "all pages" (page 0x3F), register an
+    override with page=0x3F.  The injected bytes must therefore include
+    the mode parameter header in the format of the CDB the guest will
+    send.
+
+QMP commands
+^^^^^^^^^^^^
+
+**x-scsi-disk-inject-response-set** -- set a response override.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the scsi-hd, scsi-cd,
+  usb-storage, or ufs-lu device (USB mass storage and UFS logical unit
+  devices are resolved to their internal SCSI disk automatically)
+- ``type`` (string, required): ``inquiry-standard``, ``inquiry-vpd``, or
+  ``mode-sense-page``
+- ``page`` (int, 0--255): page code; required for ``inquiry-vpd`` and
+  ``mode-sense-page``, must not be present for ``inquiry-standard``
+- ``data`` (string, required): base64-encoded response bytes, 1 to 65536
+  of them; replaces the entire response verbatim with no validation
+
+Setting an override replaces any earlier one of the same type and page.
+The device is looked up by ID; an unknown ID fails with "Device '...' not
+found", and any other kind of device with "Device '...' is not a
+scsi-hd, scsi-cd, usb-storage, or ufs-lu device".
+
+Example -- inject a short serial number (VPD page 0x80, "TEST1234")::
+
+    -> { "execute": "x-scsi-disk-inject-response-set",
+         "arguments": { "id": "disk0",
+                        "type": "inquiry-vpd",
+                        "page": 128,
+                        "data": "AIAACFRFU1QxMjM0" } }
+    <- { "return": {} }
+
+**x-scsi-disk-inject-response-clear** -- clear response overrides.
+
+Arguments:
+
+- ``id`` (string, required): device ID
+- ``type`` (string, optional): which override type to clear; omit to
+  clear all overrides on the device
+- ``page`` (int, optional): specific page to clear; required when
+  ``type`` is ``inquiry-vpd`` or ``mode-sense-page``, and an error with
+  ``inquiry-standard`` or without ``type``.  Clearing a page that has no
+  override is not an error.
+
+Example -- clear all overrides::
+
+    -> { "execute": "x-scsi-disk-inject-response-clear",
+         "arguments": { "id": "disk0" } }
+    <- { "return": {} }
+
+Example -- clear just VPD page 0x80::
+
+    -> { "execute": "x-scsi-disk-inject-response-clear",
+         "arguments": { "id": "disk0",
+                        "type": "inquiry-vpd",
+                        "page": 128 } }
+    <- { "return": {} }
+
+Notes
+^^^^^
+
+- Override data replaces the **entire** response including any headers.
+  For VPD pages this means the 4-byte header (device type, page code,
+  page length) is part of the injected data.  The ``scsi-inject.py``
+  helper constructs these headers automatically.
+
+- The maximum injected response size is 65536 bytes.  For VPD page 0x80
+  (serial number), this means a maximum serial string of 65532 bytes
+  (65536 minus the 4-byte VPD header).  What the guest receives is
+  further cut to the allocation length in its CDB, as for any INQUIRY or
+  MODE SENSE; a guest that sizes its buffer from the page length field
+  will then ask again for the full length.
+
+- Overrides apply to ``scsi-hd`` and ``scsi-cd`` devices (emulated
+  SCSI), including the internal SCSI disk inside ``usb-storage`` and
+  ``ufs-lu`` devices.  When targeting a ``usb-storage`` or ``ufs-lu``
+  device, pass its device ID and the injection commands will
+  automatically resolve to the internal SCSI disk.  Passthrough devices
+  (``scsi-block``, ``scsi-generic``), which send INQUIRY and MODE SENSE
+  to the host device via SG_IO, are refused: the set command fails with
+  "Device '...' is not a scsi-hd, scsi-cd, usb-storage, or ufs-lu
+  device".
+
+- Overrides are not migrated.  After live migration, the fuzzer harness
+  must re-inject any desired overrides.
+
+- Overrides persist across guest reboots (they are not cleared on device
+  reset).  Use the clear command to remove them.  Unplugging the device
+  discards them.
+
+- The Linux kernel caches INQUIRY responses.  After injecting a new
+  override, rescan the device in the guest to pick up the change::
+
+      echo 1 > /sys/block/sda/device/rescan
+
+  The rescan updates both direct queries (``sg_inq``) and the kernel's
+  sysfs VPD cache (``/sys/block/sda/device/vpd_pg80``), which is what
+  tools like ``lsmcli local-disk-list`` read.
+
+  Note: ``sg_inq`` queries the device directly via SG_IO and will
+  reflect overrides immediately without a rescan.  A rescan is only
+  needed to update the kernel's cached copy in sysfs.
+
+
 Command-Line Tools
 ------------------
+
+scsi-inject.py
+^^^^^^^^^^^^^^
+
+A high-level CLI for SCSI response injection.  It handles binary SCSI
+response construction and base64 encoding internally.
+Run it via the build venv, which provides the ``qemu.qmp`` package it
+needs::
+
+    build/run scripts/scsi-inject.py [options] <command> [args]
+
+Connection options (choose one; the long forms are ``--socket``,
+``--host`` and ``--port``)::
+
+    -s /path/to/qmp.sock        # Unix socket (preferred)
+    -H localhost -P 4445         # TCP; these are the defaults
+
+A QMP error is printed and the script exits with status 1.
+
+Response injection commands.  ``serial``, ``device-id`` and ``inquiry``
+take ``--dev-type N`` (default 0, a disk), the peripheral device type put
+in the first byte of the response; use 5 for a scsi-cd.  Strings are
+encoded as ASCII, with anything else replaced by ``?``.
+
+``serial <device> <string>``
+    Set VPD page 0x80 (unit serial number).  The string is not padded or
+    terminated, and the only limit is QEMU's 65532-byte maximum for it
+    -- the normal 36-character QEMU cap is bypassed entirely::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            serial disk0 "VERY_LONG_SERIAL_0123456789ABCDEF0123456789"
+
+``device-id <device> <string>``
+    Set VPD page 0x83 (device identification) to a single designation
+    descriptor: code set ASCII, association with the logical unit,
+    designator type T10 vendor ID, holding the string as given (at most
+    255 bytes, the most a descriptor's length byte can say)::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            device-id disk0 "MY_CUSTOM_DEVICE_ID_STRING"
+
+``inquiry <device> [--vendor V] [--product P] [--version V] [--removable]``
+    Set the standard INQUIRY response.  It builds a 96-byte response
+    claiming SPC-3 (version 5), response data format 2 with HiSup, and
+    Sync and CmdQue set.  ``--vendor`` (default ``QEMU``), ``--product``
+    (default ``QEMU HARDDISK``) and ``--version`` (default ``1.0``) are
+    space padded and cut to 8, 16 and 4 characters; ``--removable`` sets
+    the RMB bit::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            inquiry disk0 --vendor "ACME" --product "FuzzyDisk 9000"
+
+``vpd-raw <device> <page> <hex>``
+    Set a raw VPD page from hex-encoded bytes (complete response
+    including the 4-byte VPD header).  Page codes take a ``0x`` prefix
+    for hex::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            vpd-raw disk0 0x80 00800024564552594c4f4e47
+
+``mode-sense-raw <device> <page> <hex>``
+    Set a raw MODE SENSE response from hex-encoded bytes, header
+    included::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            mode-sense-raw disk0 0x08 0300000008120400000000000000000000000000
+
+``clear <device> [--type TYPE] [--page PAGE]``
+    Clear overrides.  With no flags, clears everything on the device::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock clear disk0
+
+    Clear a specific override::
+
+        build/run scripts/scsi-inject.py -s /tmp/qmp.sock \
+            clear disk0 --type inquiry-vpd --page 0x80
+
 
 inject-error.py
 ^^^^^^^^^^^^^^^^
@@ -333,7 +559,7 @@ Run via the build venv::
 
     build/run scripts/inject-error.py [options] <command> [args]
 
-Connection options::
+Connection options (same as scsi-inject.py)::
 
     -s /path/to/qmp.sock        # Unix socket (preferred)
     -H localhost -P 4445         # TCP; these are the defaults
