@@ -94,8 +94,15 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
          * that's writing. QEMU would then need some way to detect
          * if the guest had the fixed driver too, before we can
          * use throttling on host side.
+         *
+         * A write can also fail because it noticed the host side
+         * was gone and closed the connection on the spot.  The close
+         * has already handed the guest its buffer back, and there is
+         * nothing left to wait on: throttling now would leave the
+         * port throttled for the next connection, which would then
+         * never see the guest's data.
          */
-        if (!k->is_console) {
+        if (!k->is_console && port->host_connected) {
             virtio_serial_throttle_port(port, true);
             if (!vcon->watch) {
                 vcon->watch = qemu_chr_fe_add_watch(&vcon->chr,
