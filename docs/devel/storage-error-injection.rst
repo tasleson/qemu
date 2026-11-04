@@ -14,6 +14,8 @@ hardware responses:
   Namespace responses at the NVMe emulation layer
 - **ATA response injection** -- overrides IDENTIFY DEVICE and SMART data, or
   fails those commands, on IDE and SATA (AHCI) hard disks
+- **SD/MMC response injection** -- overrides an SD or eMMC card's CID and
+  CSD registers and sets error bits in the card status it reports
 
 They are controlled at runtime via QMP.  They are meant for fuzzing
 and for testing guest drivers and storage management software, not
@@ -703,6 +705,124 @@ Notes
   geometry changes only what the guest is told.  The disk still has its
   real size, and I/O beyond it fails as usual.
 
+
+
+SD/MMC Response Injection
+-------------------------
+
+SD response injection targets SD and eMMC card emulation.  It replaces the
+contents of the Card Identification (CID) and Card-Specific Data (CSD)
+registers that the card returns, and can OR arbitrary bits into the card
+status the card reports with its responses, which is how a card signals
+errors such as ADDRESS_ERROR, CARD_ECC_FAILED or a locked card.  Use it to
+fuzz the guest's MMC core and host controller drivers, and tools such as
+``mmc-utils`` that parse those registers.
+
+It works on any SD or MMC card model (``sd-card``, ``sd-card-spi``,
+``emmc``), on whatever controller it is attached to, such as
+``sdhci-pci`` on x86.  The card needs an ``id``::
+
+    -device sdhci-pci,id=sdhci0
+    -device sd-card,drive=sd1,bus=sd-bus,id=sd0
+
+Override types and card status
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``cid``
+    The 16-byte CID register returned by ALL_SEND_CID (CMD2) and
+    SEND_CID (CMD10): manufacturer and OEM IDs, product name and
+    revision, serial number, manufacturing date and CRC.
+
+``csd``
+    The 16-byte CSD register returned by SEND_CSD (CMD9): capacity,
+    block lengths, timing and access parameters.
+
+In SD mode the register is returned in the 136-bit R2 response; data
+shorter than 16 bytes is padded with zeros.  In SPI mode the register is
+sent on the data lines, and only as many bytes as were given are sent.
+Either way the bytes are used verbatim: the CRC7 in the last byte is not
+recomputed, so a guest that checks it sees a mismatch unless the
+injected data carries a correct one.
+
+Card status injection is separate from the register overrides.  Bits
+given as ``card-status`` are ORed into the card status reported in every
+R1 and R1b response, into the status bits of the R6 response that
+publishes the RCA, and into the R1 and R2 status bytes of SPI responses.
+They stay until cleared, whatever ``type`` they were set with, and the
+card's own clear-on-read behaviour does not remove them.  The bit layout
+is the card status register's, as in the SD specification (for example
+bit 31 OUT_OF_RANGE, bit 30 ADDRESS_ERROR, bit 25 CARD_IS_LOCKED, bit 21
+CARD_ECC_FAILED, bit 19 ERROR).
+
+QMP commands
+^^^^^^^^^^^^
+
+**x-sd-inject-response-set** -- set a register override, card status
+injection, or both.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the card
+- ``type`` (string, required): ``cid`` or ``csd``.  It says which
+  register ``data`` replaces, and must be given even when only
+  ``card-status`` is.
+- ``data`` (string, optional): base64-encoded register contents, 1 to
+  16 bytes
+- ``card-status`` (int, optional): 32-bit card status bits to OR in.
+  Setting it again replaces the previous value.
+
+At least one of ``data`` and ``card-status`` must be given.  ``data``
+replaces any earlier override of the same register and leaves card
+status injection as it was.  Failures: "Device '...' not found",
+"Device '...' is not an SD/MMC card", "at least one of 'data' or
+'card-status' must be specified" and "data length must be between 1 and
+16 bytes".
+
+Example -- replace the CID::
+
+    -> { "execute": "x-sd-inject-response-set",
+         "arguments": { "id": "sd0",
+                        "type": "cid",
+                        "data": "AwBARkFLRTEwEjRWeAEeAQ==" } }
+    <- { "return": {} }
+
+Example -- report ERROR (bit 19) in every R1 response::
+
+    -> { "execute": "x-sd-inject-response-set",
+         "arguments": { "id": "sd0",
+                        "type": "csd",
+                        "card-status": 524288 } }
+    <- { "return": {} }
+
+**x-sd-inject-response-clear** -- clear overrides.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the card
+- ``type`` (string, optional): the register override to clear.  Omit it
+  to clear both registers and card status injection; with it, card
+  status injection stays.
+
+Example::
+
+    -> { "execute": "x-sd-inject-response-clear",
+         "arguments": { "id": "sd0" } }
+    <- { "return": {} }
+
+Notes
+^^^^^
+
+- Overrides are not migrated, persist across card resets, and are
+  discarded when the card is removed.
+
+- The guest reads CID and CSD while initialising the card, so an
+  override generally takes effect at the next card initialisation: after
+  a guest reboot, a rescan of the host controller, or a remove and
+  re-insert.  Card status bits take effect on the next response.
+
+- Setting card status bits that make the guest give up on the card,
+  such as CARD_IS_LOCKED during initialisation, can leave it without a
+  usable card until they are cleared and the card is re-initialised.
 
 
 Command-Line Tools
