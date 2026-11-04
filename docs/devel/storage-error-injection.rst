@@ -298,7 +298,8 @@ down.
 Failure modes worth testing
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Each of these takes one rule; the rule column shows what it configures.
+``scripts/inject-error.py scenario`` sets up a rule for each of these; the
+rule column shows what it configures.
 
 =========================== ================================================
 Scenario                    Rule
@@ -319,3 +320,122 @@ Out-of-order completion     ``delay-max-ms`` above ``delay-ms``
 Reset race                  a hold that straddles the guest's timeout, so
                             the completion lands during recovery
 =========================== ================================================
+
+
+Command-Line Tools
+------------------
+
+inject-error.py
+^^^^^^^^^^^^^^^^
+
+A CLI for the inject-error filter: bad sector regions and latency rules.
+Run via the build venv::
+
+    build/run scripts/inject-error.py [options] <command> [args]
+
+Connection options::
+
+    -s /path/to/qmp.sock        # Unix socket (preferred)
+    -H localhost -P 4445         # TCP; these are the defaults
+
+Wherever an errno is taken it may be a number or one of the names
+``EPERM``, ``EIO``, ``ENOMEM``, ``ENODEV``, ``EINVAL``, ``ENOSPC`` and
+``ENODATA`` (case does not matter).  Sectors accept a ``0x`` prefix.  The
+``list``, ``delay-list`` and ``inflight`` commands take ``--json`` to also
+print the raw QMP reply.
+
+Commands:
+
+``list <node>``
+    List all active error entries on a node::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock list err0
+
+``add <node> <sector> [options]``
+    Add a bad sector region.  Options: ``-c/--count`` (default 1),
+    ``-e/--errno`` (default EIO), ``-b/--behavior`` (default
+    ``persistent``), ``-R/--no-reads`` to let reads through, ``-w/--writes``
+    to fail writes too (``-r/--reads`` is accepted for symmetry and is
+    the default)::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            add err0 1024 --count 8
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            add err0 2048 --count 16 --errno ENOSPC --writes
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            add err0 0 --behavior fix-on-write --writes
+
+``remove <node> <sector> [--count N]``
+    Remove entries overlapping a sector range::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            remove err0 1024 --count 8
+
+``clear <node>``
+    Remove all error entries from a node, by removing the one range that
+    spans them all::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock clear err0
+
+``scenario <node> <scenario> <id> [options]``
+    Add a latency rule for one of the named failure modes, under the name
+    ``id``.  Every field of the rule can still be overridden with the
+    ``delay-add`` options below.  The scenarios and the rule each one
+    starts from:
+
+    ======================== ==================================================
+    Scenario                 Rule
+    ======================== ==================================================
+    ``fixed-latency``        ``delay-ms`` 50
+    ``tail-latency``         ``probability`` 0.001, ``delay-ms`` 10000,
+                             ``delay-max-ms`` 60000
+    ``stall``                ``stall``
+    ``timeout-then-success`` ``delay-ms`` 45000
+    ``timeout-then-failure`` ``delay-ms`` 45000, ``errno`` 5 (EIO)
+    ``backend-disconnect``   ``stall``; ``release --error`` fails what is
+                             held, ``delay-remove`` reconnects
+    ``flush-latency``        ``ops`` flush, ``delay-ms`` 30000
+    ``queue-saturation``     ``stall``, ``max-hits`` 32
+    ``out-of-order``         ``probability`` 0.25, ``delay-ms`` 100,
+                             ``delay-max-ms`` 5000
+    ``reset-race``           ``delay-ms`` 30000, ``delay-max-ms`` 90000
+    ======================== ==================================================
+
+    For example::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            scenario err0 tail-latency slow
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            scenario err0 fixed-latency lag --delay-ms 200
+
+``delay-add <node> <id> [options]``
+    Add a latency rule from scratch.  Options: ``--ops`` (comma separated
+    list), ``--sector``, ``-c/--count``, ``-p/--probability``,
+    ``-d/--delay-ms``, ``-D/--delay-max-ms``, ``--stall``, ``-e/--errno``
+    and ``--max-hits``, each mapping to the rule option of the same name
+    and left to QEMU's default when not given::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            delay-add err0 bootflush --ops flush --delay-ms 30000
+
+``delay-list <node>`` / ``delay-remove <node> [id]``
+    List the latency rules, or remove one of them (all of them if no id is
+    given)::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock delay-list err0
+        build/run scripts/inject-error.py -s /tmp/qmp.sock delay-remove err0
+
+``inflight <node>``
+    List the requests currently being held::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock inflight err0
+
+``release <node> [-i/--request-id N] [--complete|--error] [-e ERRNO]``
+    Release held requests, optionally overriding how they complete.
+    ``-e/--errno`` (default EIO) only matters with ``--error``::
+
+        build/run scripts/inject-error.py -s /tmp/qmp.sock \
+            release err0 --error --errno EIO
