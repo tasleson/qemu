@@ -242,6 +242,25 @@ void scsi_req_retry(SCSIRequest *req);
 void scsi_device_drained_begin(SCSIDevice *sdev);
 void scsi_device_drained_end(SCSIDevice *sdev);
 void scsi_device_purge_requests(SCSIDevice *sdev, SCSISense sense);
+
+/**
+ * scsi_device_for_each_req_async_in_order: Call a function on each request
+ * @s: the device whose requests to walk
+ * @fn: called for each request enqueued on @s
+ * @opaque: passed to @fn
+ *
+ * Schedule @fn() to be invoked for each enqueued request in device @s, in the
+ * AioContext that is executing the request and in the order the requests
+ * were enqueued.  One BH is scheduled per AioContext the device has requests
+ * in, so @fn() must be thread-safe because it runs concurrently in each.
+ *
+ * Keeps the BlockBackend's in-flight counter incremented until everything is
+ * done, so draining it will settle all scheduled @fn() calls.  Must be called
+ * from the main loop thread.
+ */
+void scsi_device_for_each_req_async_in_order(SCSIDevice *s,
+                                             void (*fn)(SCSIRequest *, void *),
+                                             void *opaque);
 void scsi_device_set_ua(SCSIDevice *sdev, SCSISense sense);
 void scsi_device_report_change(SCSIDevice *dev, SCSISense sense);
 void scsi_device_unit_attention_reported(SCSIDevice *dev);

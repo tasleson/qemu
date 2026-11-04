@@ -116,6 +116,7 @@ typedef struct {
     SCSIDevice *s;
     void (*fn)(SCSIRequest *, void *);
     void *fn_opaque;
+    bool in_order;      /* oldest request first, rather than newest */
 } SCSIDeviceForEachReqAsyncData;
 
 static void scsi_device_for_each_req_async_bh(void *opaque)
@@ -139,6 +140,9 @@ static void scsi_device_for_each_req_async_bh(void *opaque)
                 reqs = g_list_prepend(reqs, req);
             }
         }
+    }
+    if (data->in_order) {
+        reqs = g_list_reverse(reqs);
     }
 
     /* Call fn() on each request */
@@ -165,6 +169,7 @@ static void scsi_device_for_each_req_async_do_ctx(gpointer key, gpointer value,
     data->s = params->s;
     data->fn = params->fn;
     data->fn_opaque = params->fn_opaque;
+    data->in_order = params->in_order;
 
     /*
      * Hold a reference to the SCSIDevice until
@@ -178,17 +183,9 @@ static void scsi_device_for_each_req_async_do_ctx(gpointer key, gpointer value,
     aio_bh_schedule_oneshot(ctx, scsi_device_for_each_req_async_bh, data);
 }
 
-/*
- * Schedule @fn() to be invoked for each enqueued request in device @s. @fn()
- * must be thread-safe because it runs concurrently in each AioContext that is
- * executing a request.
- *
- * Keeps the BlockBackend's in-flight counter incremented until everything is
- * done, so draining it will settle all scheduled @fn() calls.
- */
-static void scsi_device_for_each_req_async(SCSIDevice *s,
-                                           void (*fn)(SCSIRequest *, void *),
-                                           void *opaque)
+static void scsi_device_for_each_req_async_common(SCSIDevice *s,
+                                       void (*fn)(SCSIRequest *, void *),
+                                       void *opaque, bool in_order)
 {
     assert(qemu_in_main_thread());
 
@@ -206,12 +203,35 @@ static void scsi_device_for_each_req_async(SCSIDevice *s,
         .s = s,
         .fn = fn,
         .fn_opaque = opaque,
+        .in_order = in_order,
     };
     g_hash_table_foreach(
             aio_contexts,
             scsi_device_for_each_req_async_do_ctx,
             &params
     );
+}
+
+/*
+ * Schedule @fn() to be invoked for each enqueued request in device @s. @fn()
+ * must be thread-safe because it runs concurrently in each AioContext that is
+ * executing a request.
+ *
+ * Keeps the BlockBackend's in-flight counter incremented until everything is
+ * done, so draining it will settle all scheduled @fn() calls.
+ */
+static void scsi_device_for_each_req_async(SCSIDevice *s,
+                                           void (*fn)(SCSIRequest *, void *),
+                                           void *opaque)
+{
+    scsi_device_for_each_req_async_common(s, fn, opaque, false);
+}
+
+void scsi_device_for_each_req_async_in_order(SCSIDevice *s,
+                                             void (*fn)(SCSIRequest *, void *),
+                                             void *opaque)
+{
+    scsi_device_for_each_req_async_common(s, fn, opaque, true);
 }
 
 static void scsi_device_realize(SCSIDevice *s, Error **errp)
