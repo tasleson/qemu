@@ -396,20 +396,31 @@ void qvirtqueue_set_avail_idx(QTestState *qts, QVirtioDevice *d,
     qvirtio_writew(d, qts, vq->avail + 2, idx);
 }
 
-void qvirtqueue_kick(QTestState *qts, QVirtioDevice *d, QVirtQueue *vq,
-                     uint32_t free_head)
+/*
+ * Put @free_head on the avail ring without notifying the device, and return
+ * the avail index before it was added.
+ */
+uint16_t qvirtqueue_publish(QTestState *qts, QVirtioDevice *d, QVirtQueue *vq,
+                            uint32_t free_head)
 {
     /* vq->avail->idx */
     uint16_t idx = qvirtio_readw(d, qts, vq->avail + 2);
-    /* vq->used->flags */
-    uint16_t flags;
-    /* vq->used->avail_event */
-    uint16_t avail_event;
 
     /* vq->avail->ring[idx % vq->size] */
     qvirtio_writew(d, qts, vq->avail + 4 + (2 * (idx % vq->size)), free_head);
 
     qvirtqueue_set_avail_idx(qts, d, vq, idx + 1);
+    return idx;
+}
+
+void qvirtqueue_kick(QTestState *qts, QVirtioDevice *d, QVirtQueue *vq,
+                     uint32_t free_head)
+{
+    uint16_t idx = qvirtqueue_publish(qts, d, vq, free_head);
+    /* vq->used->flags */
+    uint16_t flags;
+    /* vq->used->avail_event */
+    uint16_t avail_event;
 
     /* Must read after idx is updated */
     flags = qvirtio_readw(d, qts, vq->used);
