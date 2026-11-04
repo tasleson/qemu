@@ -598,6 +598,15 @@ and removing it then lets the reset go ahead.
 ``fault-below-hang-holds-none`` in ``tests/qtest/virtio-scsi-test.c``
 checks that order, in the main loop and with an iothread.
 
+``scripts/fuzz-windows-inject-target-fault.py`` runs these for hours
+against a Windows guest with the vioscsi driver: it faults one target at a
+time, in rotation, records what each cycle ended with -- which recovery
+cleared it and how long that took, or that the guest never got there --
+and watches for a bugcheck or a broken ring.  Its ``--bsod`` option runs
+the last scenario instead, against cached file reads, to bugcheck a driver
+that completes requests the device still owns.  See
+:doc:`storage-error-injection-harnesses`.
+
 .. _storage-injection-virtio-scsi:
 
 virtio-scsi TMF Delay and Ring Diagnostics
@@ -1737,9 +1746,10 @@ Windows Driver Harnesses
 ------------------------
 
 ``scripts/setup-windows-inject-vm.sh`` sets up a Windows 11 guest, with
-UEFI Secure Boot and a TPM, for testing the viostor and vioscsi drivers.
-It and the harnesses built on it are documented separately, in
-:doc:`storage-error-injection-harnesses`.
+UEFI Secure Boot and a TPM, for testing the viostor and vioscsi drivers,
+and five harnesses (``scripts/fuzz-windows-inject-*.py``) run long,
+unattended experiments against it built on the mechanisms above.  They
+are documented separately, in :doc:`storage-error-injection-harnesses`.
 
 
 Walkthrough: End-to-End Example

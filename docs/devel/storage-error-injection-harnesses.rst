@@ -25,10 +25,14 @@ Harness                                     Driver   What it injects
                                                      timeout
 ``fuzz-windows-inject-reset-inflight.py``   vioscsi  hours of stalls that only
                                                      the guest's own resets end
+``fuzz-windows-inject-target-fault.py``     vioscsi  hours of SCSI target faults
+                                                     in rotation, and the
+                                                     ``--bsod`` reset-race
+                                                     recipe
 =========================================== ======== ==========================
 
-The harnesses share their machinery, ``scripts/vioscsi_soak_common.py``,
-described once below.
+The last three share their machinery, ``scripts/vioscsi_soak_common.py``,
+described once below; the first two use parts of it.
 
 .. contents:: Contents
    :local:
@@ -170,10 +174,10 @@ The shared soak library
 -----------------------
 
 ``scripts/vioscsi_soak_common.py`` is a library, not a script; it does
-nothing on its own.  The soak harnesses are thin wrappers around its
-soak driver, or run their own loop on the library's parts.  This section
-describes what they have in common, so the harness sections only cover
-what differs.
+nothing on its own.  The tail-latency and reset-inflight harnesses are
+thin wrappers around its soak driver, and the target-fault harness runs
+its own loop on the library's parts.  This section describes what they
+have in common, so the harness sections only cover what differs.
 
 Environment
 ^^^^^^^^^^^
@@ -258,6 +262,9 @@ starts a writer for each LUN.  ``--io-driver`` picks the writer:
     writing every LUN end to end.  Its per-request timeout is set past the
     longest hold the harness's rules can cause.  (tail-latency and
     reset-inflight only.)
+
+``cached-read``
+    See `fuzz-windows-inject-target-fault.py`_ (target-fault only).
 
 The deep-queue drivers matter for the reset harnesses: a stall then
 holds dozens of commands per LUN rather than one.  ``fio`` and
@@ -403,7 +410,8 @@ missing prerequisite exits with 1.
 Options every soak harness has
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The harnesses built on the library's soak driver take all of these.
+The tail-latency and reset-inflight harnesses take all of these;
+target-fault takes the ones it needs (see its section).
 
 ``--tmf-trace`` / ``--no-tmf-trace`` (on)
     Trace TMFs, resets and broken rings per adapter.
@@ -724,3 +732,171 @@ Besides the common options:
     them at a chosen point in the driver's recovery.
 
 Runs live in ``$VM_DIR/soak-reset-inflight``.
+
+
+fuzz-windows-inject-target-fault.py
+-----------------------------------
+
+The latency harnesses' storage misbehaves on a timer, whatever the guest
+does.  Real targets get stuck and stay stuck until the initiator does the
+right recovery.  This harness uses :ref:`SCSI target faults
+<storage-injection-target-faults>` for that: for hours, it takes one
+target at a time -- picked at random with ``--seed`` -- arms a fault on
+it in one of a rotating set of scenarios, waits until the guest's
+recovery clears it (the ``SCSI_FAULT_CLEARED`` event) or a deadline
+passes, cools down, and moves on.  Each fault holds commands before they
+run, so a held write never reaches the disk and a recovery that cancels
+it really does throw it away.
+
+The VM must have at least two targets in all (``--adapters`` times
+``--targets``): the dark-guest check watches the LUNs no fault holds.
+
+Scenarios
+^^^^^^^^^
+
+=========================== ===================================================
+Scenario                    The fault
+=========================== ===================================================
+``lun-reset-clears``        hung until a LUN reset; aborts cancel what it holds
+                            but leave it hung
+``abort-clears``            hung until the guest aborts a command to it, or does
+                            anything stronger
+``needs-target-reset``      hung until a target (I_T nexus) reset; LUN resets go
+                            through but leave it hung
+``reject-lun-reset``        hung until a target reset; LUN resets fail with
+                            FUNCTION REJECTED
+``hang-lun-reset``          hung until a target reset; a LUN reset gets no answer
+                            for ``--tmf-hang-ms``, then goes through and leaves
+                            it hung
+``slow-target``             every command held 5 to 15 seconds then run, for
+                            ``--window-s``
+``late-completion``         ``--late-probability`` of commands held 61 to 65
+                            seconds, past the guest's timeout, then run, for
+                            ``--window-s``
+``dead-target``             hung whatever the guest does, until the harness
+                            removes it after ``--dead-target-s``
+``late-dma``                target 0 hung, with LUN resets left hanging, until
+                            the harness lets the held reads run
+                            ``--late-dma-delay-s`` after its trigger
+=========================== ===================================================
+
+All but ``late-dma`` rotate by default.  ``late-dma`` makes a reset race
+deliberate: a driver completing requests at a reset while the device
+still owns their buffers.
+It uses the two-fault arrangement from the last of the target fault
+scenarios: a fault holding target 0's commands, and a second one with
+probability 0 that only hangs LUN resets, both ``clear-on`` ``manual``.
+When the trigger comes -- the first read the guest's readers see fail
+(``--late-dma-release-after read-error``, the default with the cached-read
+driver), by which time Windows should have given up on the read and
+reused its pages, or the first recovery attempt the fault sees
+(``recovery``, the default otherwise) -- the harness waits
+``--late-dma-delay-s`` and removes the first fault, so the held reads run
+and their data lands in memory the guest may already have reused, and
+then the second.  A driver that completed those reads to Windows when it
+reset should then bugcheck or corrupt data.
+
+Each cycle in the result records how it ended -- ``recovered`` (with
+``cleared_by`` and ``time_to_clear_s``, timed from when the fault was
+armed), ``not-recovered`` (the guest didn't get there within
+``--recovery-deadline-s``, or late-dma never saw its trigger),
+``window-ended``, ``replaced`` (dead-target), ``released`` (late-dma, with
+a ``late_dma`` record of when and why), ``removed`` (someone else removed
+it over QMP), ``interrupted`` (the harness removed every fault for a
+dump, a broken ring, an error or the end of the run) or ``arm-failed``
+(three in a row end the run) -- with the commands it held, the recovery
+attempts it saw, the TMFs the guest sent the target and the adapter
+resets during it.  ``scenario_summary`` adds them up per scenario.
+
+The cached-read driver
+^^^^^^^^^^^^^^^^^^^^^^
+
+``--io-driver cached-read`` formats every LUN NTFS before the soak and
+writes one file to it, ``--cached-read-file-gib`` in size (default 1.25
+times ``--ram``, so not even one LUN's file can stay cached), each chunk
+stamped with its LUN and offset.  Readers then read the files over and
+over through the file cache, so the LUN traffic is paging reads into
+physical pages the memory manager recycles -- which is where a read that
+completes after the driver gave up on it does damage.  Every chunk read
+is checked; a failed read is counted, a wrong one ends the run as
+``data-corruption``.  It needs nothing in the guest beyond the Storage
+cmdlets, but formatting and writing the files takes a while, especially
+on NFS-backed images.
+
+The --bsod recipe
+^^^^^^^^^^^^^^^^^
+
+``--bsod`` puts this together into one run meant to bugcheck a vioscsi
+that completes requests the device still owns.  It runs only
+``late-dma`` cycles with the cached-read driver and ``hv-crash``, turns
+``--stop-on-broken`` off, and doesn't end the run for a writer exiting.  Unless given explicitly, it also sets ``--ram`` to 4G,
+``--recovery-deadline-s`` to 900 and the layout to 2 adapters of 1
+target.  It ends as ``guest-panicked`` at the first bugcheck, with the
+STOP code and parameters printed and in ``guest_panic``, and the dump in
+``panic.dmp``; as ``data-corruption`` if ``--bsod-cycles`` cycles pass
+without one but a reader read back wrong data; as ``cycles-complete`` if
+they pass clean.  A broken ring doesn't end it at once: the harness
+removes every fault and keeps watching for 300 seconds, so a bugcheck
+the break leads to still ends the run as ``guest-panicked``; if none
+comes, it ends as ``virtio-broken``.
+
+To compare drivers, run ``--bsod`` once with each build installed in the
+golden image: the upstream driver is expected to bugcheck, and one that
+waits for the TMF response before completing anything (reset_via_tmf) to
+survive.  `The vioscsi driver record`_ in each result says which build
+a run had.
+
+Options
+^^^^^^^
+
+The common options apply, except ``--watch-after-break``, ``--fill-wait``,
+``--fill-timeout-minutes`` and ``--paranoid-path``; ``--io-driver`` takes
+``powershell``, ``diskspd``, ``fio`` or ``cached-read``.  Several
+defaults differ: ``--targets`` is 2, ``--ram`` is 8G (4G under
+``--bsod``), and ``--seed`` (1) seeds only the choice of target --
+QEMU picks which commands a probability or delay fault holds on its own,
+with no seed.  In addition:
+
+``--hv-crash`` / ``--no-hv-crash`` (on)
+    Give the guest the Hyper-V crash MSRs and run QEMU with
+    ``-action panic=pause``, so a bugcheck pauses the VM as
+    ``guest-panicked`` and the run ends with the STOP code, a screenshot
+    and ``panic.dmp``, rather than being noticed later as
+    ``crash-suspected``.  ``--bsod`` needs it.
+
+``--scenarios LIST``
+    Scenarios to rotate through, in order (default all but late-dma;
+    late-dma alone under ``--bsod``).
+
+``--recovery-deadline-s`` [300, 900 under --bsod]
+    How long a scenario waiting for recovery gets before the harness
+    removes the fault and records ``not-recovered``, and how long
+    late-dma waits for its trigger.
+
+``--late-dma-delay-s`` [10.0], ``--late-dma-release-after``
+    See late-dma above.
+
+``--bsod``, ``--bsod-cycles`` [3]
+    See the recipe above.
+
+``--window-s`` [300.0]
+    How long slow-target and late-completion stay armed.
+
+``--dead-target-s`` [240.0]
+    How long dead-target stays dead.
+
+``--cooldown-s`` [60.0]
+    Pause between one cycle ending and the next starting.
+
+``--tmf-hang-ms`` [30000]
+    How long hang-lun-reset leaves a LUN reset unanswered.
+
+``--late-probability`` [0.05]
+    Fraction of commands late-completion holds.
+
+``--cached-read-file-gib``
+    Size of each LUN's file for cached-read.
+
+Runs live in ``$VM_DIR/soak-target-fault``.  With ``--stop-on-broken``,
+the dump at a break removes every fault and no more are armed for the
+rest of the run.
