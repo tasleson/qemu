@@ -645,7 +645,8 @@ requests on the control queue are never delayed.
 A device reset drops every held TMF response without writing it to the
 ring, since the ring it belongs to no longer exists after the reset; the
 guest never sees an answer.  The same happens to TMFs a target fault
-left hanging, and at unplug.
+left hanging, and at unplug.  The ``tmf-delay-device-reset`` test in
+``tests/qtest/virtio-scsi-test.c`` checks this.
 
 ``virtio_scsi_tmf_delay`` traces each response as it is held, with the
 delay; ``virtio_scsi_tmf_resp`` traces it when it is finally sent, and
