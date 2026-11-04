@@ -1149,6 +1149,8 @@ Notes
   geometry changes only what the guest is told.  The disk still has its
   real size, and I/O beyond it fails as usual.
 
+- ``scripts/setup-fuzz-inject-vm.sh`` creates two suitable devices,
+  ``sata-disk1`` on AHCI and ``ide-disk1`` on PIIX4.
 
 
 SD/MMC Response Injection
@@ -1268,6 +1270,8 @@ Notes
   such as CARD_IS_LOCKED during initialisation, can leave it without a
   usable card until they are cleared and the card is re-initialised.
 
+- ``scripts/setup-fuzz-inject-vm.sh`` creates a card with ID
+  ``sd-card1`` on ``sdhci-pci``.
 
 .. _storage-injection-tracepoints:
 
@@ -1535,3 +1539,339 @@ Commands:
 
         build/run scripts/inject-error.py -s /tmp/qmp.sock \
             release err0 --error --errno EIO
+
+
+setup-error-inject-vm.sh
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Creates and manages a Linux test VM with a Fedora boot disk and three SCSI
+disks, all behind inject-error filters::
+
+    scripts/setup-error-inject-vm.sh create       # create disk images
+    FEDORA_ISO=/path/to/Fedora.iso \
+        scripts/setup-error-inject-vm.sh install   # install from ISO
+    scripts/setup-error-inject-vm.sh run           # boot installed system
+    scripts/setup-error-inject-vm.sh build-run     # rebuild QEMU then boot
+    scripts/setup-error-inject-vm.sh status        # show disk/VM status
+
+Prerequisites: a QEMU build in ``$HOME/projects/qemu/build`` (the path is
+fixed in the script, which does not look at where it was run from), a
+host with KVM, a GTK display, ``passt`` for networking, and a Fedora
+installation ISO.  ``build-run`` runs ``ninja -C`` on that build
+directory before booting.
+
+``create`` makes the directory ``$HOME/VirtualMachines/qemu/error_inject``
+and any sparse qcow2 images missing from it, and leaves existing ones
+alone.  ``install`` needs ``FEDORA_ISO``; ``RAM`` (default 4G) and
+``CPUS`` (default 4) size the VM.  Any other command prints the usage
+text and exits with status 1, as do the commands when an image or the
+QEMU binary is missing.
+
+The VM is configured with:
+
+- A q35 machine with KVM and ``-cpu host``
+- A 40G boot disk on virtio-blk behind an inject-error filter (install
+  Fedora here)
+- Three 10G SCSI disks on one virtio-scsi adapter (``scsi0``), each
+  behind an inject-error filter, with serial numbers ``DISK1_SERIAL``
+  to ``DISK3_SERIAL``
+- A QMP Unix socket, ``qmp.sock`` in the VM directory, for runtime
+  control
+- User-mode networking through ``passt``, with host port 2222 forwarded
+  to the guest's SSH port
+- GTK display, QEMU monitor on stdio
+
+Device and node names:
+
+====== ========= =========== ===========================================
+Disk   Device ID Block Node  Description
+====== ========= =========== ===========================================
+boot   disk0     err0        virtio-blk system disk, inject-error filter
+1      disk1     err1        SCSI disk with inject-error filter
+2      disk2     err2        SCSI disk with inject-error filter
+3      disk3     err3        SCSI disk with inject-error filter
+====== ========= =========== ===========================================
+
+Use ``disk1``/``disk2``/``disk3`` with ``x-scsi-disk-inject-response-set``
+and ``scsi-inject.py``; SCSI response injection does not apply to the boot
+disk, which is virtio-blk.  Use ``err0`` through ``err3`` with
+``x-inject-error-add`` and the latency commands, and ``scsi0`` with
+``x-scsi-fault-add`` (the disks are targets 0 to 2).
+
+Injecting on the system disk
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``err0`` is the disk the guest is running from, which makes it the most
+realistic target and the most awkward one.  Three things to plan for.
+
+The guest usually cannot report what happened, because the log it would
+write lives on the disk that is failing.  Arrange an observable that does
+not touch storage -- a serial console, or the QEMU-side trace events --
+before injecting anything there.
+
+Failures on the system disk tend to end the experiment rather than
+produce a result: an error on the paging path is a guest crash, and on
+some guests the crash dump is written by a separate driver instance that
+will hit the same injected failure.
+
+The image can be left inconsistent, and a stall on ``err0`` holds up VM
+shutdown until it is released.  Work from a copy, or from an overlay
+created with ``qemu-img create -f qcow2 -b boot.qcow2 -F qcow2``, so each
+run starts from a known state.
+
+The data disks are the better instrument for everything that does not
+specifically require the boot path: the guest stays alive and able to
+report, and a run costs seconds rather than a reinstall.
+
+setup-fuzz-inject-vm.sh
+^^^^^^^^^^^^^^^^^^^^^^^
+
+A bigger version of the same VM, with one disk on every kind of storage
+controller QEMU emulates on x86, for checking that a guest copes with an
+injected failure whatever driver handles it.  It takes the same commands
+(``create``, ``install``, ``run``, ``build-run``, ``status``), the same
+environment variables, and has the same prerequisites as
+``setup-error-inject-vm.sh``.  It uses the same VM directory and the same
+``boot.qcow2`` and ``scsi-disk*.qcow2`` images, so a Fedora installed with
+either script boots with both; ``create`` adds the extra images next to
+them.
+
+Unlike the smaller VM, its boot disk is a plain virtio-blk disk with no
+inject-error filter.  The data disks, all 10G qcow2 unless noted:
+
+============== =================== ============== ==============================
+Controller     Device ID           Block node     Injection besides inject-error
+============== =================== ============== ==============================
+virtio-scsi    disk1, disk2, disk3 err1 to err3   SCSI response, target faults
+                                                  (adapter ``scsi0``)
+NVMe           nvme-disk1          nvme1-err      NVMe response
+SATA (AHCI)    sata-disk1          sata1-err      ATA response
+IDE (PIIX4)    ide-disk1           ide1-err       ATA response
+Floppy         (none)              floppy-err     none; 1.44 MB raw image
+USB storage    usb-disk1           usb1-err       SCSI response
+SD (sdhci-pci) sd-card1            sd1-err        SD response; 1G image
+LSI 53C895A    lsi-disk1           lsi1-err       SCSI response
+MegaRAID SAS   megasas-disk1       megasas1-err   SCSI response
+VMware PVSCSI  pvscsi-disk1        pvscsi1-err    SCSI response
+UFS            (none)              ufs1-err       none: the ``ufs-lu`` has no
+                                                  ID to address it by
+============== =================== ============== ==============================
+
+The Fusion-MPT SAS controller (``mptsas1068``) is left out because it
+stopped SeaBIOS booting the right disk.  Target faults work only on the
+virtio-scsi adapter, the only one with support for them.
+
+test-libsg-injection.sh
+^^^^^^^^^^^^^^^^^^^^^^^
+
+An automated regression test for libstoragemgmt's SCSI response parsing
+(``libsg.c``), and a worked example of using response injection from a
+test script.  It runs on the host, injects crafted VPD and MODE SENSE
+responses with ``scsi-inject.py``, has the guest rescan the disk over
+SSH, runs ``lsmcli local-disk-list`` (or the ``lsm`` Python module) in
+the guest, and checks that malformed pages are reported as warnings
+rather than crashing or being misread.
+
+Prerequisites:
+
+- The VM from ``setup-error-inject-vm.sh`` running.
+- SSH as root to the guest on ``localhost`` port 2222 without a password
+  prompt (key authentication).
+- libstoragemgmt built in the guest under ``/libstoragemgmt``, with its
+  unit test ``test/libsg_test`` built, and ``lsmcli`` and the ``lsm``
+  Python module installed.
+- The test assumes ``disk1``, ``disk2`` and ``disk3`` appear in the guest
+  as ``/dev/sdc``, ``/dev/sdd`` and ``/dev/sde``.  That depends on what
+  else the guest has attached; on the plain VM they are usually ``sda``
+  to ``sdc``, in which case the device names in the script need editing.
+
+Environment: ``QEMU_SRC`` (default ``$HOME/projects/qemu``) locates
+``build/run`` and ``scsi-inject.py``; ``QMP`` (default
+``$HOME/VirtualMachines/qemu/error_inject/qmp.sock``) is the socket.
+
+It runs seven phases: libstoragemgmt's own ``libsg_test`` unit tests in
+the guest; VPD page 0x83 (device identification) with valid, oversized,
+empty, truncated and mislabelled pages; VPD 0x80 (serial number) the same
+way; VPD 0x00 (supported pages), checking that ATA is detected only when
+page 0x89 is listed within the bytes actually returned; VPD 0xB1
+(rotation rate, SSD and 7200 RPM); MODE SENSE page 0x1C (informational
+exceptions) with bad mode data and block descriptor lengths, after
+injecting a SAS identity so the health check reaches it; and a check that
+an override on one disk leaves the other two alone.  It then clears every
+override.
+
+Each check prints ``PASS``, ``FAIL`` (with what was expected and the
+relevant output) or ``SKIP``, followed by a total.  The exit status is
+the number of failures, so 0 means every check passed.  It exits with 1
+straight away if SSH or the QMP socket isn't reachable.  The script runs
+with ``set -e``, so a QMP error part way through ends it before the
+final clean-up; run ``scsi-inject.py clear`` on the three disks
+afterwards in that case.
+
+
+Walkthrough: End-to-End Example
+-------------------------------
+
+This walks through setting up a VM, injecting both I/O errors and SCSI
+response overrides, and observing the results from inside the guest.
+
+1. Create disk images and install Fedora
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    scripts/setup-error-inject-vm.sh create
+    FEDORA_ISO=~/Downloads/Fedora-Server-dvd-x86_64-42-1.1.iso \
+        scripts/setup-error-inject-vm.sh install
+
+During installation, install Fedora to the virtio boot disk (it will
+appear as ``/dev/vda``).  Leave the three SCSI disks (``/dev/sda``,
+``/dev/sdb``, ``/dev/sdc``) alone.
+
+2. Boot the installed system
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    scripts/setup-error-inject-vm.sh run
+
+3. Verify the SCSI disks are visible (inside the guest)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    $ lsblk -S
+    NAME HCTL       TYPE VENDOR   MODEL            REV TRAN
+    sda  0:0:0:0    disk QEMU     QEMU HARDDISK    2.5  spi
+    sdb  0:0:1:0    disk QEMU     QEMU HARDDISK    2.5  spi
+    sdc  0:0:2:0    disk QEMU     QEMU HARDDISK    2.5  spi
+
+    $ sg_inq --page=0x80 /dev/sda
+    Unit serial number: DISK1_SERIAL
+
+4. Inject a long serial number (from the host)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    QMP=~/VirtualMachines/qemu/error_inject/qmp.sock
+
+    build/run scripts/scsi-inject.py -s $QMP \
+        serial disk1 "FUZZING_SERIAL_0123456789ABCDEF0123456789ABCDEF"
+
+5. Verify in the guest
+^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    $ sg_inq --page=0x80 /dev/sda
+    Unit serial number: FUZZING_SERIAL_0123456789ABCDEF0123456789ABCDEF
+
+The serial number now exceeds the normal 36-character QEMU limit.
+
+6. Inject a bad sector
+^^^^^^^^^^^^^^^^^^^^^^
+
+From the host::
+
+    build/run scripts/inject-error.py -s $QMP add err1 0 --count 16
+
+7. Observe the error in the guest
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    $ dd if=/dev/sda of=/dev/null bs=512 count=1
+    dd: error reading '/dev/sda': Input/output error
+
+8. List and clear the bad sector
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    build/run scripts/inject-error.py -s $QMP list err1
+    build/run scripts/inject-error.py -s $QMP clear err1
+
+The read succeeds again::
+
+    $ dd if=/dev/sda of=/dev/null bs=512 count=1
+    1+0 records in
+    1+0 records out
+
+8a. Hold a request and watch the guest recover
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+From the host, stall every request to the disk::
+
+    build/run scripts/inject-error.py -s $QMP scenario err1 stall gone
+
+In the guest, a read now hangs instead of failing::
+
+    $ dd if=/dev/sda of=/dev/null bs=512 count=1
+
+Back on the host, the held request is visible.  Remove the rule first,
+so a request the guest retries is not stalled again, then fail (or
+complete) what is still held::
+
+    build/run scripts/inject-error.py -s $QMP inflight err1
+    build/run scripts/inject-error.py -s $QMP delay-remove err1
+    build/run scripts/inject-error.py -s $QMP release err1 --error
+
+Leaving it held long enough instead lets the guest's own timeout and
+device reset run, which is the interesting part for driver testing.
+
+8b. Make a target hang until the guest resets it
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``disk1`` is target 0 on adapter ``scsi0``.  From the host, arm a fault
+that holds every command sent to it until the guest resets the LUN (the
+default ``clear-on``)::
+
+    build/run scripts/scsi-inject.py -s $QMP fault-add scsi0 hang0 0
+
+Then wait for it to clear.  ``fault-wait`` keeps the QMP connection open,
+and the VM has only the one socket, so run nothing else over QMP until
+it returns::
+
+    build/run scripts/scsi-inject.py -s $QMP fault-wait scsi0 hang0 --timeout 600
+
+Meanwhile, in the guest, read from the disk::
+
+    $ dd if=/dev/sda of=/dev/null bs=512 count=1 iflag=direct
+
+The read hangs.  When it times out, Linux first aborts it; an abort is
+below the fault's ``clear-on``, so it cancels the command but the target
+stays hung and the retry hangs again.  The guest's error handler then
+escalates to a LUN reset, which clears the fault, and ``fault-wait``
+prints what cleared it::
+
+    Fault hang0 on scsi0 cleared by lun-reset with 0 command(s) held
+
+The count is 0 because the reset cancelled the held read before the fault
+cleared.  ``dmesg`` in the guest shows the abort and the reset.  Whether ``dd``
+then succeeds or reports an I/O error depends on how many retries the
+guest's error handling has used up by then.  If the guest never gets
+there, ``fault-wait`` exits with status 4 after its timeout; remove the
+fault with ``fault-remove scsi0 hang0``.
+
+9. Override the standard INQUIRY response
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    build/run scripts/scsi-inject.py -s $QMP \
+        inquiry disk1 --vendor "ACME" --product "FuzzyDisk 9000"
+
+In the guest::
+
+    $ sg_inq /dev/sda
+    ...
+      Vendor identification: ACME
+      Product identification: FuzzyDisk 9000
+
+10. Clear all overrides and restore normal behavior
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+::
+
+    build/run scripts/scsi-inject.py -s $QMP clear disk1
