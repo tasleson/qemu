@@ -18,6 +18,8 @@ Harness                                     Driver   What it injects
 ``fuzz-windows-inject-boot.py``             viostor  a grid of latency rules on
                                                      the boot disk, one boot per
                                                      grid point
+``fuzz-windows-inject-scsi-reset.py``       vioscsi  stalls on several LUNs at
+                                                     once, so their resets race
 ``fuzz-windows-inject-tail-latency.py``     vioscsi  hours of a few requests
                                                      held past the guest's
                                                      timeout
@@ -551,6 +553,100 @@ that did not end in ``boot-ok``, each with its run directory.  The exit
 status is 1 if any grid point ended in anything but ``boot-ok``, else 0.
 A malformed command line exits with 2, from argparse; an unknown
 category or a missing prerequisite exits with 1.
+
+
+fuzz-windows-inject-scsi-reset.py
+---------------------------------
+
+Races concurrent LUN resets on one vioscsi adapter.  The suspected bug is
+that vioscsi keeps one TMF buffer and one reset-in-progress flag per
+adapter, so a second LUN's reset arriving while the first one's TMF is
+still in flight can reuse state the device is still using.  QEMU answers
+a single LUN reset quickly -- the reset drains the LUN, and draining ends
+an inject-error stall at once -- so the lever is concurrency: stall
+several LUNs at almost the same moment, let the guest's storport time
+them all out together, and repeat under varying gaps and host load.
+
+Each trial boots the golden image with ``--luns`` scratch LUNs on one
+adapter, starts a writer per LUN, lets I/O settle, then arms a ``stall``
+(or, with ``--mode delay``, a timed hold) rule on each LUN's node in turn
+with ``gap-ms`` between them.  It holds for ``--run-timeout`` seconds
+watching for a crash, releases the stalls, and waits up to
+``--recovery-timeout`` for every LUN to be written to again.  With
+``--cycles`` above 1 it repeats that in the same boot.
+
+Options (defaults in brackets):
+
+``--luns`` [3]
+    LUNs on the shared adapter.
+
+``--gaps-ms`` [0,5,20,50,100,250,500]
+    Gaps between arming each LUN's stall, one sweep value per trial.
+
+``--mode`` [stall]
+    ``stall`` holds until released or reset, so the guest's timeout
+    drives the race; ``delay`` holds for ``--delay-ms`` [70000] up to
+    ``--delay-max-ms``.
+
+``--repeat`` [3]
+    Trials per gap.
+
+``--run-timeout`` [90], ``--recovery-timeout`` [120]
+    Seconds to hold, and to wait for recovery after release.
+
+``--cycles`` [1], ``--inter-cycle-settle`` [2.0]
+    Stall/reset/recover cycles per trial, and the clean I/O before each.
+
+``--io-driver`` [powershell], ``--diskspd-path``
+    ``powershell`` or ``diskspd``, as described above, except that
+    diskspd here writes only (``-w100``) instead of a 50/50 mix.
+
+``--tmf-delay-ms`` [0], ``--tmf-delay-count`` [0]
+    Create the adapter with ``x-tmf-delay-ms`` and ``x-tmf-delay-count``
+    so the first TMF responses are held back.  This turns the trial into
+    an escalation experiment: nothing forces a second reset, and the
+    trace shows whether storport sends one on its own while the first is
+    held (``escalations_during_delay`` in the result).
+
+``--ram`` [8G], ``--cpus`` [5], ``--host-pressure-cores``
+    Guest size, and ``taskset`` cores for QEMU.
+
+``--seed-base`` [1]
+    Seed of the first trial; each later trial uses the next.
+
+``--keep-all``, ``--stop-on-first-crash``, ``--dry-run``
+    Keep artifacts of clean trials, stop at the first finding, or just
+    print the trials.
+
+Trials go in ``$VM_DIR/fuzz-scsi-reset/run-NNNN``, with
+``windows-storage-trace-events`` traced to ``trace.log`` there when the
+file exists, and one JSON line per trial in ``results-<unix
+time>.jsonl``, with `the vioscsi driver record`_.  After each trial a
+one-line summary of the TMFs and resets seen in the trace is printed.
+
+``recovered``
+    Every LUN was written to again after the release.
+
+``crash-suspected``
+    The guest went dark while stalled; its memory is dumped to
+    ``crash.dmp``.
+
+``recovered-unresponsive``
+    The LUNs never resumed and the guest agent is gone; dumped.
+
+``io-stuck``
+    The guest agent answers but the LUNs never resumed; dumped.
+
+``qemu-exited``
+    QEMU exited.
+
+``boot-failed``, ``no-io``, ``error``
+    As for the soak harnesses.
+
+The four after ``recovered`` are findings.  The exit status is 1 if
+any trial ended in anything but ``recovered``, else 0.  As for the other
+harnesses, a malformed command line exits with 2 and a rejected option
+value or missing prerequisite with 1.
 
 
 fuzz-windows-inject-tail-latency.py

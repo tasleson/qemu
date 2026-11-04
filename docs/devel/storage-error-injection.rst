@@ -642,7 +642,9 @@ guest's view of it is late.  That is the point: a guest driver that
 issues a reset and waits for the answer stays in its reset path for as
 long as the delay lasts, so whatever else times out meanwhile -- a second
 LUN's commands, the reset itself -- has to be handled while the first is
-still in flight.
+still in flight.  ``scripts/fuzz-windows-inject-scsi-reset.py
+--tmf-delay-ms`` uses it to see whether Windows' storport sends a second
+TMF on its own while the first is held.
 
 Only TMFs answered as soon as they are processed are delayed: LOGICAL
 UNIT RESET, I_T NEXUS RESET, QUERY TASK, QUERY TASK SET, an ABORT TASK
