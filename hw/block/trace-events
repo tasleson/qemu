@@ -52,6 +52,9 @@ virtio_blk_zone_mgmt_complete(void *vdev, void *req, int ret) "vdev %p req %p re
 virtio_blk_zone_append_complete(void *vdev, void *req, int64_t sector, int ret) "vdev %p req %p, append sector 0x%" PRIx64 " ret %d"
 virtio_blk_handle_write(void *vdev, void *req, uint64_t sector, size_t nsectors) "vdev %p req %p sector %"PRIu64" nsectors %zu"
 virtio_blk_handle_read(void *vdev, void *req, uint64_t sector, size_t nsectors) "vdev %p req %p sector %"PRIu64" nsectors %zu"
+virtio_blk_handle_flush(void *vdev, void *req) "vdev %p req %p"
+virtio_blk_handle_discard(void *vdev, void *req, uint64_t sector, uint32_t nsectors) "vdev %p req %p sector %"PRIu64" nsectors %"PRIu32
+virtio_blk_handle_write_zeroes(void *vdev, void *req, uint64_t sector, uint32_t nsectors, uint32_t flags) "vdev %p req %p sector %"PRIu64" nsectors %"PRIu32" flags 0x%x"
 virtio_blk_submit_multireq(void *vdev, void *mrb, int start, int num_reqs, uint64_t offset, size_t size, bool is_write) "vdev %p mrb %p start %d num_reqs %d offset %"PRIu64" size %zu is_write %d"
 virtio_blk_handle_zone_report(void *vdev, void *req, int64_t sector, unsigned int nr_zones) "vdev %p req %p sector 0x%" PRIx64 " nr_zones %u"
 virtio_blk_handle_zone_mgmt(void *vdev, void *req, uint8_t op, int64_t sector, int64_t len) "vdev %p req %p op 0x%x sector 0x%" PRIx64 " len 0x%" PRIx64 ""

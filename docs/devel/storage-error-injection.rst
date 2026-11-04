@@ -825,6 +825,27 @@ Notes
   usable card until they are cleared and the card is re-initialised.
 
 
+.. _storage-injection-tracepoints:
+
+Tracepoints
+-----------
+
+The branch adds trace events for observing what guest drivers do around an
+injected failure.  Enable them like any others (see :ref:`tracing`), for
+example ``-trace 'virtio_blk_handle_*'``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - Events
+     - What they show
+   * - ``virtio_blk_handle_flush``, ``virtio_blk_handle_discard``, ``virtio_blk_handle_write_zeroes``
+     - each virtio-blk flush, discard and write-zeroes request as it arrives, with its sector range and flags where applicable (a flush has neither)
+   * - ``scsi_disk_emulate_command_SYNCHRONIZE_CACHE``
+     - each SYNCHRONIZE CACHE a scsi-disk receives, with its LBA
+
+
 Command-Line Tools
 ------------------
 
