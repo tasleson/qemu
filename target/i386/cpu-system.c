@@ -290,10 +290,17 @@ GuestPanicInformation *x86_cpu_get_crash_info(CPUState *cs)
             } else {
                 warn_report("Hypervisor did not provide any data for SEV-ES termination");
             }
+
+            return panic_info;
         }
-    } else
+    }
 #endif
 
+    /*
+     * Not an SEV-ES termination, so this may still be a Hyper-V crash
+     * notification: KVM reports those as KVM_SYSTEM_EVENT_CRASH, having
+     * already synchronised the crash MSRs into env.
+     */
     if (hyperv_feat_enabled(cpu, HYPERV_FEAT_CRASH)) {
         panic_info = g_new0(GuestPanicInformation, 1);
 
