@@ -18,6 +18,11 @@ Harness                                     Driver   What it injects
 ``fuzz-windows-inject-boot.py``             viostor  a grid of latency rules on
                                                      the boot disk, one boot per
                                                      grid point
+``fuzz-windows-inject-tail-latency.py``     vioscsi  hours of a few requests
+                                                     held past the guest's
+                                                     timeout
+``fuzz-windows-inject-reset-inflight.py``   vioscsi  hours of stalls that only
+                                                     the guest's own resets end
 =========================================== ======== ==========================
 
 The harnesses share their machinery, ``scripts/vioscsi_soak_common.py``,
@@ -546,3 +551,80 @@ that did not end in ``boot-ok``, each with its run directory.  The exit
 status is 1 if any grid point ended in anything but ``boot-ok``, else 0.
 A malformed command line exits with 2, from argparse; an unknown
 category or a missing prerequisite exits with 1.
+
+
+fuzz-windows-inject-tail-latency.py
+-----------------------------------
+
+The simplest soak: one VM for hours, and a single latency rule on every
+LUN that holds a small fraction of reads and writes past Windows'
+storport timeout (about 60 seconds) and then completes them normally.
+The rule is in each LUN's ``-blockdev`` from the start (or, with
+``--fill-wait``, armed once the LUNs are full) and is never changed.
+
+Besides the common options:
+
+``--probability`` [0.05]
+    Fraction of matching requests held.
+
+``--delay-ms`` [61000], ``--delay-max-ms`` [65000]
+    Hold time, drawn from that range.
+
+``--ops`` [read,write]
+    Which operations the rule matches.
+
+Expect bursts, not a steady rate.  With a deep queue, each outstanding
+request rolls the dice many times a second, so nearly the whole queue is
+caught by a hold at about the same moment: I/O runs for an instant, goes
+dark for a minute, completes in one burst, and repeats.  That puts dozens
+of requests past the guest's timeout at once, which is what provokes its
+reset path.  Runs live in ``$VM_DIR/soak-tail-latency``.
+
+
+fuzz-windows-inject-reset-inflight.py
+-------------------------------------
+
+Drives vioscsi through resets with a large, measured number of commands
+outstanding.  Two rules go on every LUN, in this order since the first
+match wins: a ``stall`` rule taking ``--stall-probability`` of requests,
+which nothing in QEMU ever completes on its own, and a baseline rule that
+slows every other request a little so the guest keeps issuing I/O.  The
+stalled set grows until storport times the oldest out and escalates.
+The LUN, target or adapter reset that follows drains the LUN, which wakes
+every request the stall rule holds; the rules stay, and the cycle starts
+again with no help from the host.
+
+Every reset is a cycle in the result: its kind, when, on which adapter,
+how many requests were held just before it (sampled with
+``x-inject-error-delay-inflight``, so possibly a poll interval stale),
+and which TMFs led up to it.  The summary prints the deepest hold seen
+at a reset.
+
+Besides the common options:
+
+``--stall-probability`` [0.02]
+    Fraction of requests stalled.  Higher reaches a reset sooner with
+    fewer requests moving meanwhile.
+
+``--baseline-delay-ms`` [5], ``--baseline-delay-max-ms`` [50]
+    The hold for everything else.
+
+``--ops`` [read,write]
+    Which operations both rules match.
+
+``--stall-budget-ms`` [300000]
+    How long a stalled request may legitimately wait for a reset.  A
+    stall has no hold time of its own, so this stands in for one when
+    sizing the I/O probe, the dark-guest I/O threshold and paranoid's
+    request timeout.
+
+``--cycles N`` [0]
+    End the run as ``cycles-complete`` once N resets of any kind have
+    been seen; 0 runs for the whole duration.
+
+``--release-after-reset-ms MS``
+    Rather than leaving every completion to the reset's drain, release
+    the adapter's held requests this long after a reset is seen, to land
+    them at a chosen point in the driver's recovery.
+
+Runs live in ``$VM_DIR/soak-reset-inflight``.
