@@ -8,6 +8,8 @@ hardware responses:
 - **inject-error** block filter driver -- injects I/O errors (bad sectors)
   and latency (slow, stalled and timing-out requests) at the block layer,
   under any emulated disk
+- **virtio-scsi TMF delay** -- hold back the answer to a guest's task
+  management functions
 - **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
   at the SCSI emulation layer
 - **NVMe response injection** -- overrides Identify Controller and Identify
@@ -17,10 +19,11 @@ hardware responses:
 - **SD/MMC response injection** -- overrides an SD or eMMC card's CID and
   CSD registers and sets error bits in the card status it reports
 
-They are controlled at runtime via QMP.  They are meant for fuzzing
-and for testing guest drivers and storage management software, not
-for production use: every command is marked ``unstable`` and carries
-an ``x-`` prefix, and none of the injected state is migrated.
+Most are controlled at runtime via QMP; the virtio-scsi knobs are device
+properties set on the command line.  They are meant for fuzzing and for
+testing guest drivers and storage management software, not for
+production use: every command is marked ``unstable`` and carries an ``x-``
+prefix, and none of the injected state is migrated.
 
 .. contents:: Contents
    :local:
@@ -329,6 +332,74 @@ Out-of-order completion     ``delay-max-ms`` above ``delay-ms``
 Reset race                  a hold that straddles the guest's timeout, so
                             the completion lands during recovery
 =========================== ================================================
+
+
+.. _storage-injection-virtio-scsi:
+
+virtio-scsi TMF Delay
+---------------------
+
+Two experimental properties on ``virtio-scsi-pci`` (and the other
+virtio-scsi transports) delay task management responses, to support
+work on guest drivers' error recovery.  They are qdev properties, so
+they can only be set when the device is created; ``qom-set`` on a
+running device fails with "Attempt to set property ... after it was
+realized".
+
+====================== ======= ===============================================
+Property               Default Effect
+====================== ======= ===============================================
+``x-tmf-delay-ms``     0       how long to hold back each delayed TMF response
+``x-tmf-delay-count``  0       how many TMF responses to delay; 0 disables
+====================== ======= ===============================================
+
+For example::
+
+    -device virtio-scsi-pci,id=scsi0,x-tmf-delay-ms=30000,x-tmf-delay-count=1
+
+Delaying TMF responses
+^^^^^^^^^^^^^^^^^^^^^^
+
+With both ``x-tmf-delay-ms`` and ``x-tmf-delay-count`` non-zero, the
+adapter holds back the response to each of the next ``x-tmf-delay-count``
+task management functions it answers for ``x-tmf-delay-ms`` milliseconds
+of guest time, then completes it.  The count goes down by one for each
+response held, so with a count of 1 only the first TMF the guest sends
+is delayed and everything after it is answered normally.
+
+The TMF itself is carried out at once: a LUN reset has already reset the
+LUN and cancelled its commands by the time its response is held.  Only
+the guest's view of it is late.  That is the point: a guest driver that
+issues a reset and waits for the answer stays in its reset path for as
+long as the delay lasts, so whatever else times out meanwhile -- a second
+LUN's commands, the reset itself -- has to be handled while the first is
+still in flight.
+
+Only TMFs answered as soon as they are processed are delayed: LOGICAL
+UNIT RESET, I_T NEXUS RESET, QUERY TASK, QUERY TASK SET, an ABORT TASK
+whose command is not outstanding, and any TMF that fails (unknown
+target, wrong LUN, CLEAR ACA or another unsupported function).  An ABORT
+TASK that finds its command, ABORT TASK SET and CLEAR TASK SET complete
+later in the request's AioContext, and are neither delayed nor counted.
+Asynchronous notification requests on the control queue are never
+delayed.
+
+A device reset drops every held TMF response without writing it to the
+ring, since the ring it belongs to no longer exists after the reset; the
+guest never sees an answer.  The same happens at unplug.
+
+``virtio_scsi_tmf_delay`` traces each response as it is held, with the
+delay; ``virtio_scsi_tmf_resp`` traces it when it is finally sent, and
+``virtio_scsi_tmf_drop`` when a reset drops it.
+
+Telling adapters apart
+^^^^^^^^^^^^^^^^^^^^^^
+
+The TMF and reset trace events carry ``bus=``, the name of
+the adapter's SCSI bus (``scsi0.0`` for ``-device virtio-scsi-pci,id=scsi0``),
+and the TMF ones the target as well as the LUN, so a VM with several
+adapters can be traced as one.  ``virtio_scsi_reset`` marks each device
+reset.
 
 
 SCSI Response Injection
@@ -832,7 +903,7 @@ Tracepoints
 
 The branch adds trace events for observing what guest drivers do around an
 injected failure.  Enable them like any others (see :ref:`tracing`), for
-example ``-trace 'virtio_blk_handle_*'``.
+example ``-trace 'virtio_scsi_tmf_*'``.
 
 .. list-table::
    :header-rows: 1
@@ -844,6 +915,20 @@ example ``-trace 'virtio_blk_handle_*'``.
      - each virtio-blk flush, discard and write-zeroes request as it arrives, with its sector range and flags where applicable (a flush has neither)
    * - ``scsi_disk_emulate_command_SYNCHRONIZE_CACHE``
      - each SYNCHRONIZE CACHE a scsi-disk receives, with its LBA
+   * - ``virtio_scsi_tmf_req``, ``virtio_scsi_tmf_resp``
+     - TMFs as they arrive and are answered, now with the target and ``bus=``
+   * - ``virtio_scsi_tmf_delay``, ``virtio_scsi_tmf_drop``
+     - TMF responses held by ``x-tmf-delay``, and held TMFs a reset drops
+   * - ``virtio_scsi_reset``
+     - each virtio-scsi device reset
+
+The existing ``virtio_scsi_tmf_req`` and ``virtio_scsi_tmf_resp`` events
+changed their arguments, so scripts that parse them need updating.  The
+``subtype`` they print is the virtio-scsi TMF code: 0 ABORT TASK, 1 ABORT
+TASK SET, 2 CLEAR ACA, 3 CLEAR TASK SET, 4 I_T NEXUS RESET, 5 LOGICAL
+UNIT RESET, 6 QUERY TASK, 7 QUERY TASK SET.  The ``response`` is the
+virtio-scsi response code: 0 means FUNCTION COMPLETE, 3 BAD TARGET, 10
+FUNCTION SUCCEEDED, 11 FUNCTION REJECTED, 12 INCORRECT LUN.
 
 
 Command-Line Tools

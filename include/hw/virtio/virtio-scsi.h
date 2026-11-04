@@ -98,6 +98,21 @@ struct VirtIOSCSI {
     bool dataplane_stopping;
     bool dataplane_fenced;
     uint32_t host_features;
+
+    /*
+     * Fuzzing/debug knob: delay the completion of the next
+     * x-tmf-delay-count TMF responses on the control queue by
+     * x-tmf-delay-ms milliseconds each. Only TMFs answered as soon as
+     * they are processed count: ones that complete asynchronously (an
+     * ABORT TASK that finds its command, ABORT TASK SET, CLEAR TASK SET)
+     * are answered undelayed. Like any qdev property these are only
+     * settable before the device is realized, so qom-set at runtime fails.
+     * Used to keep a guest-issued task reset in flight long enough to race
+     * a second reset. 0 count disables.
+     */
+    uint32_t tmf_delay_ms;
+    uint32_t tmf_delay_count;
+    QTAILQ_HEAD(, VirtIOSCSIHeldTMF) held_tmfs; /* main loop only */
 };
 
 void virtio_scsi_common_realize(DeviceState *dev,
