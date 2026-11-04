@@ -28,6 +28,13 @@ typedef struct IDEDevice IDEDevice;
 typedef struct IDEState IDEState;
 typedef struct IDEBus IDEBus;
 
+typedef struct IdeInjectData {
+    uint8_t *data;
+    uint32_t len;
+    bool has_error;
+    uint8_t error;
+} IdeInjectData;
+
 typedef void EndTransferFunc(IDEState *);
 
 #define MAX_IDE_DEVS 2
@@ -140,6 +147,11 @@ struct IDEState {
     uint8_t *smart_selftest_data;
     /* AHCI */
     int ncq_queues;
+
+    /* Response injection for fuzzing (not migrated) */
+    IdeInjectData *inject_identify;
+    IdeInjectData *inject_smart_data;
+    IdeInjectData *inject_smart_thresh;
 };
 
 struct IDEDeviceClass {

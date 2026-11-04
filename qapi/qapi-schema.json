@@ -60,6 +60,7 @@
 { 'include': 'qdev.json' }
 { 'include': 'scsi.json' }
 { 'include': 'nvme.json' }
+{ 'include': 'ide.json' }
 { 'include': 'machine-common.json' }
 { 'include': 'machine.json' }
 { 'include': 'machine-s390x.json' }

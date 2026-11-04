@@ -12,6 +12,8 @@ hardware responses:
   at the SCSI emulation layer
 - **NVMe response injection** -- overrides Identify Controller and Identify
   Namespace responses at the NVMe emulation layer
+- **ATA response injection** -- overrides IDENTIFY DEVICE and SMART data, or
+  fails those commands, on IDE and SATA (AHCI) hard disks
 
 They are controlled at runtime via QMP.  They are meant for fuzzing
 and for testing guest drivers and storage management software, not
@@ -589,6 +591,119 @@ Notes
 
 - The controller is found by its device ID; anything else fails with
   "Device '...' is not an NVMe controller".
+
+ATA Response Injection
+----------------------
+
+ATA response injection does for IDE and SATA hard disks what the SCSI and
+NVMe overrides do for theirs: it replaces the data the guest gets back from
+the commands it uses to identify a disk and judge its health, or makes those
+commands fail.  Use it to fuzz ``hdparm``, ``smartctl``, ``udev``'s ATA
+identification, ``libatasmart``, firmware and boot loaders that parse
+IDENTIFY DEVICE, and the guest kernel's own ATA probing.
+
+It works on any ``ide-hd`` device, whether attached to a PATA controller
+(``piix3-ide``, ``piix4-ide``, the ISA IDE bus) or to an AHCI controller
+(``ich9-ahci``, ``ahci``), since both go through the same IDE core.
+``ide-cd`` and ``ide-cf`` devices are refused.
+
+Supported override types
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+``identify-device``
+    The 512-byte IDENTIFY DEVICE (ECh) data: model, serial and firmware
+    strings, geometry, capacity, supported features and transfer modes.
+
+``smart-read-data``
+    The 512-byte SMART READ DATA (B0h, feature D0h) attribute table.
+
+``smart-read-thresh``
+    The 512-byte SMART READ ATTRIBUTE THRESHOLDS (B0h, feature D1h)
+    table.
+
+The override is used only once the command would otherwise have been
+answered.  A SMART command still has to carry the SMART signature
+(LBA mid 4Fh, LBA high C2h), and SMART has to be enabled on the drive --
+it is by default, but a guest that issues SMART DISABLE OPERATIONS gets
+those commands aborted as usual, override or not.
+
+QMP commands
+^^^^^^^^^^^^
+
+**x-ide-inject-response-set** -- set a response override.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the ``ide-hd`` device
+- ``type`` (string, required): ``identify-device``, ``smart-read-data``
+  or ``smart-read-thresh``
+- ``data`` (string, optional): base64-encoded response bytes, 1 to 512
+  of them.  They are sent as the command's 512-byte PIO data block,
+  padded with zeros if shorter.  Nothing is recomputed, including the
+  IDENTIFY DEVICE integrity word and the SMART data checksum, so the
+  guest sees whatever checksum the bytes contain.
+- ``error`` (int, optional): a non-zero value for the ATA Error
+  register.  The command then completes with ERR set in the Status
+  register (DRDY|ERR) and this value in the Error register, raises its
+  interrupt, and transfers no data, even if ``data`` is also given.
+  ``4`` is ABRT, an aborted command; ``0x40`` is UNC, an uncorrectable
+  data error.
+
+At least one of ``data`` and ``error`` must be given.  Setting an
+override replaces any earlier one of the same type.  Failures:
+"Device '...' not found", "Device '...' is not an ide-hd device", "at
+least one of 'data' or 'error' must be specified", "error register value
+must be non-zero" and "data length must be between 1 and 512 bytes".
+
+Example -- replace IDENTIFY DEVICE with a short buffer (the rest of the
+512 bytes reads as zero)::
+
+    -> { "execute": "x-ide-inject-response-set",
+         "arguments": { "id": "ide-disk0",
+                        "type": "identify-device",
+                        "data": "QABgAA==" } }
+    <- { "return": {} }
+
+Example -- make SMART READ DATA fail with ABRT::
+
+    -> { "execute": "x-ide-inject-response-set",
+         "arguments": { "id": "ide-disk0",
+                        "type": "smart-read-data",
+                        "error": 4 } }
+    <- { "return": {} }
+
+**x-ide-inject-response-clear** -- clear response overrides.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the ``ide-hd`` device
+- ``type`` (string, optional): which override to clear; omit to clear
+  all three.  Clearing a type with no override is not an error.
+
+Example::
+
+    -> { "execute": "x-ide-inject-response-clear",
+         "arguments": { "id": "ide-disk0",
+                        "type": "identify-device" } }
+    <- { "return": {} }
+
+Notes
+^^^^^
+
+- Overrides are not migrated, persist across guest reboots and device
+  resets, and are discarded when the device is unplugged.
+
+- The guest kernel reads IDENTIFY DEVICE when it probes the disk and
+  keeps what it read.  Tools such as ``hdparm -I`` and ``smartctl`` send
+  their own commands through ATA pass-through and see an override at
+  once; to make the kernel itself re-read IDENTIFY, rescan or re-probe
+  the disk (for libata, ``echo 1 > /sys/block/sda/device/rescan``).
+
+- An override on IDENTIFY DEVICE that reports a different capacity or
+  geometry changes only what the guest is told.  The disk still has its
+  real size, and I/O beyond it fails as usual.
+
+
 
 Command-Line Tools
 ------------------
