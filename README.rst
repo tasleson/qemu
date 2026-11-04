@@ -143,9 +143,29 @@ Upstream QEMU
 This branch is based on upstream QEMU.  For general QEMU documentation,
 bug tracking, and contribution guidelines, see:
 
+
 * `QEMU website <https://www.qemu.org/>`_
 * `QEMU source <https://gitlab.com/qemu-project/qemu.git>`_
 * `QEMU documentation <https://www.qemu.org/docs/master/>`_
 
 QEMU is released under the GNU General Public License, version 2.
 See the LICENSE file for details.
+
+
+Branches
+========
+
+``storage-error-injection`` is a moving branch: it is periodically rebased
+onto a newer upstream QEMU stable release, and force-pushed.  Pull it with
+``git pull --rebase``, or re-fetch it, rather than merging into it.
+
+Before each rebase, the state of the branch on its previous base is kept as
+``storage-error-injection/<version>``, for example
+``storage-error-injection/v11.1.0``.  Those branches are never rewritten, so
+use one if you need a base that will not move under you, or to see what a
+rebase changed:
+
+.. code-block:: shell
+
+  git range-diff v11.1.0..storage-error-injection/v11.1.0 \
+                 v11.2.0..storage-error-injection
