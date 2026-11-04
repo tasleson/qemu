@@ -113,6 +113,30 @@ struct VirtIOSCSI {
     uint32_t tmf_delay_ms;
     uint32_t tmf_delay_count;
     QTAILQ_HEAD(, VirtIOSCSIHeldTMF) held_tmfs; /* main loop only */
+
+    /*
+     * Diagnostics for a request ring the device gives up on (see
+     * virtio_scsi_diag_broken()). x-stop-on-broken pauses the VM the first
+     * time any virtio-scsi device breaks, so the guest's view of the
+     * failing request can be dumped before it moves on.
+     */
+    bool stop_on_broken;
+    /*
+     * x-diag=off turns off everything below that runs while the device is
+     * healthy -- per-request tracking, TMF and drain snapshots, and the
+     * drain watch, which changes how the guest kicks during a drain -- so
+     * its own effect on timing can be measured. The core's capture of the
+     * chain a ring broke on stays.
+     */
+    bool diag;
+    QemuMutex diag_lock;            /* protects everything below */
+    uint32_t tmf_seq;               /* TMFs seen, numbers each snapshot */
+    struct VirtIOSCSIDiagQueue *diag_queues; /* one per request queue */
+    GHashTable *inflight_buf;       /* command header GPA -> VirtIOSCSIReq */
+    GHashTable *inflight_head;      /* queue << 16 | head -> VirtIOSCSIReq */
+    uint64_t overlaps;              /* see virtio_scsi_diag_track() */
+    uint32_t drain_kicks;           /* kicks in this drain, incl. our own */
+    uint32_t drain_new;             /* positions first seen during it */
 };
 
 void virtio_scsi_common_realize(DeviceState *dev,

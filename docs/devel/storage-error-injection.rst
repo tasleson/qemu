@@ -8,8 +8,9 @@ hardware responses:
 - **inject-error** block filter driver -- injects I/O errors (bad sectors)
   and latency (slow, stalled and timing-out requests) at the block layer,
   under any emulated disk
-- **virtio-scsi TMF delay** -- hold back the answer to a guest's task
-  management functions
+- **virtio-scsi TMF delay and broken-ring diagnostics** -- hold back the
+  answer to a guest's task management functions, and record what a
+  virtio-scsi request ring looked like when the device gave up on it
 - **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
   at the SCSI emulation layer
 - **NVMe response injection** -- overrides Identify Controller and Identify
@@ -336,26 +337,30 @@ Reset race                  a hold that straddles the guest's timeout, so
 
 .. _storage-injection-virtio-scsi:
 
-virtio-scsi TMF Delay
----------------------
+virtio-scsi TMF Delay and Ring Diagnostics
+------------------------------------------
 
-Two experimental properties on ``virtio-scsi-pci`` (and the other
-virtio-scsi transports) delay task management responses, to support
-work on guest drivers' error recovery.  They are qdev properties, so
-they can only be set when the device is created; ``qom-set`` on a
-running device fails with "Attempt to set property ... after it was
-realized".
+Four experimental properties on ``virtio-scsi-pci`` (and the other
+virtio-scsi transports) support work on guest drivers' error recovery:
+one delays task management responses, the other three diagnose a request
+ring the device gives up on.  They are qdev properties, so they can only
+be set when the device is created; ``qom-set`` on a running device fails
+with "Attempt to set property ... after it was realized".
 
 ====================== ======= ===============================================
 Property               Default Effect
 ====================== ======= ===============================================
 ``x-tmf-delay-ms``     0       how long to hold back each delayed TMF response
 ``x-tmf-delay-count``  0       how many TMF responses to delay; 0 disables
+``x-diag``             on      the broken-ring diagnostics' work while the
+                               device is healthy
+``x-stop-on-broken``   off     pause the VM when a request ring breaks
 ====================== ======= ===============================================
 
 For example::
 
     -device virtio-scsi-pci,id=scsi0,x-tmf-delay-ms=30000,x-tmf-delay-count=1
+    -device virtio-scsi-pci,id=scsi1,x-stop-on-broken=on
 
 Delaying TMF responses
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -392,14 +397,127 @@ guest never sees an answer.  The same happens at unplug.
 delay; ``virtio_scsi_tmf_resp`` traces it when it is finally sent, and
 ``virtio_scsi_tmf_drop`` when a reset drops it.
 
+Broken-ring diagnostics
+^^^^^^^^^^^^^^^^^^^^^^^
+
+When a virtio device finds something it cannot accept on a ring -- a
+descriptor chain that loops, is too long or points outside guest RAM,
+or for virtio-scsi a request whose headers have the wrong size -- it
+reports the error, marks itself
+broken, and stops processing until the guest resets it.  The message says
+what was wrong but not which request, and by the time anyone looks the
+guest may have reused the memory.  For guest driver bugs that free or
+rewrite a request the device still owns, which request and what it held
+when the guest published it is the whole question.
+
+Two layers of diagnostics answer it.  Both report through trace events
+(see `Tracepoints`_), so enable those first: nothing beyond the usual
+error message is printed otherwise.
+
+**Chain capture, in the virtio core.**  For any virtio device using split
+rings, when popping a request marks the device broken, the core reads
+the avail entry it was popping and the descriptor chain behind it, right
+then, and keeps the result until the queue is next reset.  It traces
+``virtqueue_chain_error`` (device, queue, avail position, head
+descriptor and whether it could be read), ``virtqueue_chain_summary``
+(whether the chain is indirect, how many entries it has and how many of
+them have zero length, the index of the first such, whether an indirect
+table is all zeros, an FNV-1a hash of the table or chain, and the first
+16 bytes of the first buffer as two 64-bit words -- for virtio-scsi, the
+LUN and tag of the command) and one ``virtqueue_chain_entry`` for each of
+the first eight entries and for the first zero-length entry.  The device
+is named by its proxy's ID (``scsi0`` for ``-device
+virtio-scsi-pci,id=scsi0``).  The capture reads guest RAM only; an
+address that is not RAM is not read and is reported as a read failure,
+and at most 64 KiB of an indirect table is read.  Packed rings are not
+covered, and neither is a device that breaks for a reason other than the
+chain, such as virtio-scsi's "wrong size for virtio-scsi headers".
+
+**Snapshot comparison, in virtio-scsi.**  The capture shows what the
+device read, not whether that is what the guest published.  So, while
+``x-diag`` is on, virtio-scsi also records request-queue entries the
+guest has published but the device has not yet popped, the first time it
+sees each one:
+
+- when a TMF arrives, before it is carried out, for every request queue
+  (traced as ``virtio_scsi_tmf_snapshot``, with a running TMF number);
+- when the adapter is drained -- which a LUN or target reset does --
+  and, for as long as the drain lasts, on every kick the guest sends.
+  During a drain the request queue handlers are detached and nothing is
+  popped, so virtio-scsi attaches a watch in their place that only
+  records what is published and re-enables guest notifications each
+  time (``virtio_scsi_drain_begin`` and ``virtio_scsi_drain_snapshot``
+  report how many entries were pending and new, and how many kicks the
+  watch saw).
+
+When a request queue then breaks, the entry that broke it is compared
+with its snapshot and ``virtio_scsi_broken_verdict`` says what happened:
+
+================= ============================================================
+Verdict           Meaning
+================= ============================================================
+``no-snapshot``   the entry was never seen pending, so there is nothing to
+                  compare (it was published and popped outside a TMF or
+                  drain)
+``head-changed``  the avail slot now names a different descriptor: guest
+                  ring bookkeeping went wrong
+``unchanged``     same chain, byte for byte: what the guest published is
+                  what failed; look at the snapshot's zero-length entries
+``zeroed``        an indirect table that was valid while pending is now all
+                  zeros: the guest cleared a request it had handed over
+``rewritten``     the chain changed some other way: the guest reused the
+                  memory while the request was still queued
+``unreadable``    the head descriptor is unchanged but the chain behind it
+                  is not in RAM, so there is nothing to compare
+``no-chain``      the ring broke over something other than the chain, for
+                  example bad header sizes
+``not-request``   the control or event queue broke
+``diag-off``      ``x-diag=off``: no snapshots were taken
+================= ============================================================
+
+With a snapshot, ``virtio_scsi_broken_before``,
+``virtio_scsi_broken_before_detail`` and ``virtio_scsi_broken_before_entry``
+describe the entry as it was first seen: where (``tmf``, ``drain`` or
+``kick``), after which TMF, how long ago, and the same chain fields as
+the core's capture.  The verdict line also says whether the head
+descriptor still belonged to a request the device had in flight
+(``head_inflight``), and how many overlaps had been seen.
+
+**Overlap tracking.**  Independently, while ``x-diag`` is on, every
+request popped is checked against the requests the adapter still has in
+flight.  One that uses the same command header address, or the same
+queue and head descriptor, means the guest handed the device memory the
+device still owns; ``virtio_scsi_req_overlap`` reports it, with both
+requests' queue, head and tag and how long ago the older one was popped.
+The first 256 are traced; all are counted.
+
+Every adapter's diagnostic state is reset with the device.
+
+**x-diag=off** turns off everything virtio-scsi does while the device is
+healthy -- the per-request tracking, the TMF and drain snapshots, and the
+drain watch -- leaving only the core's chain capture, and the verdict is
+then ``diag-off``.  It exists to measure the diagnostics' own effect:
+the drain watch keeps guest notifications enabled during a drain and so
+changes when the guest kicks, which can change the timing of exactly the
+races being chased.
+
+**x-stop-on-broken=on** pauses the VM, as ``stop`` would, the first time a
+virtio-scsi device with the property set breaks, and traces
+``virtio_scsi_stop_on_broken``.  The guest's memory is then still as the
+driver left it when the device read the bad request, which is when to
+take a ``dump-guest-memory``.  The latch is per QEMU process: later
+breaks, on that device after a reset or on another one, do not pause the
+VM again.  Resume it with ``cont``.
+
 Telling adapters apart
 ^^^^^^^^^^^^^^^^^^^^^^
 
-The TMF and reset trace events carry ``bus=``, the name of
+The TMF, reset and broken-ring trace events carry ``bus=``, the name of
 the adapter's SCSI bus (``scsi0.0`` for ``-device virtio-scsi-pci,id=scsi0``),
 and the TMF ones the target as well as the LUN, so a VM with several
 adapters can be traced as one.  ``virtio_scsi_reset`` marks each device
-reset.
+reset and ``virtio_scsi_broken`` gives the bus and queue (0 control, 1
+event, 2 and up the request queues) of each break.
 
 
 SCSI Response Injection
@@ -921,6 +1039,10 @@ example ``-trace 'virtio_scsi_tmf_*'``.
      - TMF responses held by ``x-tmf-delay``, and held TMFs a reset drops
    * - ``virtio_scsi_reset``
      - each virtio-scsi device reset
+   * - ``virtio_scsi_broken``, ``virtio_scsi_broken_*``, ``virtio_scsi_stop_on_broken``, ``virtio_scsi_tmf_snapshot``, ``virtio_scsi_drain_begin``, ``virtio_scsi_drain_snapshot``, ``virtio_scsi_req_overlap``
+     - a request ring breaking, and the broken-ring diagnostics described above
+   * - ``virtqueue_chain_error``, ``virtqueue_chain_summary``, ``virtqueue_chain_entry``
+     - the descriptor chain a split ring broke on, for any virtio device
 
 The existing ``virtio_scsi_tmf_req`` and ``virtio_scsi_tmf_resp`` events
 changed their arguments, so scripts that parse them need updating.  The
