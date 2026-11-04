@@ -105,14 +105,25 @@ struct VirtIOSCSI {
      * x-tmf-delay-ms milliseconds each. Only TMFs answered as soon as
      * they are processed count: ones that complete asynchronously (an
      * ABORT TASK that finds its command, ABORT TASK SET, CLEAR TASK SET)
-     * are answered undelayed. Like any qdev property these are only
-     * settable before the device is realized, so qom-set at runtime fails.
-     * Used to keep a guest-issued task reset in flight long enough to race
-     * a second reset. 0 count disables.
+     * or that a target fault left hanging are answered undelayed. Like
+     * any qdev property these are only settable before the device is
+     * realized, so qom-set at runtime fails. Used to keep a guest-issued
+     * task reset in flight long enough to race a second reset. 0 count
+     * disables.
      */
     uint32_t tmf_delay_ms;
     uint32_t tmf_delay_count;
     QTAILQ_HEAD(, VirtIOSCSIHeldTMF) held_tmfs; /* main loop only */
+
+    /*
+     * TMFs that SCSI target faults care about and that finished in a
+     * request AioContext, waiting for tmf_bh to answer them from the main
+     * loop.  Protected by ctrl_lock.
+     */
+    QTAILQ_HEAD(, VirtIOSCSIReq) tmf_finishing;
+    QEMUBH *tmf_bh;
+    bool tmf_recheck_pending;   /* a fault went away, see tmf_bh */
+    VMChangeStateEntry *tmf_vmstate;
 
     /*
      * Diagnostics for a request ring the device gives up on (see
