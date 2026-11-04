@@ -1315,6 +1315,16 @@ UNIT RESET, 6 QUERY TASK, 7 QUERY TASK SET.  The ``response`` is the
 virtio-scsi response code: 0 means FUNCTION COMPLETE, 3 BAD TARGET, 10
 FUNCTION SUCCEEDED, 11 FUNCTION REJECTED, 12 INCORRECT LUN.
 
+``scripts/windows-storage-trace-events`` is a ready-made events file for
+``-trace events=FILE``.  It covers per-request reads, writes, flushes,
+discards and write-zeroes on virtio-blk, every virtio-scsi command and
+TMF (including delayed and dropped TMFs), every command the generic SCSI
+layer parses, scsi-disk's command handlers, and what reaches the backing
+image through the block layer after the inject-error filter.
+``scripts/setup-windows-inject-vm.sh`` uses it by default, but it is not
+specific to Windows guests.  It is verbose: at a sustained load it writes
+several lines per request.
+
 
 Command-Line Tools
 ------------------
@@ -1707,6 +1717,15 @@ straight away if SSH or the QMP socket isn't reachable.  The script runs
 with ``set -e``, so a QMP error part way through ends it before the
 final clean-up; run ``scsi-inject.py clear`` on the three disks
 afterwards in that case.
+
+
+Windows Driver Harnesses
+------------------------
+
+``scripts/setup-windows-inject-vm.sh`` sets up a Windows 11 guest, with
+UEFI Secure Boot and a TPM, for testing the viostor and vioscsi drivers.
+It and the harnesses built on it are documented separately, in
+:doc:`storage-error-injection-harnesses`.
 
 
 Walkthrough: End-to-End Example

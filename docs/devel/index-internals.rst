@@ -30,3 +30,4 @@ Details about QEMU's various subsystems including how to add features to them.
    crypto
    multiple-iothreads
    storage-error-injection
+   storage-error-injection-harnesses
