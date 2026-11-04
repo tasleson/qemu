@@ -10,6 +10,8 @@ hardware responses:
   under any emulated disk
 - **SCSI response injection** -- overrides INQUIRY and MODE SENSE responses
   at the SCSI emulation layer
+- **NVMe response injection** -- overrides Identify Controller and Identify
+  Namespace responses at the NVMe emulation layer
 
 They are controlled at runtime via QMP.  They are meant for fuzzing
 and for testing guest drivers and storage management software, not
@@ -470,6 +472,123 @@ Notes
   reflect overrides immediately without a rescan.  A rescan is only
   needed to update the kernel's cached copy in sysfs.
 
+
+NVMe Response Injection
+-----------------------
+
+NVMe response injection operates at the NVMe admin command emulation layer.
+It replaces the data returned by Identify Controller (CNS 01h) and Identify
+Namespace (CNS 00h) commands with arbitrary bytes, and can also inject NVMe
+status codes to simulate command failures.
+
+This is useful for fuzzing software like ``nvme-cli``, ``udev`` rules, and
+any other tool that queries NVMe device properties via Identify commands.
+
+Supported override types
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+``identify-ctrl``
+    Replaces the Identify Controller response (4096 bytes).  Controls the
+    vendor ID, serial number, model number, firmware revision, and all
+    other controller-level fields that guest software reads.
+
+``identify-ns``
+    Replaces the Identify Namespace response (4096 bytes) for a specific
+    namespace ID.  Controls the namespace size, capacity, LBA format,
+    and other namespace-level properties.  The same override answers
+    Identify Namespace for an allocated NSID (CNS 11h).  It is looked up
+    before QEMU checks that the namespace exists, so any NSID the
+    controller accepts as valid can be given an override, including one
+    with no namespace attached; the broadcast NSID and NSIDs above the
+    controller's maximum are still rejected with Invalid Namespace.
+
+QMP commands
+^^^^^^^^^^^^
+
+**x-nvme-inject-response-set** -- set a response override.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the NVMe controller
+- ``type`` (string, required): ``identify-ctrl`` or ``identify-ns``
+- ``nsid`` (int, 1-based): namespace ID; required (and non-zero) for
+  ``identify-ns``, must not be present for ``identify-ctrl``
+- ``data`` (string, optional): base64-encoded response bytes, 1 to 4096
+  of them; replaces the response verbatim with no validation.  Only the
+  bytes given are transferred, so short data leaves the rest of the
+  guest's buffer as it was.  At least one of ``data`` or ``status`` must
+  be specified.
+- ``status`` (int, optional): NVMe status field to return in the
+  completion queue entry, as a 16-bit value in QEMU's encoding (status
+  code type in bits 8-10, the Do Not Retry bit as 0x4000).  At least one
+  of ``data`` or ``status`` must be specified.  If only ``status`` is
+  given, the command fails with this status and no data is transferred;
+  if both are, the data is transferred and the command then completes
+  with the status.
+
+Setting an override replaces any earlier one for the same type and
+NSID.
+
+Example -- inject Identify Controller data (here only four bytes)::
+
+    -> { "execute": "x-nvme-inject-response-set",
+         "arguments": { "id": "nvme0",
+                        "type": "identify-ctrl",
+                        "data": "AQIDBA==" } }
+    <- { "return": {} }
+
+Example -- inject an NVMe error status for Identify Namespace::
+
+    -> { "execute": "x-nvme-inject-response-set",
+         "arguments": { "id": "nvme0",
+                        "type": "identify-ns",
+                        "nsid": 1,
+                        "status": 6 } }
+    <- { "return": {} }
+
+The status value ``6`` corresponds to ``NVME_INTERNAL_DEV_ERROR``.
+
+**x-nvme-inject-response-clear** -- clear response overrides.
+
+Arguments:
+
+- ``id`` (string, required): device ID of the NVMe controller
+- ``type`` (string, optional): which override type to clear; omit to
+  clear all overrides on the controller
+- ``nsid`` (int, optional): namespace ID to clear; required when
+  ``type`` is ``identify-ns``, and an error with ``identify-ctrl`` or
+  without ``type``
+
+Example -- clear all overrides::
+
+    -> { "execute": "x-nvme-inject-response-clear",
+         "arguments": { "id": "nvme0" } }
+    <- { "return": {} }
+
+Example -- clear just Identify Namespace for NSID 1::
+
+    -> { "execute": "x-nvme-inject-response-clear",
+         "arguments": { "id": "nvme0",
+                        "type": "identify-ns",
+                        "nsid": 1 } }
+    <- { "return": {} }
+
+Notes
+^^^^^
+
+- The injected data is sent as-is with no validation.  Only the bytes
+  given are transferred, so data shorter than the normal 4096-byte
+  identify response leaves the rest of the guest's buffer untouched.
+
+- Overrides are not migrated.  After live migration, the fuzzer harness
+  must re-inject any desired overrides.
+
+- Overrides persist across guest reboots (they are not cleared on
+  controller reset).  Use the clear command to remove them.  Unplugging
+  the controller discards them.
+
+- The controller is found by its device ID; anything else fails with
+  "Device '...' is not an NVMe controller".
 
 Command-Line Tools
 ------------------
